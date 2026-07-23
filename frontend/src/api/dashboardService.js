@@ -132,6 +132,20 @@ class DashboardService {
     }
   }
 
+  static async syncCampaignFromDatabase(campaignId) {
+    try {
+      const api = await DashboardService._api();
+      const response = await api.post(`/api/campaigns/${campaignId}/sync_from_database/`);
+      return { success: true, data: response.data };
+    } catch (error) {
+      console.error('Database sync error:', error);
+      return {
+        success: false,
+        error: error.response?.data?.error || error.response?.data || 'Database sync failed'
+      };
+    }
+  }
+
   // ========== FILE UPLOADS ==========
 
   static async uploadCallDataFile(file, campaignId = null, delimiter = ',', hasHeaders = true) {

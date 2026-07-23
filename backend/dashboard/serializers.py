@@ -458,6 +458,7 @@ class CampaignSerializer(serializers.ModelSerializer):
         model = Campaign
         fields = [
             'id', 'name', 'display_name', 'description', 'sheet_name',
+            'cd_list_id',
             'is_active', 'created_at', 'updated_at', 'created_by', 'created_by_name',
             'data_files_count', 'reports_count', 'templates_count'
         ]

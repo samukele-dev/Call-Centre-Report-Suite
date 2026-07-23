@@ -20,7 +20,8 @@ const Campaigns = () => {
     name: '',
     display_name: '',
     description: '',
-    sheet_name: ''
+    sheet_name: '',
+    cd_list_id: ''
   });
 
   // Predefined campaigns
@@ -65,7 +66,7 @@ const Campaigns = () => {
       if (result.success) {
         alert('Campaign created successfully!');
         setShowCreateModal(false);
-        setFormData({ name: '', display_name: '', description: '', sheet_name: '' });
+        setFormData({ name: '', display_name: '', description: '', sheet_name: '', cd_list_id: '' });
         fetchCampaigns();
       } else {
         alert(`Failed to create campaign: ${result.error}`);
@@ -82,7 +83,8 @@ const Campaigns = () => {
       name: campaign.name,
       display_name: campaign.display_name,
       description: `Campaign for ${campaign.display_name}`,
-      sheet_name: campaign.sheet_name
+      sheet_name: campaign.sheet_name,
+      cd_list_id: ''
     });
     setShowCreateModal(true);
   };
@@ -383,6 +385,21 @@ const Campaigns = () => {
                 value={formData.description}
                 onChange={(e) => setFormData({...formData, description: e.target.value})}
               />
+            </Form.Group>
+
+            <Form.Group className="mb-3">
+              <Form.Label>Source Database List ID (Optional)</Form.Label>
+              <Form.Control
+                type="text"
+                placeholder="e.g., 82236da3-f785-464f-848f-02db0a69d3bc"
+                value={formData.cd_list_id}
+                onChange={(e) => setFormData({...formData, cd_list_id: e.target.value})}
+              />
+              <Form.Text className="text-muted">
+                cd_list_id (UUID) in the call-centre database. Set this to enable
+                "Sync from Database" on this campaign's upload page instead of
+                manual file upload.
+              </Form.Text>
             </Form.Group>
           </Form>
         </Modal.Body>

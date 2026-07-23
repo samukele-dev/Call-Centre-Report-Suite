@@ -2473,6 +2473,22 @@ class CampaignViewSet(viewsets.ModelViewSet):
             'recent_reports': GeneratedReportSerializer(recent_reports, many=True).data,
         })
 
+    @action(detail=True, methods=['post'])
+    def sync_from_database(self, request, pk=None):
+        """Pull this campaign's call data from the external source database."""
+        from .external_source import sync_campaign_from_database, ExternalSourceError
+
+        campaign = self.get_object()
+        user = request.user if request.user.is_authenticated else None
+        try:
+            instance = sync_campaign_from_database(campaign, user=user)
+        except ExternalSourceError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({'error': f'Database sync failed: {e}'}, status=status.HTTP_502_BAD_GATEWAY)
+
+        return Response(CallDataFileSerializer(instance).data)
+
 
 # ===========================================================
 # UTILITY VIEWS

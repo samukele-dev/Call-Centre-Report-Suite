@@ -1,0 +1,21 @@
+# Environment / secrets
+.env
+backend/.env
+
+# Python
+__pycache__/
+*.pyc
+venv/
+backend/venv/
+
+# Django local artifacts
+backend/media/
+backend/staticfiles/
+
+# Node
+frontend/node_modules/
+frontend/build/
+
+# Editor/OS
+.vscode/
+.DS_Store

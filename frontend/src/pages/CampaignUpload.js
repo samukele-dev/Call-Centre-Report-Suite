@@ -17,6 +17,7 @@ const CampaignUpload = () => {
   const [delimiter, setDelimiter] = useState(',');
   const [hasHeaders, setHasHeaders] = useState(true);
   const [debugInfo, setDebugInfo] = useState(null);
+  const [syncing, setSyncing] = useState(false);
 
   useEffect(() => {
     fetchCampaign();
@@ -115,6 +116,51 @@ const CampaignUpload = () => {
     }
   };
 
+  const handleSyncFromDatabase = async () => {
+    setSyncing(true);
+    setMessage(null);
+    setDebugInfo(null);
+
+    try {
+      const result = await DashboardService.syncCampaignFromDatabase(campaign.id);
+
+      if (result.success) {
+        const file = result.data;
+        if (file.status === 'failed') {
+          setMessage({
+            type: 'danger',
+            text: `Database sync failed: ${file.processing_errors}`
+          });
+        } else {
+          setMessage({
+            type: 'success',
+            text: `Pulled data from the database for ${campaign.display_name}!`
+          });
+          setDebugInfo({
+            fileName: file.original_name,
+            fileSize: file.file_size,
+            totalRecords: file.total_records || 0,
+            processedRecords: file.processed_records || 0,
+            message: file.status_display || file.status
+          });
+        }
+      } else {
+        setMessage({
+          type: 'danger',
+          text: `Database sync failed: ${typeof result.error === 'object' ? JSON.stringify(result.error) : result.error}`
+        });
+      }
+    } catch (error) {
+      setMessage({
+        type: 'danger',
+        text: `Database sync error: ${error.message}`
+      });
+      console.error('❌ Database sync error details:', error);
+    } finally {
+      setSyncing(false);
+    }
+  };
+
   const formatFileSize = (bytes) => {
     if (!bytes || bytes === 0) return '0 Bytes';
     const k = 1024;
@@ -204,6 +250,45 @@ const CampaignUpload = () => {
           )}
         </Alert>
       )}
+
+      <Card className="mb-4">
+        <Card.Body>
+          <h5><i className="bi bi-database text-primary me-2"></i>Sync from Database</h5>
+          {campaign.cd_list_id ? (
+            <>
+              <p className="text-muted mb-3">
+                Pulls the latest call data straight from the call-centre database
+                (list <code>{campaign.cd_list_id}</code>) and processes it the same
+                way an uploaded file would be.
+              </p>
+              <Button
+                variant="success"
+                size="lg"
+                onClick={handleSyncFromDatabase}
+                disabled={syncing || uploading}
+              >
+                {syncing ? (
+                  <>
+                    <span className="spinner-border spinner-border-sm me-2"></span>
+                    Pulling from database...
+                  </>
+                ) : (
+                  <>
+                    <i className="bi bi-arrow-repeat me-2"></i>
+                    Sync from Database
+                  </>
+                )}
+              </Button>
+            </>
+          ) : (
+            <Alert variant="secondary" className="mb-0">
+              No source database list is configured for this campaign yet.
+              Set a <strong>Source Database List ID</strong> on the campaign
+              (via the Campaigns page or Django admin) to enable this.
+            </Alert>
+          )}
+        </Card.Body>
+      </Card>
 
       <Card>
         <Card.Body>

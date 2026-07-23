@@ -33,6 +33,13 @@ class Campaign(models.Model):
         help_text="Sheet name in templates for this campaign"
     )
 
+    # External source-database list this campaign pulls call data from
+    cd_list_id = models.CharField(
+        max_length=64, null=True, blank=True,
+        help_text="cd_list_id (UUID) in the external call-centre database "
+                   "used to scope 'Sync from database' pulls for this campaign"
+    )
+
     class Meta:
         ordering = ['name']
 

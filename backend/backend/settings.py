@@ -13,9 +13,14 @@ https://docs.djangoproject.com/en/6.0/ref/settings/
 # backend/backend/settings.py
 import os
 from pathlib import Path
+from dotenv import load_dotenv
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Loads backend/.env if present (gitignored). Real credentials never live in
+# this file — see backend/.env.example for the variables it can set.
+load_dotenv(BASE_DIR / '.env')
 
 SECRET_KEY = 'django-insecure-your-secret-key-change-in-production'
 
@@ -141,3 +146,15 @@ CORS_ALLOW_ALL_ORIGINS = DEBUG  # Allow all in development
 # File upload settings
 DATA_UPLOAD_MAX_MEMORY_SIZE = 10485760  # 10MB
 FILE_UPLOAD_MAX_MEMORY_SIZE = 10485760  # 10MB
+
+# External source database (the call-centre platform's own MySQL/MariaDB DB,
+# e.g. accessed via HeidiSQL) that campaign data is pulled from. Configure via
+# backend/.env — see backend/.env.example. Left blank, "Sync from database"
+# is disabled and raises a clear error instead of connecting anywhere.
+EXTERNAL_DB = {
+    'HOST': os.environ.get('SOURCE_DB_HOST', ''),
+    'PORT': int(os.environ.get('SOURCE_DB_PORT', '3306')),
+    'NAME': os.environ.get('SOURCE_DB_NAME', ''),
+    'USER': os.environ.get('SOURCE_DB_USER', ''),
+    'PASSWORD': os.environ.get('SOURCE_DB_PASSWORD', ''),
+}
