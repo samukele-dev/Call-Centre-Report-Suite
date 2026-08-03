@@ -110,7 +110,7 @@ class SimpleDataProcessor:
     def process_call_data(file_path, user, file_type='excel', delimiter=',', has_headers=True):
         """Process call data file and add Description column after last_outcome"""
         try:
-            print(f"📁 Processing file: {file_path}")
+            print(f" Processing file: {file_path}")
             file_ext = os.path.splitext(file_path)[1].lower()
 
             if file_ext == '.csv':
@@ -214,7 +214,6 @@ class SimpleDataProcessor:
             print(f"❌ Error processing file {file_path}: {e}")
             traceback.print_exc()
             raise Exception(f"Error processing file {file_path}: {e}")
-
 
 DataProcessor = SimpleDataProcessor
 
