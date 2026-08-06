@@ -1,32 +1,15 @@
-// src/pages/Dashboard.js - FIXED VERSION
+// src/pages/Dashboard.js
 import React, { useState, useEffect } from 'react';
-import { Card, Row, Col, Spinner, Alert, Button, Badge } from 'react-bootstrap';
+import { Card, Spinner, Button } from 'react-bootstrap';
 import { Link } from 'react-router-dom';
 import DashboardService from '../api/dashboardService';
-import { Bar, Pie } from 'react-chartjs-2';
-import {
-  Chart as ChartJS,
-  CategoryScale,
-  LinearScale,
-  BarElement,
-  Title,
-  Tooltip,
-  Legend,
-  ArcElement,
-  Filler
-} from 'chart.js';
 
-// Register ChartJS components
-ChartJS.register(
-  CategoryScale,
-  LinearScale,
-  BarElement,
-  Title,
-  Tooltip,
-  Legend,
-  ArcElement,
-  Filler
-);
+const STATUS_META = {
+  uploaded:   { label: 'Uploaded',   chip: 'chip-blue' },
+  processing: { label: 'Processing', chip: 'chip-amber' },
+  processed:  { label: 'Processed',  chip: 'chip-green' },
+  failed:     { label: 'Failed',     chip: 'chip-rose' },
+};
 
 const Dashboard = () => {
   const [stats, setStats] = useState({
@@ -45,7 +28,7 @@ const Dashboard = () => {
       failed: 0
     }
   });
-  
+
   const [campaigns, setCampaigns] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -53,7 +36,7 @@ const Dashboard = () => {
 
   useEffect(() => {
     fetchDashboardData();
-    
+
     // Refresh every 30 seconds
     const interval = setInterval(fetchDashboardData, 30000);
     return () => clearInterval(interval);
@@ -62,11 +45,10 @@ const Dashboard = () => {
   const fetchDashboardData = async () => {
     setLoading(true);
     setError(null);
-    
+
     try {
-      // Fetch dashboard stats
       const statsResult = await DashboardService.getDashboardStats();
-      
+
       if (statsResult.success) {
         const data = statsResult.data || {};
         setStats({
@@ -89,7 +71,6 @@ const Dashboard = () => {
         console.error('Failed to load stats:', statsResult.error);
       }
 
-      // Fetch campaigns separately
       const campaignsResult = await DashboardService.getCampaigns();
       if (campaignsResult.success) {
         setCampaigns(campaignsResult.data || []);
@@ -104,118 +85,12 @@ const Dashboard = () => {
     }
   };
 
-  // Modern gradient chart data
-  const callDataChart = {
-    labels: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'],
-    datasets: [
-      {
-        label: 'Successful Calls',
-        data: [65, 59, 80, 81, 56, 55, 40],
-        backgroundColor: 'rgba(99, 102, 241, 0.8)',
-        borderColor: 'rgba(99, 102, 241, 1)',
-        borderWidth: 2,
-        borderRadius: 8,
-        borderSkipped: false,
-      },
-      {
-        label: 'Failed Calls',
-        data: [28, 48, 40, 19, 86, 27, 90],
-        backgroundColor: 'rgba(220, 53, 69, 0.8)',
-        borderColor: 'rgba(220, 53, 69, 1)',
-        borderWidth: 2,
-        borderRadius: 8,
-        borderSkipped: false,
-      },
-    ],
-  };
+  const fileStatusTotal = Object.values(stats.file_status).reduce((a, b) => a + b, 0);
 
-  const outcomeDistributionChart = {
-    labels: ['True Contacts', 'Unsuccessful', 'Unworkable'],
-    datasets: [
-      {
-        data: [30, 50, 20],
-        backgroundColor: [
-          'rgba(99, 102, 241, 0.8)',
-          'rgba(217, 119, 6, 0.8)',
-          'rgba(220, 53, 69, 0.8)',
-        ],
-        borderColor: [
-          'rgba(99, 102, 241, 1)',
-          'rgba(217, 119, 6, 1)',
-          'rgba(220, 53, 69, 1)',
-        ],
-        borderWidth: 2,
-        hoverOffset: 15,
-      },
-    ],
-  };
-
-  const chartOptions = {
-    responsive: true,
-    maintainAspectRatio: false,
-    plugins: {
-      legend: {
-        position: 'top',
-        labels: {
-          font: {
-            size: 12,
-            family: "'Inter', sans-serif"
-          },
-          padding: 20,
-          usePointStyle: true,
-        }
-      },
-      tooltip: {
-        backgroundColor: 'rgba(0, 0, 0, 0.8)',
-        padding: 12,
-        cornerRadius: 8,
-        titleFont: {
-          size: 13,
-          weight: '600'
-        },
-        bodyFont: {
-          size: 13
-        }
-      }
-    },
-    scales: {
-      y: {
-        beginAtZero: true,
-        grid: {
-          color: 'rgba(0, 0, 0, 0.05)'
-        },
-        ticks: {
-          font: {
-            size: 11
-          }
-        }
-      },
-      x: {
-        grid: {
-          display: false
-        },
-        ticks: {
-          font: {
-            size: 11
-          }
-        }
-      }
-    }
-  };
-
-  const pieOptions = {
-    ...chartOptions,
-    plugins: {
-      ...chartOptions.plugins,
-      legend: {
-        position: 'bottom',
-        labels: {
-          ...chartOptions.plugins.legend.labels,
-          padding: 15
-        }
-      }
-    }
-  };
+  const topCampaigns = [...campaigns]
+    .sort((a, b) => (b.data_files_count || 0) - (a.data_files_count || 0))
+    .slice(0, 5);
+  const topCampaignMax = Math.max(1, ...topCampaigns.map(c => c.data_files_count || 0));
 
   if (loading && !stats.overview.total_outcomes && campaigns.length === 0) {
     return (
@@ -229,10 +104,10 @@ const Dashboard = () => {
   if (error) {
     return (
       <div className="error-container">
-        <div className="error-icon">⚠️</div>
+        <i className="bi bi-exclamation-triangle-fill error-icon"></i>
         <h3 className="error-title">Error Loading Dashboard</h3>
         <p className="error-message">{error}</p>
-        <Button 
+        <Button
           className="retry-button"
           onClick={fetchDashboardData}
         >
@@ -252,7 +127,7 @@ const Dashboard = () => {
           </small>
         )}
       </div>
-      
+
       {/* Stats Cards */}
       <div className="stat-tile-row dashboard-row">
         <div className="stat-tile">
@@ -286,139 +161,177 @@ const Dashboard = () => {
           </div>
           <div className="stat-tile-value">{stats?.overview?.total_reports?.toLocaleString() || 0}</div>
         </div>
+
+        <div className="stat-tile">
+          <div className="stat-tile-top">
+            <span className="stat-tile-label">Records Processed</span>
+            <span className="stat-tile-chip chip-rose"><i className="bi bi-database-check"></i></span>
+          </div>
+          <div className="stat-tile-value">{stats?.overview?.total_records?.toLocaleString() || 0}</div>
+        </div>
       </div>
 
-      {/* Charts Section */}
-      <Row className="dashboard-row">
-        <Col lg={8} className="mb-4">
-          <Card className="chart-card">
-            <Card.Header>
-              <Card.Title>Weekly Call Performance</Card.Title>
-            </Card.Header>
-            <Card.Body>
-              <div className="chart-container">
-                <Bar 
-                  data={callDataChart} 
-                  options={chartOptions}
-                />
+      {/* Real-data overview: file pipeline health + top campaigns */}
+      <div className="dashboard-row dashboard-overview-row">
+        <Card className="chart-card">
+          <Card.Header>
+            <Card.Title>File Processing Status</Card.Title>
+          </Card.Header>
+          <Card.Body>
+            {fileStatusTotal === 0 ? (
+              <div className="text-center py-4">
+                <i className="bi bi-inbox text-muted" style={{ fontSize: '2.5rem' }}></i>
+                <p className="text-muted mt-3 mb-0">No files uploaded yet</p>
               </div>
-            </Card.Body>
-          </Card>
-        </Col>
-        
-        <Col lg={4} className="mb-4">
-          <Card className="chart-card">
-            <Card.Header>
-              <Card.Title>Outcome Distribution</Card.Title>
-            </Card.Header>
-            <Card.Body>
-              <div className="chart-container">
-                <Pie 
-                  data={outcomeDistributionChart} 
-                  options={pieOptions}
-                />
+            ) : (
+              <>
+                <div className="status-proportion-bar">
+                  {Object.entries(stats.file_status).map(([key, count]) => (
+                    count > 0 && (
+                      <div
+                        key={key}
+                        className={`status-proportion-segment ${STATUS_META[key].chip}`}
+                        style={{ width: `${(count / fileStatusTotal) * 100}%` }}
+                        title={`${STATUS_META[key].label}: ${count}`}
+                      />
+                    )
+                  ))}
+                </div>
+                <div className="status-legend">
+                  {Object.entries(stats.file_status).map(([key, count]) => (
+                    <div className="status-legend-item" key={key}>
+                      <span className={`status-legend-dot ${STATUS_META[key].chip}`}></span>
+                      <span className="status-legend-label">{STATUS_META[key].label}</span>
+                      <span className="status-legend-value">{count.toLocaleString()}</span>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+          </Card.Body>
+        </Card>
+
+        <Card className="chart-card">
+          <Card.Header>
+            <Card.Title>Top Campaigns by Files</Card.Title>
+          </Card.Header>
+          <Card.Body>
+            {topCampaigns.length === 0 ? (
+              <div className="text-center py-4">
+                <i className="bi bi-folder text-muted" style={{ fontSize: '2.5rem' }}></i>
+                <p className="text-muted mt-3 mb-0">No campaigns yet</p>
               </div>
-            </Card.Body>
-          </Card>
-        </Col>
-      </Row>
+            ) : (
+              <div className="top-campaign-list">
+                {topCampaigns.map(c => (
+                  <Link to={`/campaigns/${c.id}`} className="top-campaign-row" key={c.id}>
+                    <span className="top-campaign-name">{c.display_name}</span>
+                    <div className="top-campaign-bar-track">
+                      <div
+                        className="top-campaign-bar-fill"
+                        style={{ width: `${((c.data_files_count || 0) / topCampaignMax) * 100}%` }}
+                      />
+                    </div>
+                    <span className="top-campaign-count">{c.data_files_count || 0}</span>
+                  </Link>
+                ))}
+              </div>
+            )}
+          </Card.Body>
+        </Card>
+      </div>
 
       {/* Recent Activity */}
-      <Row className="dashboard-row">
-        <Col lg={6} className="mb-4">
-          <Card className="recent-card">
-            <Card.Header>
-              <Card.Title>Recent Reports</Card.Title>
-              <Badge bg="primary" pill>{stats?.recent_reports?.length || 0}</Badge>
-            </Card.Header>
-            <Card.Body>
-              {stats?.recent_reports?.length > 0 ? (
-                <div className="recent-list">
-                  {stats.recent_reports.slice(0, 5).map((report) => (
-                    <div key={report.id} className="recent-item">
-                      <div className="recent-item-icon">
-                        <i className="bi bi-file-earmark-excel"></i>
-                      </div>
-                      <div className="recent-item-content">
-                        <h6>{report.parameters?.report_name || 'Unnamed Report'}</h6>
-                        <small className="text-muted">
-                          {report.generated_at ? new Date(report.generated_at).toLocaleDateString() : 'N/A'}
-                          {report.campaign_name && (
-                            <Badge bg="info" className="ms-2">{report.campaign_name}</Badge>
-                          )}
-                          <span className="ms-2 badge bg-success">Excel</span>
-                        </small>
-                      </div>
-                      <div className="recent-item-action">
-                        <a 
-                          href={`/api/reports/${report.id}/download/`}
-                          className="btn btn-sm btn-primary"
-                          target="_blank"
-                          rel="noopener noreferrer"
-                        >
-                          <i className="bi bi-download"></i>
-                        </a>
-                      </div>
+      <div className="dashboard-row dashboard-recent-row">
+        <Card className="recent-card">
+          <Card.Header className="d-flex justify-content-between align-items-center">
+            <Card.Title>Recent Reports</Card.Title>
+            <span className="count-pill">{stats?.recent_reports?.length || 0}</span>
+          </Card.Header>
+          <Card.Body>
+            {stats?.recent_reports?.length > 0 ? (
+              <div className="recent-list">
+                {stats.recent_reports.slice(0, 5).map((report) => (
+                  <div key={report.id} className="recent-item">
+                    <div className="recent-item-icon">
+                      <i className="bi bi-file-earmark-excel"></i>
                     </div>
-                  ))}
-                </div>
-              ) : (
-                <div className="text-center py-5">
-                  <i className="bi bi-file-earmark-excel text-muted" style={{ fontSize: '3rem' }}></i>
-                  <p className="text-muted mt-3">No reports generated yet</p>
-                </div>
-              )}
-            </Card.Body>
-          </Card>
-        </Col>
-        
-        <Col lg={6} className="mb-4">
-          <Card className="recent-card">
-            <Card.Header className="d-flex justify-content-between align-items-center">
-              <Card.Title>Recent File Uploads</Card.Title>
-              <Badge bg="success" pill>{stats?.recent_files?.length || 0}</Badge>
-            </Card.Header>
-            <Card.Body>
-              {stats?.recent_files?.length > 0 ? (
-                <div className="recent-list">
-                  {stats.recent_files.slice(0, 5).map((file) => (
-                    <div key={file.id} className="recent-item">
-                      <div className="recent-item-icon">
-                        <i className="bi bi-file-earmark-excel"></i>
-                      </div>
-                      <div className="recent-item-content">
-                        <h6 title={file.original_name}>
-                          {file.original_name?.slice(0, 30) || 'Unnamed File'}
-                          {file.original_name?.length > 30 ? '...' : ''}
-                        </h6>
-                        <small className="text-muted">
-                          {file.uploaded_at ? new Date(file.uploaded_at).toLocaleDateString() : 'N/A'}
-                          {file.campaign_name && (
-                            <Badge bg="info" className="ms-2">{file.campaign_name}</Badge>
-                          )}
-                          <span className={`ms-2 status-badge ${file.status || 'unknown'}`}>
-                            {file.status || 'unknown'}
-                          </span>
-                        </small>
-                      </div>
-                      <div className="recent-item-action">
-                        <span className="file-size-badge">
-                          {file.file_size ? `${(file.file_size / 1024 / 1024).toFixed(1)} MB` : 'N/A'}
+                    <div className="recent-item-content">
+                      <h6>{report.parameters?.report_name || 'Unnamed Report'}</h6>
+                      <small className="text-muted">
+                        {report.generated_at ? new Date(report.generated_at).toLocaleDateString() : 'N/A'}
+                        {report.campaign_name && (
+                          <span className="recent-chip ms-2">{report.campaign_name}</span>
+                        )}
+                      </small>
+                    </div>
+                    <div className="recent-item-action">
+                      <a
+                        href={`/api/reports/${report.id}/download/`}
+                        className="btn btn-sm btn-primary"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        <i className="bi bi-download"></i>
+                      </a>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="text-center py-5">
+                <i className="bi bi-file-earmark-excel text-muted" style={{ fontSize: '3rem' }}></i>
+                <p className="text-muted mt-3">No reports generated yet</p>
+              </div>
+            )}
+          </Card.Body>
+        </Card>
+
+        <Card className="recent-card">
+          <Card.Header className="d-flex justify-content-between align-items-center">
+            <Card.Title>Recent File Uploads</Card.Title>
+            <span className="count-pill">{stats?.recent_files?.length || 0}</span>
+          </Card.Header>
+          <Card.Body>
+            {stats?.recent_files?.length > 0 ? (
+              <div className="recent-list">
+                {stats.recent_files.slice(0, 5).map((file) => (
+                  <div key={file.id} className="recent-item">
+                    <div className="recent-item-icon">
+                      <i className="bi bi-file-earmark-excel"></i>
+                    </div>
+                    <div className="recent-item-content">
+                      <h6 title={file.original_name}>
+                        {file.original_name?.slice(0, 30) || 'Unnamed File'}
+                        {file.original_name?.length > 30 ? '...' : ''}
+                      </h6>
+                      <small className="text-muted">
+                        {file.uploaded_at ? new Date(file.uploaded_at).toLocaleDateString() : 'N/A'}
+                        {file.campaign_name && (
+                          <span className="recent-chip ms-2">{file.campaign_name}</span>
+                        )}
+                        <span className={`ms-2 status-badge ${file.status || 'unknown'}`}>
+                          {file.status || 'unknown'}
                         </span>
-                      </div>
+                      </small>
                     </div>
-                  ))}
-                </div>
-              ) : (
-                <div className="text-center py-5">
-                  <i className="bi bi-upload text-muted" style={{ fontSize: '3rem' }}></i>
-                  <p className="text-muted mt-3">No files uploaded yet</p>
-                </div>
-              )}
-            </Card.Body>
-          </Card>
-        </Col>
-      </Row>
+                    <div className="recent-item-action">
+                      <span className="file-size-badge">
+                        {file.file_size ? `${(file.file_size / 1024 / 1024).toFixed(1)} MB` : 'N/A'}
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="text-center py-5">
+                <i className="bi bi-upload text-muted" style={{ fontSize: '3rem' }}></i>
+                <p className="text-muted mt-3">No files uploaded yet</p>
+              </div>
+            )}
+          </Card.Body>
+        </Card>
+      </div>
 
       {/* Campaigns List */}
       {campaigns.length > 0 && (
@@ -427,37 +340,35 @@ const Dashboard = () => {
             <Card.Title>Your Campaigns</Card.Title>
           </Card.Header>
           <Card.Body>
-            <Row>
-              {campaigns.map(campaign => (
-                <Col md={4} key={campaign.id} className="mb-3">
-                  <Card className="h-100 campaign-mini-card">
-                    <Card.Body>
-                      <div className="d-flex align-items-center mb-2">
-                        <div className="campaign-mini-icon me-2">
-                          <i className="bi bi-megaphone"></i>
-                        </div>
-                        <h6 className="mb-0">{campaign.display_name}</h6>
+            <div className="dashboard-campaign-grid">
+              {campaigns.slice(0, 9).map(campaign => (
+                <Card className="campaign-mini-card" key={campaign.id}>
+                  <Card.Body>
+                    <div className="d-flex align-items-center mb-2">
+                      <div className="campaign-mini-icon me-2">
+                        <i className="bi bi-megaphone"></i>
                       </div>
-                      <div className="small text-muted mb-2">
-                        Sheet: <code>{campaign.sheet_name}</code>
-                      </div>
-                      <div className="campaign-mini-stats d-flex justify-content-between">
-                        <span><Badge bg="info">{campaign.data_files_count || 0} files</Badge></span>
-                        <span><Badge bg="success">{campaign.reports_count || 0} reports</Badge></span>
-                      </div>
-                      <div className="mt-3">
-                        <Link 
-                          to={`/campaigns/${campaign.id}`}
-                          className="btn btn-sm btn-outline-primary w-100"
-                        >
-                          View Campaign
-                        </Link>
-                      </div>
-                    </Card.Body>
-                  </Card>
-                </Col>
+                      <h6 className="mb-0">{campaign.display_name}</h6>
+                    </div>
+                    <div className="small text-muted mb-3">
+                      Sheet: <code>{campaign.sheet_name}</code>
+                    </div>
+                    <div className="campaign-mini-stats d-flex gap-2">
+                      <span className="recent-chip">{campaign.data_files_count || 0} files</span>
+                      <span className="recent-chip">{campaign.reports_count || 0} reports</span>
+                    </div>
+                    <div className="mt-3">
+                      <Link
+                        to={`/campaigns/${campaign.id}`}
+                        className="btn btn-sm btn-outline-primary w-100"
+                      >
+                        View Campaign
+                      </Link>
+                    </div>
+                  </Card.Body>
+                </Card>
               ))}
-            </Row>
+            </div>
           </Card.Body>
         </Card>
       )}
@@ -475,21 +386,21 @@ const Dashboard = () => {
               </div>
               <h6>Add Outcome</h6>
             </Link>
-            
+
             <Link to="/campaigns" className="quick-action-link">
               <div className="quick-action-icon">
                 <i className="bi bi-folder"></i>
               </div>
               <h6>View Campaigns</h6>
             </Link>
-            
+
             <Link to="/campaigns" className="quick-action-link">
               <div className="quick-action-icon">
                 <i className="bi bi-upload"></i>
               </div>
               <h6>Upload Data</h6>
             </Link>
-            
+
             <Link to="/campaigns" className="quick-action-link">
               <div className="quick-action-icon">
                 <i className="bi bi-file-earmark-bar-graph"></i>
@@ -499,32 +410,6 @@ const Dashboard = () => {
           </div>
         </Card.Body>
       </Card>
-
-      {/* Add some CSS for the new campaign cards */}
-      <style jsx>{`
-        .campaign-mini-card {
-          transition: transform 0.2s;
-          border: 1px solid #e9ecef;
-        }
-        .campaign-mini-card:hover {
-          transform: translateY(-3px);
-          box-shadow: 0 5px 15px rgba(0,0,0,0.1);
-        }
-        .campaign-mini-icon {
-          width: 32px;
-          height: 32px;
-          border-radius: 8px;
-          background: #6366f1;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          color: white;
-          font-size: 1rem;
-        }
-        .campaign-mini-stats {
-          font-size: 0.85rem;
-        }
-      `}</style>
     </div>
   );
 };

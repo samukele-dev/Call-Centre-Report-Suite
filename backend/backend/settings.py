@@ -78,10 +78,18 @@ TEMPLATES = [
 WSGI_APPLICATION = 'backend.wsgi.application'
 
 # Database
+# 'timeout' is a safety net for writer-vs-writer contention (e.g. two syncs
+# at once) — SQLite's default is 5s, too short for a QA cache sync that can
+# run 60-90s. WAL mode (enabled once on the db file, see qa_source.py /
+# manage.py note) means plain reads don't block on a writer at all, so this
+# timeout should rarely if ever actually be hit.
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
         'NAME': BASE_DIR / 'db.sqlite3',
+        'OPTIONS': {
+            'timeout': 30,
+        },
     }
 }
 
@@ -147,13 +155,13 @@ CORS_ALLOW_ALL_ORIGINS = DEBUG  # Allow all in development
 DATA_UPLOAD_MAX_MEMORY_SIZE = 10485760  # 10MB
 FILE_UPLOAD_MAX_MEMORY_SIZE = 10485760  # 10MB
 
-# External source database (the call-centre platform's own MySQL/MariaDB DB,
+# External source database (the call-centre platform's own PostgreSQL DB,
 # e.g. accessed via HeidiSQL) that campaign data is pulled from. Configure via
 # backend/.env — see backend/.env.example. Left blank, "Sync from database"
 # is disabled and raises a clear error instead of connecting anywhere.
 EXTERNAL_DB = {
     'HOST': os.environ.get('SOURCE_DB_HOST', ''),
-    'PORT': int(os.environ.get('SOURCE_DB_PORT', '3306')),
+    'PORT': int(os.environ.get('SOURCE_DB_PORT', '5432')),
     'NAME': os.environ.get('SOURCE_DB_NAME', ''),
     'USER': os.environ.get('SOURCE_DB_USER', ''),
     'PASSWORD': os.environ.get('SOURCE_DB_PASSWORD', ''),

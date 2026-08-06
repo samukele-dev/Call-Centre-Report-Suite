@@ -1,10 +1,11 @@
 // src/pages/CampaignUpload.js - COMPLETE WORKING VERSION
 import React, { useState, useEffect } from 'react';
-import { 
+import {
   Card, Button, Alert, Spinner, ProgressBar,
-  Form, Row, Col, Badge, Accordion, Table
+  Form, Row, Col, Badge, Accordion, Table, Dropdown
 } from 'react-bootstrap';
 import { useParams, Link } from 'react-router-dom';
+import { saveAs } from 'file-saver';
 import DashboardService from '../api/dashboardService';
 
 const CampaignUpload = () => {
@@ -18,10 +19,59 @@ const CampaignUpload = () => {
   const [hasHeaders, setHasHeaders] = useState(true);
   const [debugInfo, setDebugInfo] = useState(null);
   const [syncing, setSyncing] = useState(false);
+  const [syncStartDate, setSyncStartDate] = useState('');
+  const [syncEndDate, setSyncEndDate] = useState('');
+  const [syncStartTime, setSyncStartTime] = useState('');
+  const [syncEndTime, setSyncEndTime] = useState('');
+  const [latestReport, setLatestReport] = useState(null);
+  const [downloadingReport, setDownloadingReport] = useState(false);
+  const [sourceLists, setSourceLists] = useState([]);
+  const [loadingLists, setLoadingLists] = useState(false);
+  const [listsError, setListsError] = useState(null);
+  const [selectedListIds, setSelectedListIds] = useState([]);
 
   useEffect(() => {
     fetchCampaign();
   }, [id]);
+
+  useEffect(() => {
+    if (campaign?.cd_campaign_id) {
+      fetchSourceLists();
+    } else {
+      setSourceLists([]);
+      setSelectedListIds([]);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [campaign?.cd_campaign_id]);
+
+  const fetchSourceLists = async () => {
+    setLoadingLists(true);
+    setListsError(null);
+    try {
+      const result = await DashboardService.getCampaignSourceLists(campaign.id);
+      if (result.success) {
+        setSourceLists(result.data || []);
+      } else {
+        setListsError(typeof result.error === 'object' ? JSON.stringify(result.error) : result.error);
+      }
+    } catch (err) {
+      setListsError('Error loading batches from the database');
+    } finally {
+      setLoadingLists(false);
+    }
+  };
+
+  const toggleListId = (listId) => {
+    setSelectedListIds(prev =>
+      prev.includes(listId) ? prev.filter(x => x !== listId) : [...prev, listId]
+    );
+  };
+
+  const allListsSelected = sourceLists.length > 0 && selectedListIds.length === sourceLists.length;
+
+  const toggleSelectAllLists = () => {
+    setSelectedListIds(allListsSelected ? [] : sourceLists.map(l => l.id));
+  };
 
   const fetchCampaign = async () => {
     try {
@@ -117,12 +167,29 @@ const CampaignUpload = () => {
   };
 
   const handleSyncFromDatabase = async () => {
+    if (syncStartDate && syncEndDate) {
+      const from = `${syncStartDate} ${syncStartTime || '00:00'}`;
+      const to = `${syncEndDate} ${syncEndTime || '23:59'}`;
+      if (from > to) {
+        setMessage({ type: 'danger', text: 'From date/time must be before or equal to the To date/time.' });
+        return;
+      }
+    }
+
     setSyncing(true);
     setMessage(null);
     setDebugInfo(null);
+    setLatestReport(null);
 
     try {
-      const result = await DashboardService.syncCampaignFromDatabase(campaign.id);
+      const result = await DashboardService.syncCampaignFromDatabase(
+        campaign.id,
+        syncStartDate || null,
+        syncEndDate || null,
+        selectedListIds,
+        syncStartTime || null,
+        syncEndTime || null
+      );
 
       if (result.success) {
         const file = result.data;
@@ -143,6 +210,14 @@ const CampaignUpload = () => {
             processedRecords: file.processed_records || 0,
             message: file.status_display || file.status
           });
+
+          // The auto-report is generated synchronously as part of the sync
+          // itself, so it already exists by the time we get here — surface
+          // it right away instead of making the user go find it on Reports.
+          const reportsResult = await DashboardService.getReports(campaign.id);
+          if (reportsResult.success && reportsResult.data?.length > 0) {
+            setLatestReport(reportsResult.data[0]);
+          }
         }
       } else {
         setMessage({
@@ -158,6 +233,24 @@ const CampaignUpload = () => {
       console.error('❌ Database sync error details:', error);
     } finally {
       setSyncing(false);
+    }
+  };
+
+  const handleDownloadLatestReport = async () => {
+    if (!latestReport) return;
+    setDownloadingReport(true);
+    try {
+      const result = await DashboardService.downloadReport(latestReport.id);
+      if (result.success) {
+        const timestamp = new Date().toISOString().slice(0, 10);
+        saveAs(result.data, `${campaign.name}_Report_${timestamp}.xlsx`);
+      } else {
+        alert('Failed to download report');
+      }
+    } catch (err) {
+      alert('Error downloading report');
+    } finally {
+      setDownloadingReport(false);
     }
   };
 
@@ -184,85 +277,234 @@ const CampaignUpload = () => {
 
   return (
     <div className="campaign-upload">
-      <div className="page-header mb-4">
-        <div className="d-flex align-items-center">
-          <Link to={`/campaigns/${id}`} className="btn btn-outline-secondary me-3">
-            <i className="bi bi-arrow-left"></i> Back
-          </Link>
-          <div>
-            <h1 className="page-title mb-1">Upload Data - {campaign.display_name}</h1>
-            <p className="text-muted mb-0">
-              <Badge bg="info" className="me-2">Sheet: {campaign.sheet_name}</Badge>
-              Upload campaign-specific data files
-            </p>
-          </div>
+      <div className="upload-page-header">
+        <Link to={`/campaigns/${id}`} className="btn btn-outline-secondary btn-icon-only" title="Back to campaign">
+          <i className="bi bi-arrow-left"></i>
+        </Link>
+        <div>
+          <h1 className="page-title mb-1">{campaign.display_name}</h1>
+          <p className="page-subtitle mb-0">
+            <span className="sheet-chip"><i className="bi bi-table"></i>{campaign.sheet_name}</span>
+            Bring in call data for this campaign
+          </p>
         </div>
       </div>
 
       {message && (
-        <Alert variant={message.type} className="mb-3">
-          <Alert.Heading>
-            {message.type === 'success' ? '✅ Success!' : '❌ Error'}
-          </Alert.Heading>
-          <p>{message.text}</p>
-          
+        <Alert variant={message.type} className="result-alert mb-4">
+          <div className="result-alert-head">
+            <i className={`bi ${message.type === 'success' ? 'bi-check-circle-fill' : 'bi-exclamation-triangle-fill'}`}></i>
+            <span>{message.text}</span>
+          </div>
+
           {debugInfo && (
-            <div className="mt-3">
-              <h6>📊 Processing Details:</h6>
-              <Table striped bordered size="sm">
-                <tbody>
-                  <tr>
-                    <td><strong>File Name:</strong></td>
-                    <td>{debugInfo.fileName}</td>
-                  </tr>
-                  <tr>
-                    <td><strong>File Size:</strong></td>
-                    <td>{formatFileSize(debugInfo.fileSize)}</td>
-                  </tr>
-                  <tr>
-                    <td><strong>Records in File:</strong></td>
-                    <td>{debugInfo.totalRecords?.toLocaleString() || 'Unknown'}</td>
-                  </tr>
-                  <tr>
-                    <td><strong>Records Processed:</strong></td>
-                    <td>{debugInfo.processedRecords?.toLocaleString() || 'Unknown'}</td>
-                  </tr>
-                  <tr>
-                    <td><strong>Status:</strong></td>
-                    <td>
-                      <Badge bg="success">
-                        {debugInfo.message}
-                      </Badge>
-                    </td>
-                  </tr>
-                </tbody>
-              </Table>
-              
-              {debugInfo.totalRecords && debugInfo.processedRecords && 
+            <>
+              <div className="result-stat-grid">
+                <div className="result-stat">
+                  <span className="result-stat-label">File</span>
+                  <span className="result-stat-value" title={debugInfo.fileName}>{debugInfo.fileName}</span>
+                </div>
+                <div className="result-stat">
+                  <span className="result-stat-label">Size</span>
+                  <span className="result-stat-value">{formatFileSize(debugInfo.fileSize)}</span>
+                </div>
+                <div className="result-stat">
+                  <span className="result-stat-label">Records in file</span>
+                  <span className="result-stat-value">{debugInfo.totalRecords?.toLocaleString() || 'Unknown'}</span>
+                </div>
+                <div className="result-stat">
+                  <span className="result-stat-label">Processed</span>
+                  <span className="result-stat-value">{debugInfo.processedRecords?.toLocaleString() || 'Unknown'}</span>
+                </div>
+              </div>
+
+              {debugInfo.totalRecords && debugInfo.processedRecords &&
                debugInfo.processedRecords < debugInfo.totalRecords && (
-                <Alert variant="warning" className="mt-2">
+                <Alert variant="warning" className="mt-3 mb-0 py-2">
                   <i className="bi bi-exclamation-triangle me-2"></i>
-                  <strong>Note:</strong> Only {debugInfo.processedRecords} out of {debugInfo.totalRecords} records 
-                  were saved to the database.
+                  Only {debugInfo.processedRecords} out of {debugInfo.totalRecords} records were saved.
                 </Alert>
               )}
-            </div>
+
+              {latestReport && (
+                <Button
+                  variant="primary"
+                  className="mt-3"
+                  onClick={handleDownloadLatestReport}
+                  disabled={downloadingReport}
+                >
+                  {downloadingReport ? (
+                    <>
+                      <span className="spinner-border spinner-border-sm me-2"></span>
+                      Downloading...
+                    </>
+                  ) : (
+                    <>
+                      <i className="bi bi-file-earmark-arrow-down me-2"></i>
+                      Download Report
+                    </>
+                  )}
+                </Button>
+              )}
+            </>
           )}
         </Alert>
       )}
 
-      <Card className="mb-4">
+      <Card className="mb-4 section-card">
+        <Card.Header>
+          <div className="section-card-title">
+            <span className="section-card-icon"><i className="bi bi-database"></i></span>
+            <div>
+              <h5 className="mb-0">Sync from Database</h5>
+              <span className="section-card-subtitle">Pull directly from the call-centre platform</span>
+            </div>
+          </div>
+        </Card.Header>
         <Card.Body>
-          <h5><i className="bi bi-database text-primary me-2"></i>Sync from Database</h5>
-          {campaign.cd_list_id ? (
+          {campaign.cd_campaign_id ? (
             <>
               <p className="text-muted mb-3">
-                Pulls the latest call data straight from the call-centre database
-                (list <code>{campaign.cd_list_id}</code>) and processes it the same
-                way an uploaded file would be.
+                Pulls call data straight from the call-centre database
+                (campaign <code>{campaign.cd_campaign_id}</code>, across every list it has ever
+                had) and processes it the same way an uploaded file would be.
               </p>
+
+              <Form.Group className="mb-3">
+                <Form.Label>Batch(es) (optional)</Form.Label>
+                {listsError ? (
+                  <Alert variant="warning" className="py-2 px-3 mb-0">
+                    Couldn't load batches from the database: {listsError}
+                  </Alert>
+                ) : (
+                  <Dropdown autoClose="outside">
+                    <Dropdown.Toggle
+                      variant="outline-secondary"
+                      className="w-100 text-start d-flex justify-content-between align-items-center"
+                      disabled={syncing || loadingLists}
+                    >
+                      <span>
+                        {loadingLists ? (
+                          <><span className="spinner-border spinner-border-sm me-2"></span>Loading batches...</>
+                        ) : selectedListIds.length === 0 ? (
+                          `All batches (${sourceLists.length})`
+                        ) : allListsSelected ? (
+                          `All ${sourceLists.length} batches selected`
+                        ) : (
+                          `${selectedListIds.length} of ${sourceLists.length} batch${sourceLists.length !== 1 ? 'es' : ''} selected`
+                        )}
+                      </span>
+                    </Dropdown.Toggle>
+                    <Dropdown.Menu className="w-100" style={{ maxHeight: '280px', overflowY: 'auto' }}>
+                      {sourceLists.length === 0 ? (
+                        <Dropdown.ItemText className="text-muted">No batches found for this campaign.</Dropdown.ItemText>
+                      ) : (
+                        <>
+                          <Dropdown.Item as="button" onClick={toggleSelectAllLists}>
+                            <Form.Check
+                              type="checkbox"
+                              readOnly
+                              checked={allListsSelected}
+                              label={<strong>{allListsSelected ? 'Deselect all' : 'Select all'}</strong>}
+                            />
+                          </Dropdown.Item>
+                          <Dropdown.Item as="button" onClick={() => setSelectedListIds([])}>
+                            <i className="bi bi-asterisk me-2"></i>Clear (use campaign's full history)
+                          </Dropdown.Item>
+                          <Dropdown.Divider />
+                          {sourceLists.map(list => (
+                            <Dropdown.Item
+                              as="button"
+                              key={list.id}
+                              onClick={() => toggleListId(list.id)}
+                              active={selectedListIds.includes(list.id)}
+                            >
+                              <Form.Check
+                                type="checkbox"
+                                readOnly
+                                checked={selectedListIds.includes(list.id)}
+                                label={
+                                  <>
+                                    {list.name}
+                                    {list.created_at && (
+                                      <span className="text-muted small ms-2">
+                                        {new Date(list.created_at).toLocaleDateString()}
+                                      </span>
+                                    )}
+                                  </>
+                                }
+                              />
+                            </Dropdown.Item>
+                          ))}
+                        </>
+                      )}
+                    </Dropdown.Menu>
+                  </Dropdown>
+                )}
+                <Form.Text className="text-muted d-block mt-1">
+                  Pick specific upload batches (e.g. "Absa Insurance 20260618") pulled live from the database,
+                  use "Select all" to check every one individually, or leave it cleared for the campaign's full history.
+                </Form.Text>
+              </Form.Group>
+
+              <Row className="mb-3">
+                <Col md={5}>
+                  <Form.Group>
+                    <Form.Label>From (optional)</Form.Label>
+                    <Row className="g-2">
+                      <Col xs={7}>
+                        <Form.Control
+                          type="date"
+                          value={syncStartDate}
+                          onChange={(e) => setSyncStartDate(e.target.value)}
+                          disabled={syncing}
+                          max={syncEndDate || undefined}
+                        />
+                      </Col>
+                      <Col xs={5}>
+                        <Form.Control
+                          type="time"
+                          value={syncStartTime}
+                          onChange={(e) => setSyncStartTime(e.target.value)}
+                          disabled={syncing}
+                          title="Optional — narrows the start date to a specific time (ignored unless a start date is also set)"
+                        />
+                      </Col>
+                    </Row>
+                  </Form.Group>
+                </Col>
+                <Col md={5}>
+                  <Form.Group>
+                    <Form.Label>To (optional)</Form.Label>
+                    <Row className="g-2">
+                      <Col xs={7}>
+                        <Form.Control
+                          type="date"
+                          value={syncEndDate}
+                          onChange={(e) => setSyncEndDate(e.target.value)}
+                          disabled={syncing}
+                          min={syncStartDate || undefined}
+                        />
+                      </Col>
+                      <Col xs={5}>
+                        <Form.Control
+                          type="time"
+                          value={syncEndTime}
+                          onChange={(e) => setSyncEndTime(e.target.value)}
+                          disabled={syncing}
+                          title="Optional — narrows the end date to a specific time (ignored unless an end date is also set)"
+                        />
+                      </Col>
+                    </Row>
+                  </Form.Group>
+                </Col>
+              </Row>
+              <Form.Text className="text-muted d-block mb-3">
+                Filters by interaction date (when the call happened), on top of the batch selection above. Time is optional and narrows the from/to date to a specific moment. Leave everything blank for no date limit.
+              </Form.Text>
+
               <Button
-                variant="success"
+                variant="primary"
                 size="lg"
                 onClick={handleSyncFromDatabase}
                 disabled={syncing || uploading}
@@ -282,24 +524,42 @@ const CampaignUpload = () => {
             </>
           ) : (
             <Alert variant="secondary" className="mb-0">
-              No source database list is configured for this campaign yet.
-              Set a <strong>Source Database List ID</strong> on the campaign
+              No source database campaign is configured for this campaign yet.
+              Set a <strong>Source Database Campaign ID</strong> on the campaign
               (via the Campaigns page or Django admin) to enable this.
             </Alert>
           )}
         </Card.Body>
       </Card>
 
-      <Card>
+      <Card className="section-card">
+        <Card.Header>
+          <div className="section-card-title">
+            <span className="section-card-icon section-card-icon-neutral"><i className="bi bi-upload"></i></span>
+            <div>
+              <h5 className="mb-0">Upload a File</h5>
+              <span className="section-card-subtitle">CSV or Excel, processed the same way as a database sync</span>
+            </div>
+          </div>
+        </Card.Header>
         <Card.Body>
-          <div className="upload-instructions mb-4">
-            <h5><i className="bi bi-info-circle text-primary me-2"></i>How It Works</h5>
-            <ul>
-              <li><strong>Upload</strong> your call data CSV/Excel file for this campaign</li>
-              <li><strong>Processing</strong>: System reads "last_outcome" and matches with descriptions from database</li>
-              <li><strong>Output</strong>: Adds a "Description" column after "last_outcome"</li>
-              <li><strong>Database</strong>: Saves all records to database for reporting</li>
-            </ul>
+          <div className="upload-steps mb-4">
+            <div className="upload-step">
+              <span className="upload-step-num">1</span>
+              <span>Upload your file</span>
+            </div>
+            <div className="upload-step">
+              <span className="upload-step-num">2</span>
+              <span>Match outcomes to descriptions</span>
+            </div>
+            <div className="upload-step">
+              <span className="upload-step-num">3</span>
+              <span>Add a Description column</span>
+            </div>
+            <div className="upload-step">
+              <span className="upload-step-num">4</span>
+              <span>Save &amp; generate report</span>
+            </div>
           </div>
 
           <form onSubmit={handleFileUpload}>
@@ -353,7 +613,7 @@ const CampaignUpload = () => {
                         </tr>
                         <tr>
                           <td><code>Description</code></td>
-                          <td><Badge bg="success">Auto-added</Badge></td>
+                          <td><Badge bg="info">Auto-added</Badge></td>
                           <td>Will be added automatically after processing</td>
                         </tr>
                       </tbody>
@@ -403,10 +663,10 @@ const CampaignUpload = () => {
                   </small>
                   <small>{uploadProgress}%</small>
                 </div>
-                <ProgressBar 
-                  now={uploadProgress} 
-                  animated 
-                  variant="success"
+                <ProgressBar
+                  now={uploadProgress}
+                  animated
+                  variant="primary"
                 />
               </div>
             )}

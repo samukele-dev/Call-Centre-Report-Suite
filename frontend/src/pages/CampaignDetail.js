@@ -6,8 +6,21 @@ import {
 } from 'react-bootstrap';
 import { useParams, Link } from 'react-router-dom';
 import DashboardService from '../api/dashboardService';
-import { Bar, Doughnut } from 'react-chartjs-2';
+import { Doughnut } from 'react-chartjs-2';
+import {
+  Chart as ChartJS,
+  ArcElement,
+  Title,
+  Tooltip,
+  Legend
+} from 'chart.js';
 import { saveAs } from 'file-saver';
+
+// This page's Doughnut chart needs ArcElement registered. Previously this
+// worked only by accident — Dashboard.js registered it as a side effect of
+// loading first, which broke the moment that page's own charts were
+// rewritten. Registering here directly makes this page self-contained.
+ChartJS.register(ArcElement, Title, Tooltip, Legend);
 
 const CampaignDetail = () => {
   const { id } = useParams();

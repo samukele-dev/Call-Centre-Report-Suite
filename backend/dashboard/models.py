@@ -33,11 +33,24 @@ class Campaign(models.Model):
         help_text="Sheet name in templates for this campaign"
     )
 
-    # External source-database list this campaign pulls call data from
-    cd_list_id = models.CharField(
+    # External source-database campaign (cxm.campaigns.id) this campaign pulls
+    # call data from. A source campaign owns many cd_lists (one per upload
+    # batch over time), so syncing scopes by campaign_id, not a single list.
+    cd_campaign_id = models.CharField(
         max_length=64, null=True, blank=True,
-        help_text="cd_list_id (UUID) in the external call-centre database "
-                   "used to scope 'Sync from database' pulls for this campaign"
+        help_text="Campaign UUID (cxm.campaigns.id) in the external call-centre "
+                   "database used to scope 'Sync from database' pulls"
+    )
+
+    # Which named collection of outcome descriptions this campaign resolves
+    # last_outcome -> Description against. Strictly scoped — a campaign only
+    # ever sees descriptions from its own assigned set, no fallback to any
+    # other set. Every campaign defaults to "Outcomes 1" (see the migration
+    # that introduced this field) so nothing broke on rollout.
+    outcome_set = models.ForeignKey(
+        'OutcomeSet', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='campaigns',
+        help_text="Outcome set this campaign's uploads/syncs resolve descriptions against"
     )
 
     class Meta:
@@ -47,10 +60,37 @@ class Campaign(models.Model):
         return self.display_name
 
 
+# ========== OUTCOME SET ==========
+class OutcomeSet(models.Model):
+    """
+    A named collection of outcome descriptions (e.g. "Outcomes 1",
+    "Outcomes 2"). Campaigns are assigned to exactly one set, and only ever
+    resolve last_outcome -> Description within that set — sets don't fall
+    back to one another.
+    """
+    name = models.CharField(max_length=100, unique=True)
+    description = models.TextField(blank=True, null=True)
+    created_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['name']
+
+    def __str__(self):
+        return self.name
+
+
 # ========== OUTCOME DESCRIPTION ==========
 class OutcomeDescription(models.Model):
     last_outcome = models.CharField(max_length=100)
     description = models.TextField()
+    outcome_set = models.ForeignKey(
+        OutcomeSet, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='descriptions'
+    )
     created_by = models.ForeignKey(
         User, on_delete=models.SET_NULL, null=True, blank=True
     )
@@ -241,3 +281,44 @@ class ReportTemplate(models.Model):
 
     class Meta:
         ordering = ['-uploaded_at']
+
+
+# ========== QA CALL RECORD (local cache) ==========
+class QACallRecord(models.Model):
+    """
+    Local cache of QA-relevant call data, refreshed on demand from the
+    external source DB (see dashboard/qa_source.py). Exists because filtering
+    the source DB live by date has no supporting index there (see
+    docs/qa-review.md) — querying this local, properly-indexed copy instead
+    is what makes the QA page fast, at the cost of the data being only as
+    fresh as the last sync rather than live-to-the-second.
+
+    Deliberately separate from ProcessedData (the Campaign upload/sync
+    pipeline's table): different columns (full outcome name, recording ref),
+    different source query, different purpose.
+    """
+    campaign = models.ForeignKey(
+        Campaign, on_delete=models.CASCADE, related_name='qa_records'
+    )
+    contact_id = models.CharField(max_length=255, db_index=True)
+    customer = models.CharField(max_length=500, null=True, blank=True)
+    phone_number = models.CharField(max_length=100, null=True, blank=True)
+    agent_name = models.CharField(max_length=255, null=True, blank=True)
+    outcome = models.CharField(max_length=255, null=True, blank=True)
+    call_date = models.DateTimeField(null=True, blank=True)
+    recording_key = models.CharField(max_length=500, null=True, blank=True)
+    recording_duration_seconds = models.IntegerField(null=True, blank=True)
+    synced_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['campaign', 'contact_id'], name='unique_qa_record_per_contact')
+        ]
+        indexes = [
+            models.Index(fields=['campaign', 'call_date']),
+            models.Index(fields=['campaign', 'outcome']),
+        ]
+        ordering = ['-call_date']
+
+    def __str__(self):
+        return f"{self.contact_id} [{self.campaign.display_name}] - {self.outcome}"

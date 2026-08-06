@@ -1,147 +1,142 @@
-// src/pages/OutcomeDescriptions.js - UPDATED WITH FIXES
-import React, { useState, useEffect } from 'react';
-import { 
-  Table, Button, Modal, Form, Alert, Spinner,
-  InputGroup, Row, Col, Badge, Card, Pagination
+// src/pages/OutcomeDescriptions.js
+import React, { useState, useEffect, useCallback } from 'react';
+import {
+  Button, Modal, Form, Alert, Spinner
 } from 'react-bootstrap';
 import DashboardService from '../api/dashboardService';
 import { saveAs } from 'file-saver';
 
+const PAGE_SIZE = 50;
+
 const OutcomeDescriptions = () => {
   const [outcomes, setOutcomes] = useState([]);
+  const [outcomeSets, setOutcomeSets] = useState([]);
+  const [campaigns, setCampaigns] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [showModal, setShowModal] = useState(false);
   const [showUploadModal, setShowUploadModal] = useState(false);
+  const [showSetModal, setShowSetModal] = useState(false);
   const [editingOutcome, setEditingOutcome] = useState(null);
+  const [editingSet, setEditingSet] = useState(null);
   const [uploadFile, setUploadFile] = useState(null);
+  const [uploadSetId, setUploadSetId] = useState('');
   const [uploading, setUploading] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
-  const [totalCount, setTotalCount] = useState(0);
+  const [activeSetId, setActiveSetId] = useState('all');
   const [currentPage, setCurrentPage] = useState(1);
-  const [itemsPerPage] = useState(50);
   const [uploadResult, setUploadResult] = useState(null);
+  const [savingSet, setSavingSet] = useState(false);
 
-  // Form state
   const [formData, setFormData] = useState({
     last_outcome: '',
     description: '',
+    outcome_set: '',
   });
+  const [outcomeSetForm, setOutcomeSetForm] = useState({ name: '', description: '' });
 
-  useEffect(() => {
-    fetchOutcomes();
-  }, [searchTerm, currentPage]);
+  const fetchOutcomeSets = useCallback(async () => {
+    const result = await DashboardService.getOutcomeSets();
+    if (result.success) setOutcomeSets(result.data || []);
+  }, []);
 
-  const fetchOutcomes = async () => {
+  const fetchCampaigns = useCallback(async () => {
+    const result = await DashboardService.getCampaigns();
+    if (result.success) setCampaigns(result.data || []);
+  }, []);
+
+  const fetchOutcomes = useCallback(async () => {
     setLoading(true);
     setError(null);
-    
     try {
       const params = {};
       if (searchTerm) params.search = searchTerm;
-      
-      console.log('📡 Fetching outcomes with params:', params);
-      
+      if (activeSetId !== 'all') params.outcome_set = activeSetId;
+
       const result = await DashboardService.getOutcomeDescriptions(params);
-      
-      console.log('📦 API Response:', result);
-      
       if (result.success) {
-        // Check if data is an array
-        if (Array.isArray(result.data)) {
-          setOutcomes(result.data);
-          setTotalCount(result.data.length);
-        } else if (result.data && result.data.results) {
-          // If using DRF pagination with results field
-          setOutcomes(result.data.results);
-          setTotalCount(result.data.count || result.data.results.length);
-        } else if (result.data && Array.isArray(result.data.data)) {
-          // If data is nested under data field
-          setOutcomes(result.data.data);
-          setTotalCount(result.data.total || result.data.data.length);
-        } else {
-          console.error('Unexpected data format:', result.data);
-          setOutcomes([]);
-          setTotalCount(0);
+        const data = Array.isArray(result.data) ? result.data : [];
+        if (activeSetId === 'all') {
+          data.sort((a, b) => {
+            const setCompare = (a.outcome_set_name || '').localeCompare(b.outcome_set_name || '');
+            return setCompare !== 0 ? setCompare : (a.last_outcome || '').localeCompare(b.last_outcome || '');
+          });
         }
+        setOutcomes(data);
       } else {
-        setError(result.error || 'Failed to fetch outcomes');
+        setError(typeof result.error === 'object' ? JSON.stringify(result.error) : (result.error || 'Failed to fetch outcomes'));
         setOutcomes([]);
-        setTotalCount(0);
       }
     } catch (err) {
-      console.error('Error fetching outcomes:', err);
       setError(err.message || 'An error occurred while fetching outcomes');
       setOutcomes([]);
-      setTotalCount(0);
     }
-    
     setLoading(false);
+  }, [searchTerm, activeSetId]);
+
+  useEffect(() => {
+    fetchOutcomeSets();
+    fetchCampaigns();
+  }, [fetchOutcomeSets, fetchCampaigns]);
+
+  useEffect(() => {
+    fetchOutcomes();
+  }, [fetchOutcomes]);
+
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [searchTerm, activeSetId]);
+
+  const defaultSetId = () => {
+    if (activeSetId !== 'all') return activeSetId;
+    const outcomes1 = outcomeSets.find(s => s.name === 'Outcomes 1');
+    return outcomes1 ? outcomes1.id : (outcomeSets[0]?.id || '');
   };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    
-    try {
-      if (editingOutcome) {
-        // Update existing outcome
-        const result = await DashboardService.updateOutcomeDescription(
-          editingOutcome.id,
-          {
-            last_outcome: formData.last_outcome,
-            description: formData.description,
-          }
-        );
-        
-        if (result.success) {
-          fetchOutcomes();
-          handleCloseModal();
-        } else {
-          setError(result.error || 'Failed to update outcome');
-        }
-      } else {
-        // Create new outcome
-        const result = await DashboardService.createOutcomeDescription({
-          last_outcome: formData.last_outcome,
-          description: formData.description,
-        });
-        
-        if (result.success) {
-          fetchOutcomes();
-          handleCloseModal();
-        } else {
-          setError(result.error || 'Failed to create outcome');
-        }
-      }
-    } catch (err) {
-      console.error('Error saving outcome:', err);
-      setError(err.message || 'An error occurred while saving');
+    const payload = {
+      last_outcome: formData.last_outcome,
+      description: formData.description,
+      outcome_set: formData.outcome_set || null,
+    };
+    const result = editingOutcome
+      ? await DashboardService.updateOutcomeDescription(editingOutcome.id, payload)
+      : await DashboardService.createOutcomeDescription(payload);
+
+    if (result.success) {
+      fetchOutcomes();
+      fetchOutcomeSets();
+      handleCloseModal();
+    } else {
+      setError(typeof result.error === 'object' ? JSON.stringify(result.error) : result.error);
     }
   };
 
   const handleEdit = (outcome) => {
-    console.log('Editing outcome:', outcome);
     setEditingOutcome(outcome);
     setFormData({
-      last_outcome: outcome.last_outcome || outcome.abbreviation || '',
+      last_outcome: outcome.last_outcome || '',
       description: outcome.description || '',
+      outcome_set: outcome.outcome_set || '',
     });
+    setShowModal(true);
+  };
+
+  const handleAddNew = () => {
+    setEditingOutcome(null);
+    setFormData({ last_outcome: '', description: '', outcome_set: defaultSetId() });
     setShowModal(true);
   };
 
   const handleDelete = async (id) => {
     if (window.confirm('Are you sure you want to delete this outcome?')) {
-      try {
-        const result = await DashboardService.deleteOutcomeDescription(id);
-        
-        if (result.success) {
-          fetchOutcomes();
-        } else {
-          setError(result.error || 'Failed to delete outcome');
-        }
-      } catch (err) {
-        console.error('Error deleting outcome:', err);
-        setError(err.message || 'An error occurred while deleting');
+      const result = await DashboardService.deleteOutcomeDescription(id);
+      if (result.success) {
+        fetchOutcomes();
+        fetchOutcomeSets();
+      } else {
+        setError(typeof result.error === 'object' ? JSON.stringify(result.error) : result.error);
       }
     }
   };
@@ -149,356 +144,329 @@ const OutcomeDescriptions = () => {
   const handleCloseModal = () => {
     setShowModal(false);
     setEditingOutcome(null);
-    setFormData({
-      last_outcome: '',
-      description: '',
-    });
+    setFormData({ last_outcome: '', description: '', outcome_set: '' });
   };
 
   const handleFileUpload = async (e) => {
     e.preventDefault();
-    
-    if (!uploadFile) {
-      alert('Please select a file to upload');
-      return;
-    }
-    
+    if (!uploadFile) return;
+
     setUploading(true);
     setUploadResult(null);
-    console.log('📤 Uploading file:', uploadFile.name, uploadFile.type, uploadFile.size);
-    
     try {
-      // Check file size (limit to 10MB)
       if (uploadFile.size > 10 * 1024 * 1024) {
         throw new Error('File size exceeds 10MB limit');
       }
-      
-      const result = await DashboardService.bulkUploadOutcomes(uploadFile);
-      console.log('📦 Upload result:', result);
-      
+      const result = await DashboardService.bulkUploadOutcomes(uploadFile, uploadSetId || null);
       if (result.success) {
-        setUploadResult({
-          success: true,
-          message: result.data.message || 'Upload successful',
-          details: result.data
-        });
-        
-        // Show success alert
-        alert(`✅ ${result.data.message}\n\nCreated: ${result.data.created}\nUpdated: ${result.data.updated}\nTotal in DB: ${result.data.total_in_db}`);
-        
-        // Close modal after 2 seconds and refresh data
+        setUploadResult({ success: true, message: result.data.message, details: result.data.details });
         setTimeout(() => {
           setShowUploadModal(false);
           setUploadFile(null);
+          setUploadResult(null);
           fetchOutcomes();
-        }, 2000);
-        
+          fetchOutcomeSets();
+        }, 1800);
       } else {
-        const errorMsg = result.error 
-          ? (typeof result.error === 'object' ? JSON.stringify(result.error) : result.error)
-          : 'Upload failed';
-        
         setUploadResult({
           success: false,
-          message: errorMsg
+          message: typeof result.error === 'object' ? JSON.stringify(result.error) : result.error
         });
-        
-        alert(`❌ Error: ${errorMsg}`);
       }
     } catch (error) {
-      console.error('Upload error:', error);
-      
-      let errorMessage = error.message || 'Upload failed';
-      
-      // Handle specific error cases
-      if (error.response) {
-        // Server responded with error
-        errorMessage = `Server error: ${error.response.status} - ${error.response.statusText}`;
-        if (error.response.data) {
-          if (typeof error.response.data === 'object') {
-            errorMessage += `\n${JSON.stringify(error.response.data, null, 2)}`;
-          } else {
-            errorMessage += `\n${error.response.data}`;
-          }
-        }
-      } else if (error.request) {
-        // Request was made but no response
-        errorMessage = 'No response from server. Please check your connection.';
-      }
-      
-      setUploadResult({
-        success: false,
-        message: errorMessage
-      });
-      
-      alert(`❌ Upload failed: ${errorMessage}`);
+      setUploadResult({ success: false, message: error.message || 'Upload failed' });
     } finally {
       setUploading(false);
     }
   };
 
   const handleExport = async () => {
-    try {
-      const result = await DashboardService.exportOutcomes();
-      
-      if (result.success) {
-        saveAs(result.data, `outcome_descriptions_${new Date().toISOString().split('T')[0]}.xlsx`);
-      } else {
-        alert('Failed to export outcomes');
-      }
-    } catch (error) {
-      console.error('Export error:', error);
-      alert('Failed to export outcomes');
+    const result = await DashboardService.exportOutcomes();
+    if (result.success) {
+      saveAs(result.data, `outcome_descriptions_${new Date().toISOString().split('T')[0]}.xlsx`);
+    } else {
+      setError('Failed to export outcomes');
     }
   };
 
-  // Calculate pagination
-  const indexOfLastItem = currentPage * itemsPerPage;
-  const indexOfFirstItem = indexOfLastItem - itemsPerPage;
-  const currentItems = outcomes.slice(indexOfFirstItem, indexOfLastItem);
-  const totalPages = Math.ceil(outcomes.length / itemsPerPage);
-
-  const handlePageChange = (pageNumber) => {
-    setCurrentPage(pageNumber);
+  const handleOpenNewSet = () => {
+    setEditingSet(null);
+    setOutcomeSetForm({ name: '', description: '' });
+    setShowSetModal(true);
   };
 
-  const paginationItems = [];
-  for (let number = 1; number <= totalPages; number++) {
-    paginationItems.push(
-      <Pagination.Item
-        key={number}
-        active={number === currentPage}
-        onClick={() => handlePageChange(number)}
-      >
-        {number}
-      </Pagination.Item>
-    );
-  }
+  const handleSaveSet = async (e) => {
+    e.preventDefault();
+    setSavingSet(true);
+    const result = editingSet
+      ? await DashboardService.updateOutcomeSet(editingSet.id, outcomeSetForm)
+      : await DashboardService.createOutcomeSet(outcomeSetForm);
+
+    if (result.success) {
+      await fetchOutcomeSets();
+      if (!editingSet) setActiveSetId(result.data.id);
+      setShowSetModal(false);
+    } else {
+      setError(typeof result.error === 'object' ? JSON.stringify(result.error) : result.error);
+    }
+    setSavingSet(false);
+  };
+
+  const campaignsWithoutSet = campaigns.filter(c => !c.outcome_set);
+  const activeSet = outcomeSets.find(s => s.id === activeSetId);
+
+  const totalPages = Math.max(1, Math.ceil(outcomes.length / PAGE_SIZE));
+  const pageStart = (currentPage - 1) * PAGE_SIZE;
+  const pageItems = outcomes.slice(pageStart, pageStart + PAGE_SIZE);
+
+  const goToPage = (page) => setCurrentPage(Math.min(Math.max(1, page), totalPages));
+  const pageNumbers = () => {
+    const nums = [];
+    for (let p = 1; p <= totalPages; p++) {
+      if (p === 1 || p === totalPages || Math.abs(p - currentPage) <= 1) nums.push(p);
+      else if (nums[nums.length - 1] !== '…') nums.push('…');
+    }
+    return nums;
+  };
 
   return (
     <div className="outcome-descriptions">
-      <div className="page-header">
-        <h1 className="page-title">Outcome Descriptions</h1>
-        <p className="page-subtitle">
-          Manage last_outcomes and their descriptions (File 1)
-        </p>
+      <div className="page-header d-flex justify-content-between align-items-start flex-wrap gap-3">
+        <div>
+          <h1 className="page-title mb-1">Outcome Descriptions</h1>
+          <p className="page-subtitle mb-0">
+            What each <code>last_outcome</code> code means — grouped into sets, since some campaigns use their own.
+          </p>
+        </div>
+        <div className="d-flex gap-2">
+          <Button variant="outline-secondary" onClick={handleExport}>
+            <i className="bi bi-download me-1"></i>Export
+          </Button>
+          <Button variant="outline-secondary" onClick={() => setShowUploadModal(true)}>
+            <i className="bi bi-upload me-1"></i>Bulk Upload
+          </Button>
+          <Button variant="primary" onClick={handleAddNew}>
+            <i className="bi bi-plus-circle me-1"></i>Add Outcome
+          </Button>
+        </div>
       </div>
 
-      {error && (
-        <Alert variant="danger" dismissible onClose={() => setError(null)}>
-          <Alert.Heading>Error</Alert.Heading>
-          <p>{error}</p>
+      {/* Overview stat tiles */}
+      <div className="stat-tile-row">
+        <div className="stat-tile">
+          <div className="stat-tile-top">
+            <span className="stat-tile-label">Outcome Sets</span>
+            <span className="stat-tile-chip chip-indigo"><i className="bi bi-collection"></i></span>
+          </div>
+          <div className="stat-tile-value">{outcomeSets.length}</div>
+        </div>
+        <div className="stat-tile">
+          <div className="stat-tile-top">
+            <span className="stat-tile-label">Total Descriptions</span>
+            <span className="stat-tile-chip chip-teal"><i className="bi bi-list-check"></i></span>
+          </div>
+          <div className="stat-tile-value">
+            {outcomeSets.reduce((sum, s) => sum + (s.descriptions_count || 0), 0).toLocaleString()}
+          </div>
+        </div>
+        <div className="stat-tile">
+          <div className="stat-tile-top">
+            <span className="stat-tile-label">Campaigns Assigned</span>
+            <span className="stat-tile-chip chip-blue"><i className="bi bi-folder-check"></i></span>
+          </div>
+          <div className="stat-tile-value">{campaigns.length - campaignsWithoutSet.length}</div>
+          <div className="stat-tile-foot">of {campaigns.length} total</div>
+        </div>
+        <div className="stat-tile">
+          <div className="stat-tile-top">
+            <span className="stat-tile-label">Needs a Set</span>
+            <span className="stat-tile-chip chip-rose"><i className="bi bi-exclamation-triangle"></i></span>
+          </div>
+          <div className="stat-tile-value">{campaignsWithoutSet.length}</div>
+          <div className="stat-tile-foot">campaigns with no descriptions at all</div>
+        </div>
+      </div>
+
+      {campaignsWithoutSet.length > 0 && (
+        <Alert variant="warning" className="mb-4">
+          <i className="bi bi-exclamation-triangle me-2"></i>
+          <strong>{campaignsWithoutSet.length} campaign{campaignsWithoutSet.length !== 1 ? 's have' : ' has'}</strong> no
+          outcome set assigned — their Description column will be blank until you assign one on the Campaigns page.
+          {' '}({campaignsWithoutSet.slice(0, 5).map(c => c.display_name).join(', ')}{campaignsWithoutSet.length > 5 ? ', …' : ''})
         </Alert>
       )}
 
-      <Card className="mb-4">
-        <Card.Body>
-          <Row className="align-items-center">
-            <Col md={4}>
-              <InputGroup>
-                <InputGroup.Text>
-                  <i className="bi bi-search"></i>
-                </InputGroup.Text>
-                <Form.Control
-                  placeholder="Search last_outcomes or descriptions..."
-                  value={searchTerm}
-                  onChange={(e) => setSearchTerm(e.target.value)}
-                />
-                {searchTerm && (
-                  <Button
-                    variant="outline-secondary"
-                    onClick={() => setSearchTerm('')}
-                  >
-                    <i className="bi bi-x"></i>
-                  </Button>
-                )}
-              </InputGroup>
-            </Col>
-            
-            <Col md={3}>
-              <Form.Select
-              >
-                <option value="">All Categories</option>
-                <option value="TrueContact">True Contacts</option>
-                <option value="Unsuccessful">Unsuccessful Contacts</option>
-                <option value="Unworkable">Unworkable Leads</option>
-              </Form.Select>
-            </Col>
-            
-            <Col md={5} className="text-end">
-              <div className="d-flex justify-content-end align-items-center gap-2">
-                <div className="text-muted me-3">
-                  <small>Total: <strong>{totalCount}</strong> outcomes</small>
-                </div>
-                <Button 
-                  variant="primary" 
-                  className="me-2"
-                  onClick={() => setShowModal(true)}
-                >
-                  <i className="bi bi-plus-circle me-1"></i>
-                  Add Outcome
-                </Button>
-                
-                <Button 
-                  variant="success" 
-                  className="me-2"
-                  onClick={() => setShowUploadModal(true)}
-                >
-                  <i className="bi bi-upload me-1"></i>
-                  Bulk Upload
-                </Button>
-                
-                <Button 
-                  variant="outline-secondary"
-                  onClick={handleExport}
-                >
-                  <i className="bi bi-download me-1"></i>
-                  Export
-                </Button>
-              </div>
-            </Col>
-          </Row>
-        </Card.Body>
-      </Card>
+      {error && (
+        <Alert variant="danger" dismissible onClose={() => setError(null)} className="mb-4">
+          {error}
+        </Alert>
+      )}
+
+      {/* Outcome set tabs */}
+      <div className="outcome-set-tabs">
+        <button
+          className={`outcome-set-tab ${activeSetId === 'all' ? 'active' : ''}`}
+          onClick={() => setActiveSetId('all')}
+        >
+          All Sets
+        </button>
+        {outcomeSets.map(s => (
+          <button
+            key={s.id}
+            className={`outcome-set-tab ${activeSetId === s.id ? 'active' : ''}`}
+            onClick={() => setActiveSetId(s.id)}
+          >
+            {s.name} <span className="outcome-set-tab-count">{s.descriptions_count}</span>
+          </button>
+        ))}
+        <button className="outcome-set-tab outcome-set-tab-new" onClick={handleOpenNewSet}>
+          <i className="bi bi-plus-lg"></i> New Set
+        </button>
+      </div>
+
+      {activeSet && (
+        <div className="outcome-set-meta mb-3">
+          <div>
+            {activeSet.description && <span className="text-muted small me-3">{activeSet.description}</span>}
+            <span className="recent-chip me-2">{activeSet.campaigns_count} campaign{activeSet.campaigns_count !== 1 ? 's' : ''} using this set</span>
+          </div>
+          <button
+            className="btn btn-sm btn-outline-secondary"
+            onClick={() => {
+              setEditingSet(activeSet);
+              setOutcomeSetForm({ name: activeSet.name, description: activeSet.description || '' });
+              setShowSetModal(true);
+            }}
+          >
+            <i className="bi bi-pencil me-1"></i>Rename
+          </button>
+        </div>
+      )}
+
+      {/* Filter bar */}
+      <div className="filter-bar mb-3">
+        <div className="page-search filter-search">
+          <i className="bi bi-search"></i>
+          <input
+            type="text"
+            placeholder="Search codes or descriptions..."
+            value={searchTerm}
+            onChange={(e) => setSearchTerm(e.target.value)}
+          />
+        </div>
+        <span className="text-muted small">{outcomes.length.toLocaleString()} result{outcomes.length !== 1 ? 's' : ''}</span>
+      </div>
 
       {loading ? (
         <div className="text-center py-5">
-          <Spinner animation="border" role="status">
-            <span className="visually-hidden">Loading...</span>
-          </Spinner>
+          <Spinner animation="border" variant="primary" />
         </div>
       ) : (
         <>
-          <Card>
-            <Card.Body>
-              <div className="table-responsive">
-                <Table hover striped>
-                  <thead>
-                    <tr>
-                      <th>last_outcome</th>
-                      <th>Description</th>
-                      <th>Created By</th>
-                      <th>Created At</th>
-                      <th>Actions</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {currentItems.length === 0 ? (
-                      <tr>
-                        <td colSpan="6" className="text-center py-4">
-                          <i className="bi bi-inbox" style={{ fontSize: '3rem', color: '#6c757d' }}></i>
-                          <p className="mt-2">No outcome descriptions found</p>
-                          
-                        </td>
-                      </tr>
-                    ) : (
-                      currentItems.map((outcome) => (
-                        <tr key={outcome.id}>
-                          <td>
-                            <strong>{outcome.last_outcome || outcome.abbreviation}</strong>
-                          </td>
-                          <td>
-                            <div className="description-cell">
-                              {outcome.description}
-                            </div>
-                          </td>
-                          <td>
-                          </td>
-                          <td>
-                            <small>{outcome.created_by_name || 'System'}</small>
-                          </td>
-                          <td>
-                            <small>
-                              {outcome.created_at ? new Date(outcome.created_at).toLocaleDateString() : 'N/A'}
-                            </small>
-                          </td>
-                          <td>
-                            <Button
-                              variant="outline-primary"
-                              size="sm"
-                              className="me-2"
-                              onClick={() => handleEdit(outcome)}
-                            >
-                              <i className="bi bi-pencil"></i>
-                            </Button>
-                            
-                            <Button
-                              variant="outline-danger"
-                              size="sm"
-                              onClick={() => handleDelete(outcome.id)}
-                            >
-                              <i className="bi bi-trash"></i>
-                            </Button>
-                          </td>
-                        </tr>
-                      ))
-                    )}
-                  </tbody>
-                </Table>
-              </div>
-              
-              <div className="d-flex justify-content-between align-items-center mt-3">
-                <div>
-                  <small className="text-muted">
-                    Showing {currentItems.length} of {outcomes.length} outcome(s)
-                    {totalCount > outcomes.length && ` (${totalCount} total in database)`}
-                  </small>
-                </div>
-                <div>
-                  <small className="text-muted">
-                    Last updated: {new Date().toLocaleTimeString()}
-                  </small>
-                </div>
-              </div>
-            </Card.Body>
-          </Card>
+          <div className={`campaign-list outcome-list ${activeSetId === 'all' ? 'has-set-column' : ''}`}>
+            <div className="campaign-list-head outcome-list-head">
+              <span>Code</span>
+              <span>Description</span>
+              {activeSetId === 'all' && <span>Set</span>}
+              <span>Updated</span>
+              <span></span>
+            </div>
 
-          {/* Pagination */}
+            {pageItems.length === 0 ? (
+              <div className="text-center py-5">
+                <i className="bi bi-inbox" style={{ fontSize: '2.5rem', color: 'var(--text-faint)' }}></i>
+                <p className="text-muted mt-2 mb-0">No outcome descriptions found</p>
+              </div>
+            ) : (
+              pageItems.map((outcome) => (
+                <div className="campaign-row outcome-list-row" key={outcome.id}>
+                  <span><code>{outcome.last_outcome}</code></span>
+                  <span className="outcome-description-cell">{outcome.description}</span>
+                  {activeSetId === 'all' && (
+                    <span>
+                      {outcome.outcome_set_name
+                        ? <span className="recent-chip">{outcome.outcome_set_name}</span>
+                        : <span className="recent-chip" style={{ opacity: 0.6 }}>Unassigned</span>}
+                    </span>
+                  )}
+                  <span className="text-muted small">
+                    {outcome.updated_at ? new Date(outcome.updated_at).toLocaleDateString() : 'N/A'}
+                  </span>
+                  <span className="cl-col-actions">
+                    <Button variant="outline-primary" size="sm" onClick={() => handleEdit(outcome)}>
+                      <i className="bi bi-pencil"></i>
+                    </Button>
+                    <Button variant="outline-danger" size="sm" onClick={() => handleDelete(outcome.id)}>
+                      <i className="bi bi-trash"></i>
+                    </Button>
+                  </span>
+                </div>
+              ))
+            )}
+          </div>
+
           {totalPages > 1 && (
-            <div className="d-flex justify-content-center mt-3">
-              <Pagination>
-                <Pagination.Prev 
-                  onClick={() => handlePageChange(Math.max(1, currentPage - 1))}
-                  disabled={currentPage === 1}
-                />
-                {paginationItems}
-                <Pagination.Next 
-                  onClick={() => handlePageChange(Math.min(totalPages, currentPage + 1))}
-                  disabled={currentPage === totalPages}
-                />
-              </Pagination>
+            <div className="pagination-bar">
+              <span className="pagination-summary">
+                Showing {pageStart + 1}–{Math.min(pageStart + PAGE_SIZE, outcomes.length)} of {outcomes.length}
+              </span>
+              <div className="pagination-controls">
+                <button className="pagination-btn" onClick={() => goToPage(currentPage - 1)} disabled={currentPage === 1}>
+                  <i className="bi bi-chevron-left"></i>
+                </button>
+                {pageNumbers().map((p, i) => p === '…' ? (
+                  <span key={`e-${i}`} className="pagination-ellipsis">…</span>
+                ) : (
+                  <button key={p} className={`pagination-btn ${p === currentPage ? 'active' : ''}`} onClick={() => goToPage(p)}>
+                    {p}
+                  </button>
+                ))}
+                <button className="pagination-btn" onClick={() => goToPage(currentPage + 1)} disabled={currentPage === totalPages}>
+                  <i className="bi bi-chevron-right"></i>
+                </button>
+              </div>
             </div>
           )}
         </>
       )}
 
-      {/* Add/Edit Modal */}
+      {/* Add/Edit Outcome Modal */}
       <Modal show={showModal} onHide={handleCloseModal} size="lg">
         <Modal.Header closeButton>
-          <Modal.Title>
-            {editingOutcome ? 'Edit Outcome' : 'Add New Outcome'}
-          </Modal.Title>
+          <Modal.Title>{editingOutcome ? 'Edit Outcome' : 'Add New Outcome'}</Modal.Title>
         </Modal.Header>
         <Form onSubmit={handleSubmit}>
           <Modal.Body>
+            <Form.Group className="mb-3">
+              <Form.Label>Outcome Set</Form.Label>
+              <Form.Select
+                value={formData.outcome_set}
+                onChange={(e) => setFormData({ ...formData, outcome_set: e.target.value })}
+                required
+              >
+                <option value="" disabled>Select a set...</option>
+                {outcomeSets.map(s => (
+                  <option key={s.id} value={s.id}>{s.name}</option>
+                ))}
+              </Form.Select>
+              <Form.Text className="text-muted">
+                Only campaigns assigned to this set will use this description.
+              </Form.Text>
+            </Form.Group>
+
             <Form.Group className="mb-3">
               <Form.Label>last_outcome</Form.Label>
               <Form.Control
                 type="text"
                 placeholder="e.g., SALE, CB, AM"
                 value={formData.last_outcome}
-                onChange={(e) => setFormData({
-                  ...formData,
-                  last_outcome: e.target.value.toUpperCase()
-                })}
+                onChange={(e) => setFormData({ ...formData, last_outcome: e.target.value.toUpperCase() })}
                 required
                 disabled={!!editingOutcome}
               />
-              <Form.Text className="text-muted">
-                Unique last_outcome used in call data
-              </Form.Text>
+              <Form.Text className="text-muted">Unique code used in call data</Form.Text>
             </Form.Group>
-            
+
             <Form.Group className="mb-3">
               <Form.Label>Description</Form.Label>
               <Form.Control
@@ -506,50 +474,78 @@ const OutcomeDescriptions = () => {
                 rows={3}
                 placeholder="Full description of the outcome"
                 value={formData.description}
-                onChange={(e) => setFormData({
-                  ...formData,
-                  description: e.target.value
-                })}
+                onChange={(e) => setFormData({ ...formData, description: e.target.value })}
                 required
               />
             </Form.Group>
-            
-
           </Modal.Body>
           <Modal.Footer>
-            <Button variant="secondary" onClick={handleCloseModal}>
-              Cancel
-            </Button>
-            <Button variant="primary" type="submit">
-              {editingOutcome ? 'Update' : 'Save'}
+            <Button variant="secondary" onClick={handleCloseModal}>Cancel</Button>
+            <Button variant="primary" type="submit">{editingOutcome ? 'Update' : 'Save'}</Button>
+          </Modal.Footer>
+        </Form>
+      </Modal>
+
+      {/* New/Rename Set Modal */}
+      <Modal show={showSetModal} onHide={() => setShowSetModal(false)}>
+        <Modal.Header closeButton>
+          <Modal.Title>{editingSet ? 'Rename Outcome Set' : 'New Outcome Set'}</Modal.Title>
+        </Modal.Header>
+        <Form onSubmit={handleSaveSet}>
+          <Modal.Body>
+            <Form.Group className="mb-3">
+              <Form.Label>Name</Form.Label>
+              <Form.Control
+                type="text"
+                placeholder="e.g., Outcomes 2"
+                value={outcomeSetForm.name}
+                onChange={(e) => setOutcomeSetForm({ ...outcomeSetForm, name: e.target.value })}
+                required
+              />
+            </Form.Group>
+            <Form.Group className="mb-3">
+              <Form.Label>Description (optional)</Form.Label>
+              <Form.Control
+                as="textarea"
+                rows={2}
+                placeholder="What's this set for?"
+                value={outcomeSetForm.description}
+                onChange={(e) => setOutcomeSetForm({ ...outcomeSetForm, description: e.target.value })}
+              />
+            </Form.Group>
+          </Modal.Body>
+          <Modal.Footer>
+            <Button variant="secondary" onClick={() => setShowSetModal(false)}>Cancel</Button>
+            <Button variant="primary" type="submit" disabled={savingSet}>
+              {savingSet ? 'Saving...' : editingSet ? 'Save' : 'Create'}
             </Button>
           </Modal.Footer>
         </Form>
       </Modal>
 
       {/* Bulk Upload Modal */}
-      <Modal show={showUploadModal} onHide={() => setShowUploadModal(false)} size="lg">
+      <Modal show={showUploadModal} onHide={() => { setShowUploadModal(false); setUploadFile(null); setUploadResult(null); }} size="lg">
         <Modal.Header closeButton>
           <Modal.Title>Bulk Upload from Excel/CSV</Modal.Title>
         </Modal.Header>
         <Form onSubmit={handleFileUpload}>
           <Modal.Body>
             {uploadResult && (
-              <Alert variant={uploadResult.success ? "success" : "danger"}>
-                <i className={`bi ${uploadResult.success ? "bi-check-circle" : "bi-exclamation-circle"} me-2`}></i>
+              <Alert variant={uploadResult.success ? 'success' : 'danger'}>
+                <i className={`bi ${uploadResult.success ? 'bi-check-circle' : 'bi-exclamation-circle'} me-2`}></i>
                 {uploadResult.message}
                 {uploadResult.success && uploadResult.details && (
                   <div className="mt-2">
                     <small>
-                      Created: {uploadResult.details.created}<br />
-                      Updated: {uploadResult.details.updated}<br />
-                      Total in DB: {uploadResult.details.total_in_db}
+                      Outcome set: {uploadResult.details.outcome_set}<br />
+                      Processed: {uploadResult.details.processed_rows}<br />
+                      Total added to DB: {uploadResult.details.total_added_to_db}
                     </small>
                   </div>
                 )}
               </Alert>
             )}
-            
+
             <Alert variant="info">
               <i className="bi bi-info-circle me-2"></i>
               <strong>File Requirements:</strong>
@@ -559,92 +555,70 @@ const OutcomeDescriptions = () => {
                 <li>File size limit: 10MB</li>
               </ul>
             </Alert>
-            
+
+            <Form.Group className="mb-3">
+              <Form.Label>Outcome Set</Form.Label>
+              <Form.Select value={uploadSetId} onChange={(e) => setUploadSetId(e.target.value)}>
+                <option value="">Outcomes 1 (default)</option>
+                {outcomeSets.map(s => (
+                  <option key={s.id} value={s.id}>{s.name}</option>
+                ))}
+              </Form.Select>
+              <Form.Text className="text-muted">
+                Every row in this file will be tagged to the set you pick here.
+              </Form.Text>
+            </Form.Group>
+
             <Form.Group className="mb-3">
               <Form.Label>Select File</Form.Label>
               <Form.Control
                 type="file"
-                accept=".xlsx,.xls,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,text/csv"
-                onChange={(e) => {
-                  setUploadFile(e.target.files[0]);
-                  setUploadResult(null);
-                }}
+                accept=".xlsx,.xls,.csv"
+                onChange={(e) => { setUploadFile(e.target.files[0]); setUploadResult(null); }}
                 required
               />
-              <Form.Text className="text-muted">
-                Make sure your file has headers matching the requirements
-              </Form.Text>
             </Form.Group>
-            
+
             {uploadFile && (
-              <Alert variant="success">
-                <i className="bi bi-check-circle me-2"></i>
-                Selected: <strong>{uploadFile.name}</strong> 
-                ({Math.round(uploadFile.size / 1024)} KB, {uploadFile.type || 'Unknown type'})
+              <Alert variant="secondary" className="py-2">
+                Selected: <strong>{uploadFile.name}</strong> ({Math.round(uploadFile.size / 1024)} KB)
               </Alert>
             )}
-            
-            <div className="sample-file-link">
-              <Button 
-                variant="outline-secondary" 
-                size="sm"
-                onClick={() => {
-                  const sampleData = [
-                    ['last_outcome', 'Description'],
-                    ['SALE', 'Sale made',],
-                    ['CB', 'Call back requested',],
-                    ['NA', 'No answer',],
-                    ['AM', 'Answering machine'],
-                    ['WM', 'Wrong number'],
-                    ['DNC', 'Do not call']
-                    ['NA', 'No Answer Autodial']
-                  ];
-                  
-                  const csvContent = sampleData.map(row => 
-                    row.map(cell => `"${cell}"`).join(',')
-                  ).join('\n');
-                  
-                  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-                  saveAs(blob, 'sample_outcome_descriptions.csv');
-                }}
-              >
-                <i className="bi bi-download me-1"></i>
-                Download Sample CSV
-              </Button>
-              
-              <p className="small text-muted mt-2">
-                <i className="bi bi-lightbulb me-1"></i>
-                Tip: Save your Excel file as CSV (UTF-8) if you encounter encoding issues
-              </p>
-            </div>
+
+            <Button
+              variant="outline-secondary"
+              size="sm"
+              onClick={() => {
+                const sampleData = [
+                  ['last_outcome', 'Description'],
+                  ['SALE', 'Sale made'],
+                  ['CB', 'Call back requested'],
+                  ['NA', 'No answer'],
+                  ['AM', 'Answering machine'],
+                  ['WN', 'Wrong number'],
+                  ['DNC', 'Do not call'],
+                ];
+                const csvContent = sampleData.map(row => row.map(cell => `"${cell}"`).join(',')).join('\n');
+                const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+                saveAs(blob, 'sample_outcome_descriptions.csv');
+              }}
+            >
+              <i className="bi bi-download me-1"></i>Download Sample CSV
+            </Button>
           </Modal.Body>
           <Modal.Footer>
-            <Button 
-              variant="secondary" 
-              onClick={() => {
-                setShowUploadModal(false);
-                setUploadFile(null);
-                setUploadResult(null);
-              }}
+            <Button
+              variant="secondary"
+              onClick={() => { setShowUploadModal(false); setUploadFile(null); setUploadResult(null); }}
               disabled={uploading}
             >
               Cancel
             </Button>
-            <Button 
-              variant="success" 
-              type="submit"
-              disabled={uploading || !uploadFile}
-            >
+            <Button variant="primary" type="submit" disabled={uploading || !uploadFile}>
               {uploading ? (
-                <>
-                  <span className="spinner-border spinner-border-sm me-2"></span>
-                  Uploading...
-                </>
+                <><span className="spinner-border spinner-border-sm me-2"></span>Uploading...</>
               ) : (
-                <>
-                  <i className="bi bi-upload me-1"></i>
-                  Upload & Process
-                </>
+                <><i className="bi bi-upload me-1"></i>Upload &amp; Process</>
               )}
             </Button>
           </Modal.Footer>

@@ -3,7 +3,7 @@ from rest_framework import serializers
 from django.contrib.auth.models import User
 from django.db import transaction, IntegrityError
 from .models import (
-    OutcomeDescription, CallDataFile, ProcessedData,
+    OutcomeDescription, OutcomeSet, CallDataFile, ProcessedData,
     GeneratedReport, ReportTemplate, Campaign
 )
 import os
@@ -19,14 +19,35 @@ class UserSerializer(serializers.ModelSerializer):
         fields = ['id', 'username', 'email', 'first_name', 'last_name']
 
 
+class OutcomeSetSerializer(serializers.ModelSerializer):
+    descriptions_count = serializers.SerializerMethodField()
+    campaigns_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = OutcomeSet
+        fields = [
+            'id', 'name', 'description',
+            'descriptions_count', 'campaigns_count',
+            'created_at', 'updated_at'
+        ]
+        read_only_fields = ['created_at', 'updated_at']
+
+    def get_descriptions_count(self, obj):
+        return obj.descriptions.count()
+
+    def get_campaigns_count(self, obj):
+        return obj.campaigns.count()
+
+
 class OutcomeDescriptionSerializer(serializers.ModelSerializer):
     created_by_name = serializers.CharField(source='created_by.username', read_only=True)
     created_by_email = serializers.CharField(source='created_by.email', read_only=True)
+    outcome_set_name = serializers.CharField(source='outcome_set.name', read_only=True, default=None)
 
     class Meta:
         model = OutcomeDescription
         fields = [
-            'id', 'last_outcome', 'description',
+            'id', 'last_outcome', 'description', 'outcome_set', 'outcome_set_name',
             'created_by', 'created_by_name', 'created_by_email',
             'created_at', 'updated_at', 'is_active'
         ]
@@ -148,7 +169,8 @@ class CallDataFileSerializer(serializers.ModelSerializer):
                 instance.user,
                 file_type=file_type,
                 delimiter=instance.delimiter,
-                has_headers=instance.has_headers
+                has_headers=instance.has_headers,
+                campaign=instance.campaign
             )
 
             print(f"✅ Data processed: {len(processed_df)} rows, {len(processed_df.columns)} columns")
@@ -453,12 +475,13 @@ class CampaignSerializer(serializers.ModelSerializer):
     data_files_count = serializers.SerializerMethodField()
     reports_count = serializers.SerializerMethodField()
     templates_count = serializers.SerializerMethodField()
+    outcome_set_name = serializers.CharField(source='outcome_set.name', read_only=True, default=None)
 
     class Meta:
         model = Campaign
         fields = [
             'id', 'name', 'display_name', 'description', 'sheet_name',
-            'cd_list_id',
+            'cd_campaign_id', 'outcome_set', 'outcome_set_name',
             'is_active', 'created_at', 'updated_at', 'created_by', 'created_by_name',
             'data_files_count', 'reports_count', 'templates_count'
         ]

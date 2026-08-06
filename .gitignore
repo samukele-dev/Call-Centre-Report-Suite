@@ -11,6 +11,8 @@ backend/venv/
 # Django local artifacts
 backend/media/
 backend/staticfiles/
+backend/db.sqlite3
+*.sqlite3
 
 # Node
 frontend/node_modules/

@@ -12,7 +12,7 @@ from rest_framework.parsers import MultiPartParser, FormParser
 from django.shortcuts import get_object_or_404
 from django.http import HttpResponse, JsonResponse, HttpRequest
 from django.contrib.auth.models import User
-from django.db.models import Q, Count, Sum, Avg
+from django.db.models import Q, Count, Sum, Avg, Max
 from django.db import IntegrityError
 import pandas as pd
 import numpy as np
@@ -29,11 +29,11 @@ import traceback
 from openpyxl import load_workbook
 
 from .models import (
-    OutcomeDescription, CallDataFile, ProcessedData,
-    GeneratedReport, ReportTemplate, Campaign
+    OutcomeDescription, OutcomeSet, CallDataFile, ProcessedData,
+    GeneratedReport, ReportTemplate, Campaign, QACallRecord
 )
 from .serializers import (
-    OutcomeDescriptionSerializer, CallDataFileSerializer,
+    OutcomeDescriptionSerializer, OutcomeSetSerializer, CallDataFileSerializer,
     ProcessedDataSerializer, GeneratedReportSerializer,
     ReportTemplateSerializer, FileUploadSerializer, CampaignSerializer
 )
@@ -105,12 +105,27 @@ def verify_token(request):
 # DATA PROCESSOR
 # ===========================================================
 
+def _build_outcome_map(campaign):
+    """
+    last_outcome -> description lookup, strictly scoped to this campaign's
+    assigned OutcomeSet. No fallback across sets: a campaign with no
+    outcome_set assigned, or a code missing from its set, resolves to
+    nothing here (callers fall back to showing the raw code).
+    """
+    if not campaign or not campaign.outcome_set_id:
+        return {}
+    return {
+        o.last_outcome: o.description
+        for o in OutcomeDescription.objects.filter(outcome_set_id=campaign.outcome_set_id)
+    }
+
+
 class SimpleDataProcessor:
     @staticmethod
-    def process_call_data(file_path, user, file_type='excel', delimiter=',', has_headers=True):
+    def process_call_data(file_path, user, file_type='excel', delimiter=',', has_headers=True, campaign=None):
         """Process call data file and add Description column after last_outcome"""
         try:
-            print(f" Processing file: {file_path}")
+            print(f"📁 Processing file: {file_path}")
             file_ext = os.path.splitext(file_path)[1].lower()
 
             if file_ext == '.csv':
@@ -172,38 +187,22 @@ class SimpleDataProcessor:
             elif not contact_id_col:
                 df['contact_id'] = [f"ID_{i + 1}" for i in range(len(df))]
 
-            # Build outcome map
-            outcomes = OutcomeDescription.objects.all()
-            outcome_map = {o.last_outcome: o.description for o in outcomes}
-            print(f"📚 Loaded {len(outcome_map)} outcome descriptions")
+            # Build outcome map — strictly scoped to this campaign's outcome
+            # set (see _build_outcome_map). No cross-set fallback: a code
+            # missing from the set just shows its raw value below.
+            outcome_map = _build_outcome_map(campaign)
+            print(f"📚 Loaded {len(outcome_map)} outcome descriptions"
+                  f"{f' for outcome set {campaign.outcome_set_id}' if campaign and campaign.outcome_set_id else ' (no outcome set assigned)'}")
 
             # Insert Description column right after last_outcome
             if 'last_outcome' in df.columns:
                 col_idx = list(df.columns).index('last_outcome') + 1
 
                 def get_description(outcome_code):
-                    try:
-                        if outcome_code is None or str(outcome_code).strip() == '':
-                            return ''
-                        value_str = str(outcome_code)
-                        if value_str in outcome_map:
-                            return outcome_map[value_str]
-                        outcome = OutcomeDescription.objects.filter(
-                            last_outcome=value_str
-                        ).first()
-                        if outcome:
-                            outcome_map[value_str] = outcome.description
-                            return outcome.description
-                        outcome = OutcomeDescription.objects.filter(
-                            last_outcome__iexact=value_str
-                        ).first()
-                        if outcome:
-                            outcome_map[value_str] = outcome.description
-                            return outcome.description
-                        return value_str
-                    except Exception as e:
-                        print(f"❌ get_description error for '{outcome_code}': {e}")
-                        return str(outcome_code) if outcome_code else ''
+                    if outcome_code is None or str(outcome_code).strip() == '':
+                        return ''
+                    value_str = str(outcome_code)
+                    return outcome_map.get(value_str, value_str)
 
                 df.insert(col_idx, 'Description', df['last_outcome'].apply(get_description))
 
@@ -214,6 +213,7 @@ class SimpleDataProcessor:
             print(f"❌ Error processing file {file_path}: {e}")
             traceback.print_exc()
             raise Exception(f"Error processing file {file_path}: {e}")
+
 
 DataProcessor = SimpleDataProcessor
 
@@ -339,6 +339,21 @@ class CallDataFileViewSet(viewsets.ModelViewSet):
 
 
 # ===========================================================
+# OUTCOME SET VIEWSET
+# ===========================================================
+
+class OutcomeSetViewSet(viewsets.ModelViewSet):
+    """Manage named outcome sets (e.g. 'Outcomes 1', 'Outcomes 2')."""
+    queryset = OutcomeSet.objects.all().order_by('name')
+    serializer_class = OutcomeSetSerializer
+    permission_classes = [AllowAny]
+
+    def perform_create(self, serializer):
+        user = self.request.user if self.request.user.is_authenticated else None
+        serializer.save(created_by=user)
+
+
+# ===========================================================
 # OUTCOME DESCRIPTION VIEWSET
 # ===========================================================
 
@@ -356,6 +371,9 @@ class OutcomeDescriptionViewSet(viewsets.ModelViewSet):
             queryset = queryset.filter(
                 Q(last_outcome__icontains=search) | Q(description__icontains=search)
             )
+        outcome_set = self.request.query_params.get('outcome_set')
+        if outcome_set:
+            queryset = queryset.filter(outcome_set_id=outcome_set)
         return queryset.order_by('last_outcome')
 
     def perform_create(self, serializer):
@@ -364,9 +382,18 @@ class OutcomeDescriptionViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['post'], parser_classes=[MultiPartParser, FormParser])
     def bulk_upload(self, request):
-        """Bulk upload outcomes from Excel/CSV"""
+        """Bulk upload outcomes from Excel/CSV into a specific outcome set."""
         if 'file' not in request.FILES:
             return Response({'error': 'No file provided'}, status=status.HTTP_400_BAD_REQUEST)
+
+        outcome_set_id = request.data.get('outcome_set')
+        if outcome_set_id:
+            try:
+                outcome_set = OutcomeSet.objects.get(id=outcome_set_id)
+            except OutcomeSet.DoesNotExist:
+                return Response({'error': f'Outcome set {outcome_set_id} not found.'}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            outcome_set, _ = OutcomeSet.objects.get_or_create(name='Outcomes 1')
 
         file = request.FILES['file']
         try:
@@ -408,6 +435,7 @@ class OutcomeDescriptionViewSet(viewsets.ModelViewSet):
                         outcomes_to_create.append(OutcomeDescription(
                             last_outcome=last_outcome,
                             description=description,
+                            outcome_set=outcome_set,
                             created_by=request.user if request.user.is_authenticated else None,
                             is_active=True
                         ))
@@ -444,8 +472,9 @@ class OutcomeDescriptionViewSet(viewsets.ModelViewSet):
 
             final_count = OutcomeDescription.objects.count()
             response_data = {
-                'message': f'Processed {len(df)} rows from file.',
+                'message': f"Processed {len(df)} rows from file into outcome set '{outcome_set.name}'.",
                 'details': {
+                    'outcome_set': outcome_set.name,
                     'file_rows': len(df),
                     'processed_rows': created_count,
                     'initial_db_count': initial_count,
@@ -734,12 +763,15 @@ class ReportViewSet(
     def _auto_generate_full_report(file_instance):
         """
         Automatically called after a data file is processed.
-        Generates ONE workbook with 4 sheets and saves it as a GeneratedReport:
+        Generates ONE workbook with up to 5 sheets and saves it as a GeneratedReport:
 
-            Sheet 1: Processed Data   — every record from this upload
-            Sheet 2: Pivot            — count per outcome description
+            Sheet 1: Processed Data    — every record from this upload
+            Sheet 2: Pivot             — count per outcome description
             Sheet 3: Campaign Analysis — summary metrics + category tables
-            Sheet 4: Sheet1           — the campaign's template, populated
+            Sheet 4: Agent Performance — per-agent call stats (only if the
+                                          campaign has a cd_campaign_id; see
+                                          external_source.fetch_agent_performance)
+            Sheet 5: Sheet1            — the campaign's template, populated
 
         This replaces the old two-step flow (Generate Report → Run Analysis).
         Everything is ready to download as soon as the upload completes.
@@ -748,7 +780,7 @@ class ReportViewSet(
         import xlsxwriter, openpyxl, os, traceback
         from io import BytesIO
         from datetime import datetime
-        from django.db.models import Count
+        from django.db.models import Count, Min, Max
         from openpyxl import load_workbook
         from openpyxl.utils import get_column_letter
 
@@ -761,9 +793,8 @@ class ReportViewSet(
         print(f"🚀 AUTO-REPORT: campaign='{campaign.display_name}' "
               f"file='{file_instance.original_name}'")
 
-        # ── 1. Build outcome map ───────────────────────────────────────
-        outcome_descriptions = OutcomeDescription.objects.all()
-        outcome_map = {o.last_outcome: o.description for o in outcome_descriptions}
+        # ── 1. Build outcome map (strictly scoped to this campaign's set) ──
+        outcome_map = _build_outcome_map(campaign)
         print(f"📚 Outcome map: {len(outcome_map)} entries")
 
         # ── 2. Load processed data for this file ───────────────────────
@@ -802,6 +833,7 @@ class ReportViewSet(
         SALE_TERMS = [
             'sale made', 'upsell', 'tyme bank account sale',
             'sale made - completed mandate', 'sale made - pending mandate',
+            'qa verify',  # this campaign's real sale-completion step, pending QA sign-off
         ]
         TRUE_CONTACT_TERMS = [
             'not interested', 'callback', 'call back', 'client hung up',
@@ -832,6 +864,25 @@ class ReportViewSet(
         print(f"📊 Metrics: TL={total_leads} SC={successful_contacts} "
               f"TC={true_contacts} TS={true_sales} Conv={conversion_value:.2f}%")
 
+        # ── 4b. Agent Performance (best-effort — only for DB-connected
+        #        campaigns, and never allowed to fail the report) ────────
+        agent_rows = None
+        if campaign.cd_campaign_id:
+            try:
+                from .external_source import fetch_agent_performance
+                date_span = processed_data_query.aggregate(
+                    min_date=Min('last_called_date'), max_date=Max('last_called_date')
+                )
+                agent_rows = fetch_agent_performance(
+                    campaign.cd_campaign_id,
+                    start_dt=date_span['min_date'],
+                    end_dt=date_span['max_date'],
+                )
+                print(f"👥 Agent Performance: {len(agent_rows)} agents")
+            except Exception as e:
+                print(f"⚠️  Agent Performance sheet skipped: {e}")
+                agent_rows = None
+
         # ── 5. Build workbook ──────────────────────────────────────────
         output = BytesIO()
         workbook = xlsxwriter.Workbook(output, {'nan_inf_to_errors': True})
@@ -858,6 +909,9 @@ class ReportViewSet(
         })
         fmts['percent'] = workbook.add_format({
             'border': 1, 'align': 'center', 'num_format': '0.00%'
+        })
+        fmts['duration'] = workbook.add_format({
+            'border': 1, 'align': 'center', 'num_format': '[h]:mm:ss'
         })
         fmts['formula_cell'] = workbook.add_format({
             'border': 1, 'align': 'center', 'num_format': '#,##0',
@@ -903,7 +957,11 @@ class ReportViewSet(
         all_records = list(processed_data_query[:10000])
         field_names = [
             f.name for f in ProcessedData._meta.fields
-            if f.name not in ['id', 'call_data_file', 'processed_at']
+            # outcome_description dropped: now that last_outcome is pulled as the
+            # source DB's full name (see external_source.SOURCE_QUERY_TEMPLATE),
+            # it's just a duplicate of last_outcome, not a separate abbreviation
+            # lookup — same exclusion download_processed already applies.
+            if f.name not in ['id', 'call_data_file', 'processed_at', 'outcome_description']
         ]
         for col, field in enumerate(field_names):
             data_ws.write(0, col, field.replace('_', ' ').title(), fmts['header'])
@@ -958,7 +1016,7 @@ class ReportViewSet(
             ],
             'successful': [
                 'Sale Made - Completed Mandate','Sale Made - Pending Mandate',
-                'Sale Made','Tyme Bank Account Sale','QA Rework'
+                'Sale Made','Tyme Bank Account Sale','QA Rework','QA Verify'
             ],
             'unworkable': [
                 'Already Contacted','Existing Client','Unemployed','Wrong Number',
@@ -1108,6 +1166,53 @@ class ReportViewSet(
         )
 
         print(f"✅ Campaign Analysis sheet built")
+
+        # ── SHEET: AGENT PERFORMANCE (only if the campaign is DB-connected
+        #    and the fetch above succeeded — see external_source.py) ─────
+        if agent_rows is not None:
+            ap_ws = workbook.add_worksheet('Agent Performance')
+            ap_headers = [
+                'User', 'Team', 'Outbound', 'Inbound', 'Combined',
+                'Connects Combined', 'Connect Rate Combined', 'DMCs', 'DMC Rate',
+                'Sales', 'Conversion', 'Completed', 'Talk', 'Avg Talk',
+                'DMC Talk', 'Avg DMC Talk', 'Pause', 'Wait', 'Avg Wait',
+                'Wrap', 'Avg Wrap',
+            ]
+            for col, h in enumerate(ap_headers):
+                ap_ws.write(0, col, h, fmts['header'])
+            ap_ws.set_column(0, 1, 22)
+            ap_ws.set_column(2, len(ap_headers) - 1, 13)
+            ap_ws.freeze_panes(1, 0)
+
+            def _as_day_fraction(seconds):
+                # Excel stores elapsed time as a fraction of a 24h day; the
+                # [h]:mm:ss format then displays cumulative hours past 24
+                # correctly instead of wrapping like a real clock would.
+                return (seconds or 0) / 86400
+
+            for row_num, a in enumerate(agent_rows, start=1):
+                ap_ws.write(row_num, 0, a['display_name'], fmts['cell'])
+                ap_ws.write(row_num, 1, a['team_name'], fmts['cell'])
+                ap_ws.write(row_num, 2, a['outbound'], fmts['number'])
+                ap_ws.write(row_num, 3, a['inbound'], fmts['number'])
+                ap_ws.write(row_num, 4, a['combined'], fmts['number'])
+                ap_ws.write(row_num, 5, a['connects'], fmts['number'])
+                ap_ws.write(row_num, 6, a['connect_rate'], fmts['percent'])
+                ap_ws.write(row_num, 7, a['dmcs'], fmts['number'])
+                ap_ws.write(row_num, 8, a['dmc_rate'], fmts['percent'])
+                ap_ws.write(row_num, 9, a['sales'], fmts['number'])
+                ap_ws.write(row_num, 10, a['conversion'], fmts['percent'])
+                ap_ws.write(row_num, 11, a['completed'], fmts['number'])
+                ap_ws.write(row_num, 12, _as_day_fraction(a['talk_seconds']), fmts['duration'])
+                ap_ws.write(row_num, 13, _as_day_fraction(a['avg_talk_seconds']), fmts['duration'])
+                ap_ws.write(row_num, 14, _as_day_fraction(a['dmc_talk_seconds']), fmts['duration'])
+                ap_ws.write(row_num, 15, _as_day_fraction(a['avg_dmc_talk_seconds']), fmts['duration'])
+                ap_ws.write(row_num, 16, _as_day_fraction(a['pause_seconds']), fmts['duration'])
+                ap_ws.write(row_num, 17, _as_day_fraction(a['wait_seconds']), fmts['duration'])
+                ap_ws.write(row_num, 18, _as_day_fraction(a['avg_wait_seconds']), fmts['duration'])
+                ap_ws.write(row_num, 19, _as_day_fraction(a['wrap_seconds']), fmts['duration'])
+                ap_ws.write(row_num, 20, _as_day_fraction(a['avg_wrap_seconds']), fmts['duration'])
+            print(f"✅ Agent Performance sheet built: {len(agent_rows)} agents")
 
         # ── SHEET 4: TEMPLATE (Sheet1) populated from Pivot ────────────
         # Find the newest template for this campaign
@@ -1330,9 +1435,9 @@ class ReportViewSet(
                   f"(labels untouched, values in col "
                   f"{get_column_letter(data_col)})")
 
-            # Add the 3 existing sheets (Processed Data, Pivot, Campaign Analysis)
-            # from the xlsxwriter output into the new_wb
-            for extra_name in ['Processed Data', 'Pivot', 'Campaign Analysis']:
+            # Add the existing sheets (Processed Data, Pivot, Campaign Analysis,
+            # Agent Performance if built) from the xlsxwriter output into new_wb
+            for extra_name in ['Processed Data', 'Pivot', 'Campaign Analysis', 'Agent Performance']:
                 if extra_name in xl_wb.sheetnames:
                     src_extra = xl_wb[extra_name]
                     dst_extra = new_wb.create_sheet(title=extra_name)
@@ -1362,8 +1467,9 @@ class ReportViewSet(
                             dst_extra.row_dimensions[row_idx].height = dim.height
 
             # Reorder sheets EXACTLY as requested:
-            # 1. Processed Data  2. Sheet1  3. Campaign Analysis  4. Pivot
-            desired_order = ['Processed Data', target_sheet_name, 'Campaign Analysis', 'Pivot']
+            # 1. Processed Data  2. Sheet1  3. Campaign Analysis
+            # 4. Agent Performance (if built)  5. Pivot
+            desired_order = ['Processed Data', target_sheet_name, 'Campaign Analysis', 'Agent Performance', 'Pivot']
             for i, name in enumerate(desired_order):
                 if name in new_wb.sheetnames:
                     idx = new_wb.sheetnames.index(name)
@@ -1408,6 +1514,8 @@ class ReportViewSet(
                 'has_sheet1':      template_obj is not None,
                 'template_name':   template_obj.name if template_obj else None,
                 'rows_populated':  rows_populated if template_obj else 0,
+                'has_agent_performance': agent_rows is not None,
+                'agent_count':     len(agent_rows) if agent_rows else 0,
                 'metrics': {
                     'total_leads':         total_leads,
                     'unworked_leads':      unworked_leads,
@@ -2410,12 +2518,143 @@ class DashboardStatsView(generics.GenericAPIView):
 
 
 # ===========================================================
+# QA REVIEW
+# ===========================================================
+#
+# Deliberately separate from the Campaign upload/sync pipeline (ProcessedData
+# never carries full outcome names or recording refs). Records/Outcomes views
+# below query the LOCAL QACallRecord cache — fast, our own indexes — which is
+# populated by QASyncView hitting the source DB live (see qa_source.py for
+# why: no supporting index for date-filtered live queries on that schema).
+
+class QASyncView(generics.GenericAPIView):
+    """Trigger an on-demand refresh of the local QA cache for one or more campaigns."""
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        from .qa_source import sync_campaign_qa_cache, ExternalSourceError
+
+        local_campaign_ids = request.data.get('campaign_ids') or []
+        campaigns = Campaign.objects.filter(id__in=local_campaign_ids)
+
+        results = []
+        for campaign in campaigns:
+            try:
+                count, synced_at = sync_campaign_qa_cache(campaign)
+                results.append({
+                    'campaign_id': campaign.id,
+                    'campaign': campaign.display_name,
+                    'records_synced': count,
+                    'synced_at': synced_at,
+                })
+            except ExternalSourceError as e:
+                results.append({'campaign_id': campaign.id, 'campaign': campaign.display_name, 'error': str(e)})
+            except Exception as e:
+                results.append({'campaign_id': campaign.id, 'campaign': campaign.display_name, 'error': f'Sync failed: {e}'})
+
+        return Response({'results': results})
+
+
+class QARecordsView(generics.GenericAPIView):
+    """
+    Paginated, filterable call-record listing for QA review, across one or
+    more campaigns at once, unlike everything else in this app which is
+    scoped to a single campaign — reads the local QACallRecord cache.
+    """
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        local_campaign_ids = [c for c in request.query_params.get('campaign_ids', '').split(',') if c]
+        empty = {'count': 0, 'results': [], 'page': 1, 'num_pages': 1, 'last_synced': None}
+        if not local_campaign_ids:
+            return Response(empty)
+
+        qs = QACallRecord.objects.filter(campaign_id__in=local_campaign_ids)
+
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date')
+        start_time = request.query_params.get('start_time')
+        end_time = request.query_params.get('end_time')
+        if start_date:
+            qs = qs.filter(call_date__gte=f"{start_date} {start_time or '00:00:00'}")
+        if end_date:
+            qs = qs.filter(call_date__lte=f"{end_date} {end_time or '23:59:59'}")
+
+        outcomes = [o for o in request.query_params.get('outcomes', '').split(',') if o]
+        if outcomes:
+            qs = qs.filter(outcome__in=outcomes)
+
+        search = request.query_params.get('search')
+        if search:
+            qs = qs.filter(
+                Q(customer__icontains=search) | Q(phone_number__icontains=search) | Q(agent_name__icontains=search)
+            )
+
+        last_synced = qs.aggregate(Max('synced_at'))['synced_at__max']
+
+        try:
+            page = int(request.query_params.get('page', 1))
+            page_size = min(int(request.query_params.get('page_size', 50)), 200)
+        except ValueError:
+            return Response({'error': 'page and page_size must be integers'}, status=status.HTTP_400_BAD_REQUEST)
+
+        total = qs.count()
+        qs = qs.select_related('campaign').order_by('-call_date')
+        offset = (page - 1) * page_size
+        page_rows = qs[offset:offset + page_size]
+
+        results = [
+            {
+                'id': r.id,
+                'date': r.call_date,
+                'customer': r.customer,
+                'phone_number': r.phone_number,
+                'agent_name': r.agent_name,
+                'campaign': r.campaign.display_name,
+                'outcome': r.outcome,
+                'recording_key': r.recording_key,
+                'recording_duration_seconds': r.recording_duration_seconds,
+            }
+            for r in page_rows
+        ]
+        return Response({
+            'count': total,
+            'results': results,
+            'page': page,
+            'num_pages': max(1, -(-total // page_size)),
+            'last_synced': last_synced,
+        })
+
+
+class QAOutcomesView(generics.GenericAPIView):
+    """Distinct full outcome names actually present in the local QA cache for the given campaign(s)."""
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        local_campaign_ids = [c for c in request.query_params.get('campaign_ids', '').split(',') if c]
+        if not local_campaign_ids:
+            return Response([])
+
+        outcomes = (
+            QACallRecord.objects.filter(campaign_id__in=local_campaign_ids)
+            .exclude(outcome__isnull=True).exclude(outcome='')
+            .order_by('outcome')
+            .values_list('outcome', flat=True)
+            .distinct()
+        )
+        return Response(list(outcomes))
+
+
+# ===========================================================
 # CAMPAIGN VIEWSET
 # ===========================================================
 
 class CampaignViewSet(viewsets.ModelViewSet):
-    """Manage campaigns."""
-    queryset = Campaign.objects.filter(is_active=True).order_by('name')
+    """Manage campaigns. Lists every campaign (active and inactive) — the
+    frontend filters/searches client-side; other endpoints that should only
+    ever touch active campaigns look them up with their own is_active=True
+    guard, so this doesn't loosen anything for them."""
+    queryset = Campaign.objects.all().order_by('name')
     serializer_class = CampaignSerializer
     permission_classes = [AllowAny]
 
@@ -2472,6 +2711,24 @@ class CampaignViewSet(viewsets.ModelViewSet):
             'recent_reports': GeneratedReportSerializer(recent_reports, many=True).data,
         })
 
+    @action(detail=True, methods=['get'])
+    def source_lists(self, request, pk=None):
+        """List this campaign's upload batches (cd_lists) in the external source database."""
+        from .external_source import fetch_source_lists, ExternalSourceError
+
+        campaign = self.get_object()
+        if not campaign.cd_campaign_id:
+            return Response({'error': 'This campaign has no cd_campaign_id configured.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            lists = fetch_source_lists(campaign.cd_campaign_id)
+        except ExternalSourceError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({'error': f'Fetching source lists failed: {e}'}, status=status.HTTP_502_BAD_GATEWAY)
+
+        return Response(lists)
+
     @action(detail=True, methods=['post'])
     def sync_from_database(self, request, pk=None):
         """Pull this campaign's call data from the external source database."""
@@ -2479,8 +2736,16 @@ class CampaignViewSet(viewsets.ModelViewSet):
 
         campaign = self.get_object()
         user = request.user if request.user.is_authenticated else None
+        start_date = request.data.get('start_date') or None
+        end_date = request.data.get('end_date') or None
+        start_time = request.data.get('start_time') or None
+        end_time = request.data.get('end_time') or None
+        list_ids = request.data.get('list_ids') or None
         try:
-            instance = sync_campaign_from_database(campaign, user=user)
+            instance = sync_campaign_from_database(
+                campaign, user=user, start_date=start_date, end_date=end_date,
+                start_time=start_time, end_time=end_time, list_ids=list_ids
+            )
         except ExternalSourceError as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:

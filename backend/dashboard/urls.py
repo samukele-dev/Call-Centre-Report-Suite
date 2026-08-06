@@ -6,6 +6,7 @@ from .views import ReportTemplateViewSet, CampaignViewSet
 
 
 router = DefaultRouter()
+router.register(r'outcome-sets', views.OutcomeSetViewSet, basename='outcome-set')
 router.register(r'outcomes', views.OutcomeDescriptionViewSet, basename='outcome')
 router.register(r'files', views.CallDataFileViewSet, basename='file')
 # Register reports with the fixed ReportViewSet
@@ -20,7 +21,12 @@ urlpatterns = [
     
     # Stats endpoint
     path('stats/', views.DashboardStatsView.as_view(), name='dashboard_stats'),
-    
+
+    # QA review
+    path('qa/records/', views.QARecordsView.as_view(), name='qa_records'),
+    path('qa/outcomes/', views.QAOutcomesView.as_view(), name='qa_outcomes'),
+    path('qa/sync/', views.QASyncView.as_view(), name='qa_sync'),
+
     # REMOVE these custom report endpoints - they conflict with the router
     # The router already creates these endpoints automatically:
     # - /api/reports/ (GET) - list reports

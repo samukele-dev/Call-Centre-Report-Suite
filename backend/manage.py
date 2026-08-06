@@ -3,6 +3,14 @@
 import os
 import sys
 
+# Windows' console defaults stdout/stderr to a legacy codepage (cp1252) that
+# can't encode the emoji used throughout this codebase's print()-based
+# logging (e.g. "❌"). Without this, any code path that prints one on Windows
+# raises UnicodeEncodeError and masks the real underlying error.
+if sys.platform == 'win32':
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 
 def main():
     """Run administrative tasks."""

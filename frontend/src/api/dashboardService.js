@@ -9,15 +9,61 @@ class DashboardService {
     return import('./apiConfig').then(mod => mod.default);
   }
 
+  // ========== OUTCOME SETS ==========
+
+  static async getOutcomeSets() {
+    try {
+      const api = await DashboardService._api();
+      const response = await api.get('/api/outcome-sets/');
+      return { success: true, data: response.data };
+    } catch (error) {
+      return { success: false, error: error.response?.data || 'Failed to fetch outcome sets', data: [] };
+    }
+  }
+
+  static async createOutcomeSet(data) {
+    try {
+      const api = await DashboardService._api();
+      const response = await api.post('/api/outcome-sets/', data);
+      return { success: true, data: response.data };
+    } catch (error) {
+      return { success: false, error: error.response?.data || 'Failed to create outcome set' };
+    }
+  }
+
+  static async updateOutcomeSet(id, data) {
+    try {
+      const api = await DashboardService._api();
+      const response = await api.patch(`/api/outcome-sets/${id}/`, data);
+      return { success: true, data: response.data };
+    } catch (error) {
+      return { success: false, error: error.response?.data || 'Failed to update outcome set' };
+    }
+  }
+
+  static async deleteOutcomeSet(id) {
+    try {
+      const api = await DashboardService._api();
+      await api.delete(`/api/outcome-sets/${id}/`);
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: error.response?.data || 'Failed to delete outcome set' };
+    }
+  }
+
   // ========== OUTCOME DESCRIPTIONS ==========
 
-  static async getOutcomeDescriptions() {
+  static async getOutcomeDescriptions(params = {}) {
     try {
-      const response = await dashboardAPI.getOutcomeDescriptions();
-      return response;
+      const api = await DashboardService._api();
+      const query = {};
+      if (params.search) query.search = params.search;
+      if (params.outcome_set) query.outcome_set = params.outcome_set;
+      const response = await api.get('/api/outcomes/', { params: query });
+      return { success: true, data: response.data };
     } catch (error) {
       console.error('API Error:', error);
-      return { success: false, error: error.error || 'API request failed' };
+      return { success: false, error: error.response?.data || 'API request failed' };
     }
   }
 
@@ -51,10 +97,11 @@ class DashboardService {
     }
   }
 
-  static async bulkUploadOutcomes(file) {
+  static async bulkUploadOutcomes(file, outcomeSetId = null) {
     try {
       const formData = new FormData();
       formData.append('file', file);
+      if (outcomeSetId) formData.append('outcome_set', outcomeSetId);
       const api = await DashboardService._api();
       const response = await api.post('/api/outcomes/bulk_upload/', formData, {
         headers: { 'Content-Type': 'multipart/form-data' }
@@ -72,6 +119,66 @@ class DashboardService {
       return { success: true, data: response.data };
     } catch (error) {
       return { success: false, error: 'Failed to export outcomes' };
+    }
+  }
+
+  // ========== QA REVIEW ==========
+
+  static async getQARecords({ campaignIds = [], startDate = null, endDate = null, startTime = null, endTime = null, outcomes = [], search = null, page = 1, pageSize = 50 } = {}) {
+    try {
+      const api = await DashboardService._api();
+      const params = {
+        campaign_ids: campaignIds.join(','),
+        page,
+        page_size: pageSize,
+      };
+      if (startDate) params.start_date = startDate;
+      if (endDate) params.end_date = endDate;
+      if (startDate && startTime) params.start_time = startTime;
+      if (endDate && endTime) params.end_time = endTime;
+      if (outcomes.length > 0) params.outcomes = outcomes.join(',');
+      if (search) params.search = search;
+
+      const response = await api.get('/api/qa/records/', { params });
+      return { success: true, data: response.data };
+    } catch (error) {
+      return {
+        success: false,
+        error: error.response?.data?.error || error.response?.data || 'Failed to fetch QA records',
+        data: { count: 0, results: [], page: 1, num_pages: 1, last_synced: null }
+      };
+    }
+  }
+
+  static async getQAOutcomes(campaignIds = []) {
+    try {
+      const api = await DashboardService._api();
+      const response = await api.get('/api/qa/outcomes/', { params: { campaign_ids: campaignIds.join(',') } });
+      return { success: true, data: response.data };
+    } catch (error) {
+      return { success: false, error: error.response?.data || 'Failed to fetch outcomes', data: [] };
+    }
+  }
+
+  // Refreshes the local QA cache for the given campaigns from the source DB
+  // (a full per-campaign pull — can take a while for a large campaign's first sync).
+  // Callers sync one campaign at a time so progress/cancellation can be
+  // surfaced per-campaign; `signal` (an AbortController.signal) lets an
+  // in-flight sync be cancelled from the UI.
+  static async syncQACache(campaignIds = [], signal = null) {
+    try {
+      const api = await DashboardService._api();
+      const response = await api.post(
+        '/api/qa/sync/',
+        { campaign_ids: campaignIds },
+        signal ? { signal } : undefined
+      );
+      return { success: true, data: response.data };
+    } catch (error) {
+      if (error.code === 'ERR_CANCELED') {
+        return { success: false, aborted: true };
+      }
+      return { success: false, error: error.response?.data?.error || error.response?.data || 'Failed to sync QA data' };
     }
   }
 
@@ -110,6 +217,17 @@ class DashboardService {
     }
   }
 
+  static async updateCampaign(id, data) {
+    try {
+      const api = await DashboardService._api();
+      const response = await api.patch(`/api/campaigns/${id}/`, data);
+      return { success: true, data: response.data };
+    } catch (error) {
+      console.error('Error updating campaign:', error);
+      return { success: false, error: error.response?.data || error.message };
+    }
+  }
+
   static async getCampaignStats(campaignId) {
     try {
       const api = await DashboardService._api();
@@ -132,10 +250,31 @@ class DashboardService {
     }
   }
 
-  static async syncCampaignFromDatabase(campaignId) {
+  static async getCampaignSourceLists(campaignId) {
     try {
       const api = await DashboardService._api();
-      const response = await api.post(`/api/campaigns/${campaignId}/sync_from_database/`);
+      const response = await api.get(`/api/campaigns/${campaignId}/source_lists/`);
+      return { success: true, data: response.data };
+    } catch (error) {
+      console.error('Error fetching source lists:', error);
+      return {
+        success: false,
+        error: error.response?.data?.error || error.response?.data || 'Failed to fetch source lists',
+        data: []
+      };
+    }
+  }
+
+  static async syncCampaignFromDatabase(campaignId, startDate = null, endDate = null, listIds = null, startTime = null, endTime = null) {
+    try {
+      const api = await DashboardService._api();
+      const response = await api.post(`/api/campaigns/${campaignId}/sync_from_database/`, {
+        start_date: startDate || undefined,
+        end_date: endDate || undefined,
+        start_time: startDate && startTime ? startTime : undefined,
+        end_time: endDate && endTime ? endTime : undefined,
+        list_ids: listIds && listIds.length > 0 ? listIds : undefined,
+      });
       return { success: true, data: response.data };
     } catch (error) {
       console.error('Database sync error:', error);

@@ -11,6 +11,8 @@ import Layout from './components/Layout/Layout';
 import Login from './pages/Login';
 import Dashboard from './pages/Dashboard';
 import OutcomeDescriptions from './pages/OutcomeDescriptions';  // Keep this global
+import QA from './pages/QA';  // Global — spans multiple campaigns at once
+import AgentReports from './pages/AgentReports';  // Global — spans multiple campaigns at once
 
 // Campaign Pages
 import Campaigns from './pages/Campaigns';
@@ -50,7 +52,25 @@ function App() {
               </Layout>
             </ProtectedRoute>
           } />
-          
+
+          {/* Global QA Review Page */}
+          <Route path="/qa" element={
+            <ProtectedRoute>
+              <Layout>
+                <QA />
+              </Layout>
+            </ProtectedRoute>
+          } />
+
+          {/* Global Agent Reports Page */}
+          <Route path="/agent-reports" element={
+            <ProtectedRoute>
+              <Layout>
+                <AgentReports />
+              </Layout>
+            </ProtectedRoute>
+          } />
+
           {/* Campaign Routes */}
           <Route path="/campaigns" element={
             <ProtectedRoute>
