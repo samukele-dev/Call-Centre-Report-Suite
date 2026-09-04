@@ -1,4 +1,4 @@
-# backend/dashboard/models.py - COMPLETE FIXED VERSION
+# backend/dashboard/models.py - COMPLETE FIXED VERSION WITH CAMPAIGN SYNC FIELDS
 from django.db import models
 from django.contrib.auth.models import User
 from django.utils import timezone
@@ -37,9 +37,25 @@ class Campaign(models.Model):
     # call data from. A source campaign owns many cd_lists (one per upload
     # batch over time), so syncing scopes by campaign_id, not a single list.
     cd_campaign_id = models.CharField(
-        max_length=64, null=True, blank=True,
+        max_length=64, null=True, blank=True, unique=True, db_index=True,
         help_text="Campaign UUID (cxm.campaigns.id) in the external call-centre "
                    "database used to scope 'Sync from database' pulls"
+    )
+
+    # Track when campaign metadata was last synced from external source
+    last_synced_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text="When campaign metadata was last synced from external source"
+    )
+
+    # Campaign dates from external source
+    start_date = models.DateField(
+        null=True, blank=True,
+        help_text="Campaign start date from external source"
+    )
+    end_date = models.DateField(
+        null=True, blank=True,
+        help_text="Campaign end date from external source"
     )
 
     # Which named collection of outcome descriptions this campaign resolves

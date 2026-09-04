@@ -31,7 +31,9 @@ const Dashboard = () => {
 
   const [campaigns, setCampaigns] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState(null);
+  const [syncMessage, setSyncMessage] = useState(null);
   const [lastUpdated, setLastUpdated] = useState(null);
 
   useEffect(() => {
@@ -42,8 +44,8 @@ const Dashboard = () => {
     return () => clearInterval(interval);
   }, []);
 
-  const fetchDashboardData = async () => {
-    setLoading(true);
+  const fetchDashboardData = async (showLoading = true) => {
+    if (showLoading) setLoading(true);
     setError(null);
 
     try {
@@ -81,7 +83,80 @@ const Dashboard = () => {
       console.error('Dashboard fetch error:', error);
       setError('Network error. Please check your connection.');
     } finally {
-      setLoading(false);
+      if (showLoading) setLoading(false);
+    }
+  };
+
+  // ============================================================
+  // Sync Campaigns from External Database using DashboardService
+  // ============================================================
+  const syncCampaigns = async () => {
+    setSyncing(true);
+    setSyncMessage(null);
+    setError(null);
+
+    try {
+      const result = await DashboardService.syncCampaigns(true);
+      
+      console.log('Sync result:', result);
+
+      if (result.success && result.data && result.data.success) {
+        const data = result.data;
+        setSyncMessage({
+          type: 'success',
+          text: data.message || 'Campaigns synced successfully!'
+        });
+        // Refresh dashboard data after sync
+        await fetchDashboardData(false);
+        // Auto-clear message after 5 seconds
+        setTimeout(() => setSyncMessage(null), 5000);
+      } else {
+        const errorMsg = result.data?.error || result.error || 'Failed to sync campaigns';
+        setSyncMessage({
+          type: 'error',
+          text: errorMsg
+        });
+        console.error('Sync error details:', result);
+      }
+    } catch (error) {
+      console.error('Sync error:', error);
+      setSyncMessage({
+        type: 'error',
+        text: error.message || 'Network error while syncing campaigns'
+      });
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  // ============================================================
+  // Test Connection to External Database
+  // ============================================================
+  const testConnection = async () => {
+    setSyncMessage(null);
+    try {
+      const result = await DashboardService.testConnection();
+      console.log('Connection test result:', result);
+      
+      if (result.success) {
+        setSyncMessage({
+          type: 'success',
+          text: `✅ ${result.data.message || 'Connection successful!'}`
+        });
+      } else {
+        setSyncMessage({
+          type: 'error',
+          text: `❌ ${result.error || 'Connection failed'}`
+        });
+      }
+      setTimeout(() => setSyncMessage(null), 5000);
+    } catch (error) {
+      console.error('Connection test error:', error);
+      setSyncMessage({
+        type: 'error',
+        text: `❌ Network error: ${error.message}`
+      });
+      setTimeout(() => setSyncMessage(null), 5000);
     }
   };
 
@@ -109,7 +184,7 @@ const Dashboard = () => {
         <p className="error-message">{error}</p>
         <Button
           className="retry-button"
-          onClick={fetchDashboardData}
+          onClick={() => fetchDashboardData(true)}
         >
           Retry
         </Button>
@@ -121,12 +196,77 @@ const Dashboard = () => {
     <div className="dashboard">
       <div className="d-flex justify-content-between align-items-center mb-4">
         <h1 className="page-title">Dashboard Overview</h1>
-        {lastUpdated && (
-          <small className="text-muted">
-            Last updated: {lastUpdated.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-          </small>
-        )}
+        <div className="d-flex align-items-center gap-3">
+          {lastUpdated && (
+            <small className="text-muted">
+              Last updated: {lastUpdated.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+            </small>
+          )}
+          
+          {/* Test Connection Button */}
+          <Button
+            variant="outline-info"
+            size="sm"
+            onClick={testConnection}
+            title="Test connection to external database"
+          >
+            <i className="bi bi-plug me-1"></i>
+            Test DB
+          </Button>
+
+          {/* Sync Campaigns Button */}
+          <Button
+            variant="outline-primary"
+            size="sm"
+            onClick={syncCampaigns}
+            disabled={syncing}
+            title="Sync campaigns from external database"
+          >
+            {syncing ? (
+              <>
+                <Spinner
+                  as="span"
+                  animation="border"
+                  size="sm"
+                  role="status"
+                  aria-hidden="true"
+                  className="me-1"
+                />
+                Syncing...
+              </>
+            ) : (
+              <>
+                <i className="bi bi-arrow-repeat me-1"></i>
+                Sync Campaigns
+              </>
+            )}
+          </Button>
+
+          {/* Refresh Button */}
+          <Button
+            variant="outline-secondary"
+            size="sm"
+            onClick={() => fetchDashboardData(true)}
+            disabled={loading}
+            title="Refresh dashboard"
+          >
+            <i className={`bi ${loading ? 'bi-arrow-repeat-spin' : 'bi-arrow-repeat'}`}></i>
+          </Button>
+        </div>
       </div>
+
+      {/* Sync Message Alert */}
+      {syncMessage && (
+        <div className={`alert ${syncMessage.type === 'success' ? 'alert-success' : 'alert-danger'} mb-3 d-flex align-items-center justify-content-between`}>
+          <span>{syncMessage.text}</span>
+          <button
+            type="button"
+            className="btn-close"
+            onClick={() => setSyncMessage(null)}
+            aria-label="Close"
+          />
+        </div>
+      )}
 
       {/* Stats Cards */}
       <div className="stat-tile-row dashboard-row">
@@ -336,8 +476,27 @@ const Dashboard = () => {
       {/* Campaigns List */}
       {campaigns.length > 0 && (
         <Card className="mt-4">
-          <Card.Header>
-            <Card.Title>Your Campaigns</Card.Title>
+          <Card.Header className="d-flex justify-content-between align-items-center">
+            <Card.Title>Your Campaigns ({campaigns.length})</Card.Title>
+            <div className="d-flex gap-2">
+              <Button
+                variant="outline-info"
+                size="sm"
+                onClick={testConnection}
+                title="Test connection to external database"
+              >
+                <i className="bi bi-plug me-1"></i>
+                Test DB
+              </Button>
+              <Button
+                variant="outline-primary"
+                size="sm"
+                onClick={syncCampaigns}
+                disabled={syncing}
+              >
+                {syncing ? 'Syncing...' : 'Sync Campaigns'}
+              </Button>
+            </div>
           </Card.Header>
           <Card.Body>
             <div className="dashboard-campaign-grid">
@@ -352,6 +511,9 @@ const Dashboard = () => {
                     </div>
                     <div className="small text-muted mb-3">
                       Sheet: <code>{campaign.sheet_name}</code>
+                      {campaign.cd_campaign_id && (
+                        <span className="ms-2 text-success">✓ Synced</span>
+                      )}
                     </div>
                     <div className="campaign-mini-stats d-flex gap-2">
                       <span className="recent-chip">{campaign.data_files_count || 0} files</span>

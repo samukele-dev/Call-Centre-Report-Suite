@@ -12,6 +12,7 @@ ProcessedData save, auto-report) so there is exactly one code path for
 "data came in" regardless of source.
 """
 import os
+import socket
 
 import pandas as pd
 import psycopg2
@@ -101,24 +102,105 @@ class ExternalSourceError(Exception):
 
 
 def _get_connection():
+    """Get connection to external database with better error handling."""
     cfg = settings.EXTERNAL_DB
+    
+    # Check if external DB is configured
     if not cfg.get('HOST') or not cfg.get('NAME') or not cfg.get('USER'):
         raise ExternalSourceError(
             "External database is not configured. Set SOURCE_DB_HOST, "
             "SOURCE_DB_NAME, SOURCE_DB_USER and SOURCE_DB_PASSWORD in "
             "backend/.env (see backend/.env.example)."
         )
+    
+    # Log connection attempt (without password)
+    print(f"🔌 Connecting to external DB: {cfg['HOST']}:{cfg.get('PORT', 5432)}/{cfg['NAME']} as {cfg['USER']}")
+    
     try:
-        return psycopg2.connect(
+        conn = psycopg2.connect(
             host=cfg['HOST'],
-            port=cfg['PORT'],
+            port=cfg.get('PORT', 5432),
             user=cfg['USER'],
             password=cfg['PASSWORD'],
             dbname=cfg['NAME'],
-            connect_timeout=15,
+            connect_timeout=10,
+            # Add these for better connection handling
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=5,
         )
+        print("✅ Connected to external database successfully")
+        return conn
+    except psycopg2.OperationalError as e:
+        error_msg = f"Could not connect to external database: {e}"
+        print(f"❌ {error_msg}")
+        raise ExternalSourceError(error_msg)
     except psycopg2.Error as e:
-        raise ExternalSourceError(f"Could not connect to the external database: {e}")
+        error_msg = f"Database error: {e}"
+        print(f"❌ {error_msg}")
+        raise ExternalSourceError(error_msg)
+    except Exception as e:
+        error_msg = f"Unexpected connection error: {e}"
+        print(f"❌ {error_msg}")
+        raise ExternalSourceError(error_msg)
+
+
+def test_connection():
+    """
+    Test the connection to the external database without making any queries.
+    Returns (success, message, details).
+    """
+    cfg = settings.EXTERNAL_DB
+    
+    # Check configuration
+    if not cfg.get('HOST') or not cfg.get('NAME') or not cfg.get('USER'):
+        return False, "External database is not configured", {
+            'configured': False,
+            'missing': [k for k in ['HOST', 'NAME', 'USER'] if not cfg.get(k)]
+        }
+    
+    # Test network connectivity first
+    try:
+        socket.create_connection(
+            (cfg['HOST'], cfg.get('PORT', 5432)),
+            timeout=5
+        )
+        network_ok = True
+    except Exception as e:
+        network_ok = False
+        network_error = str(e)
+    
+    if not network_ok:
+        return False, f"Cannot reach database server: {network_error}", {
+            'network_ok': False,
+            'error': network_error
+        }
+    
+    # Test database connection
+    try:
+        conn = _get_connection()
+        conn.close()
+        return True, "Successfully connected to external database", {
+            'network_ok': True,
+            'connected': True,
+            'host': cfg['HOST'],
+            'port': cfg.get('PORT', 5432),
+            'database': cfg['NAME'],
+            'user': cfg['USER']
+        }
+    except ExternalSourceError as e:
+        return False, str(e), {
+            'network_ok': True,
+            'connected': False,
+            'error': str(e)
+        }
+    except Exception as e:
+        return False, f"Unexpected error: {e}", {
+            'network_ok': True,
+            'connected': False,
+            'error': str(e)
+        }
 
 
 def fetch_source_lists(cd_campaign_id):
@@ -373,6 +455,57 @@ def fetch_agent_performance(cd_campaign_id, start_dt=None, end_dt=None):
     return results
 
 
+def fetch_contact_call_counts(cd_campaign_id, start_dt=None, end_dt=None):
+    """
+    How many times each contact was actually called within a date range —
+    for the "Call Count Breakdown" report sheet. Deliberately not derived
+    from ProcessedData.called_count: that field is cvm.interaction_attempts,
+    a lifetime cumulative counter from the source DB, not scoped to any
+    particular sync's date range. This counts actual call rows instead.
+
+    Same schema/performance profile as fetch_agent_performance (see its
+    docstring): reporting.interaction_voice has no campaign_id index, so
+    only a date-bounded query is fast — verified ~1s for a week of a large
+    campaign. Raises ExternalSourceError on any failure (including timeout);
+    callers should treat this as best-effort, same as Agent Performance.
+
+    Returns {customer_id_str: call_count}. customer_id here is the same
+    value already pulled into ProcessedData.customer_id by
+    fetch_call_data_from_source, so callers can join against records
+    already loaded for that sync without a second lookup.
+    """
+    if not cd_campaign_id:
+        raise ExternalSourceError("No cd_campaign_id provided.")
+
+    where = ["campaign_id = %s", "customer_id IS NOT NULL"]
+    params = [cd_campaign_id]
+    if start_dt:
+        where.append("start_time >= %s")
+        params.append(start_dt)
+    if end_dt:
+        where.append("start_time <= %s")
+        params.append(end_dt)
+
+    conn = _get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SET statement_timeout = 25000")
+        cur.execute(
+            f"""
+            SELECT customer_id, COUNT(*) AS call_count
+            FROM reporting.interaction_voice
+            WHERE {" AND ".join(where)}
+            GROUP BY customer_id
+            """,
+            params,
+        )
+        return {str(row[0]): row[1] for row in cur.fetchall()}
+    except Exception as e:
+        raise ExternalSourceError(f"Call count query against external database failed: {e}")
+    finally:
+        conn.close()
+
+
 def _default_user():
     user, created = User.objects.get_or_create(
         username='test_user',
@@ -453,3 +586,371 @@ def sync_campaign_from_database(campaign, user=None, start_date=None, end_date=N
         )
 
     return instance
+
+
+# ============================================================
+# CAMPAIGN METADATA SYNC FUNCTIONS
+# ============================================================
+def fetch_campaigns_from_source(only_active=True):
+    """
+    Fetch all campaigns from the external source database (cxm.campaigns).
+    
+    Args:
+        only_active: If True, only return active campaigns (is_active=1)
+    
+    Returns:
+        List of dicts with campaign metadata from the source database
+    """
+    conn = _get_connection()
+    try:
+        cur = conn.cursor()
+        
+        # Get actual column names from the campaigns table
+        cur.execute("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_schema = 'cxm' 
+            AND table_name = 'campaigns'
+            ORDER BY ordinal_position
+        """)
+        available = [row[0] for row in cur.fetchall()]
+        print(f"📋 Available columns in cxm.campaigns: {available}")
+        
+        # Build query with only columns that exist
+        select_parts = ['id', 'name']
+        
+        # Add created_at if it exists
+        if 'created_at' in available:
+            select_parts.append('created_at')
+        else:
+            select_parts.append('NULL AS created_at')
+        
+        # Add updated_at if it exists
+        if 'updated_at' in available:
+            select_parts.append('updated_at')
+        else:
+            select_parts.append('NULL AS updated_at')
+        
+        # Add display_name - use name as fallback
+        if 'display_name' in available:
+            select_parts.append('display_name')
+        else:
+            select_parts.append('name AS display_name')
+        
+        # Add sheet_name with fallback
+        if 'sheet_name' in available:
+            select_parts.append('sheet_name')
+        else:
+            select_parts.append("'' AS sheet_name")
+        
+        # Add description with fallback
+        if 'description' in available:
+            select_parts.append('description')
+        else:
+            select_parts.append("'' AS description")
+        
+        # Add dates with fallback
+        if 'start_date' in available:
+            select_parts.append('start_date')
+        else:
+            select_parts.append('NULL AS start_date')
+        
+        if 'end_date' in available:
+            select_parts.append('end_date')
+        else:
+            select_parts.append('NULL AS end_date')
+        
+        # Add is_active - use 1 as default since we don't know
+        if 'is_active' in available:
+            select_parts.append('is_active')
+        else:
+            select_parts.append('1 AS is_active')
+        
+        # Build WHERE clause - if is_active doesn't exist, don't filter by it
+        if 'is_active' in available:
+            where_clause = "WHERE is_active = %s OR %s = false"
+            params = (1 if only_active else 0, only_active)
+        else:
+            # No is_active column - ignore the only_active filter
+            where_clause = ""
+            params = ()
+            print("⚠️ 'is_active' column not found - ignoring only_active filter")
+        
+        query = f"""
+            SELECT 
+                {', '.join(select_parts)}
+            FROM cxm.campaigns
+            {where_clause}
+            ORDER BY name
+        """
+        
+        print(f"📝 Query: {query}")
+        cur.execute(query, params)
+        
+        columns = [desc[0] for desc in cur.description]
+        results = []
+        for row in cur.fetchall():
+            row_dict = dict(zip(columns, row))
+            # Convert datetime objects to strings for JSON serialization
+            for key in ['created_at', 'updated_at', 'start_date', 'end_date']:
+                if row_dict.get(key) and hasattr(row_dict[key], 'isoformat'):
+                    row_dict[key] = row_dict[key].isoformat()
+            # Ensure display_name is set
+            if not row_dict.get('display_name'):
+                row_dict['display_name'] = row_dict.get('name', '')
+            # Ensure is_active is set
+            if 'is_active' not in row_dict:
+                row_dict['is_active'] = True
+            results.append(row_dict)
+        return results
+    except Exception as e:
+        raise ExternalSourceError(f"Failed to fetch campaigns: {e}")
+    finally:
+        conn.close()
+
+
+def sync_campaigns_from_source(only_active=True):
+    """
+    Sync campaign metadata from external source to Django.
+    
+    - Creates new campaigns that don't exist in Django
+    - Updates existing campaigns with new metadata from source
+    - Leaves campaigns untouched if they don't have cd_campaign_id set
+    - Optionally deactivates campaigns that no longer exist in source
+    
+    Args:
+        only_active: If True, only sync active campaigns from source
+    
+    Returns:
+        dict with sync statistics
+    """
+    from .models import Campaign
+    from django.utils import timezone
+    
+    source_campaigns = fetch_campaigns_from_source(only_active=only_active)
+    
+    results = {
+        'created': 0,
+        'updated': 0,
+        'deactivated': 0,
+        'unchanged': 0,
+        'total_synced': len(source_campaigns),
+        'details': []
+    }
+    
+    # Get existing campaign IDs that are linked to source
+    existing_campaigns = Campaign.objects.filter(
+        cd_campaign_id__isnull=False
+    )
+    existing_ids = set(existing_campaigns.values_list('cd_campaign_id', flat=True))
+    source_ids = set()
+    
+    for src in source_campaigns:
+        source_ids.add(src['id'])
+        
+        try:
+            # Try to find by cd_campaign_id
+            campaign = Campaign.objects.get(cd_campaign_id=src['id'])
+            
+            # Check for changes
+            changed = False
+            updates = {}
+            
+            # Map source fields to Django fields
+            field_mapping = {
+                'name': 'name',
+                'display_name': 'display_name',
+                'sheet_name': 'sheet_name',
+                'is_active': 'is_active',
+                'description': 'description',
+                'start_date': 'start_date',
+                'end_date': 'end_date',
+            }
+            
+            for source_field, django_field in field_mapping.items():
+                source_value = src.get(source_field)
+                current_value = getattr(campaign, django_field)
+                
+                # Handle None/empty string comparisons consistently
+                if source_value is None:
+                    source_value = '' if django_field != 'is_active' else False
+                if current_value is None:
+                    current_value = '' if django_field != 'is_active' else False
+                
+                if source_value != current_value:
+                    setattr(campaign, django_field, source_value)
+                    changed = True
+                    updates[django_field] = {'old': current_value, 'new': source_value}
+            
+            if changed:
+                campaign.last_synced_at = timezone.now()
+                campaign.save()
+                results['updated'] += 1
+                results['details'].append({
+                    'id': campaign.id,
+                    'cd_campaign_id': src['id'],
+                    'action': 'updated',
+                    'name': campaign.display_name,
+                    'changes': updates
+                })
+            else:
+                results['unchanged'] += 1
+                
+        except Campaign.DoesNotExist:
+            # Create new campaign
+            campaign = Campaign.objects.create(
+                cd_campaign_id=src['id'],
+                name=src.get('name', ''),
+                display_name=src.get('display_name', src.get('name', '')),
+                sheet_name=src.get('sheet_name', ''),
+                is_active=src.get('is_active', True),
+                description=src.get('description', ''),
+                start_date=src.get('start_date'),
+                end_date=src.get('end_date'),
+                last_synced_at=timezone.now(),
+                created_by=None,  # System-created
+            )
+            results['created'] += 1
+            results['details'].append({
+                'id': campaign.id,
+                'cd_campaign_id': src['id'],
+                'action': 'created',
+                'name': campaign.display_name,
+            })
+    
+    # Deactivate campaigns that no longer exist in source
+    # (Only if we're syncing all campaigns, not just active ones)
+    if not only_active:
+        deactivated_count = 0
+        for existing_id in existing_ids:
+            if existing_id not in source_ids:
+                Campaign.objects.filter(cd_campaign_id=existing_id).update(
+                    is_active=False,
+                    last_synced_at=timezone.now()
+                )
+                deactivated_count += 1
+        results['deactivated'] = deactivated_count
+    
+    return results
+    """
+    Sync campaign metadata from external source to Django.
+    
+    - Creates new campaigns that don't exist in Django
+    - Updates existing campaigns with new metadata from source
+    - Leaves campaigns untouched if they don't have cd_campaign_id set
+    - Optionally deactivates campaigns that no longer exist in source
+    
+    Args:
+        only_active: If True, only sync active campaigns from source
+    
+    Returns:
+        dict with sync statistics
+    """
+    from .models import Campaign
+    from django.utils import timezone
+    
+    source_campaigns = fetch_campaigns_from_source(only_active=only_active)
+    
+    results = {
+        'created': 0,
+        'updated': 0,
+        'deactivated': 0,
+        'unchanged': 0,
+        'total_synced': len(source_campaigns),
+        'details': []
+    }
+    
+    # Get existing campaign IDs that are linked to source
+    existing_campaigns = Campaign.objects.filter(
+        cd_campaign_id__isnull=False
+    )
+    existing_ids = set(existing_campaigns.values_list('cd_campaign_id', flat=True))
+    source_ids = set()
+    
+    for src in source_campaigns:
+        source_ids.add(src['id'])
+        
+        try:
+            # Try to find by cd_campaign_id
+            campaign = Campaign.objects.get(cd_campaign_id=src['id'])
+            
+            # Check for changes
+            changed = False
+            updates = {}
+            
+            # Map source fields to Django fields
+            field_mapping = {
+                'name': 'name',
+                'display_name': 'display_name',
+                'sheet_name': 'sheet_name',
+                'is_active': 'is_active',
+                'description': 'description',
+                'start_date': 'start_date',
+                'end_date': 'end_date',
+            }
+            
+            for source_field, django_field in field_mapping.items():
+                source_value = src.get(source_field)
+                current_value = getattr(campaign, django_field)
+                
+                # Handle None/empty string comparisons consistently
+                if source_value is None:
+                    source_value = '' if django_field != 'is_active' else False
+                if current_value is None:
+                    current_value = '' if django_field != 'is_active' else False
+                
+                if source_value != current_value:
+                    setattr(campaign, django_field, source_value)
+                    changed = True
+                    updates[django_field] = {'old': current_value, 'new': source_value}
+            
+            if changed:
+                campaign.last_synced_at = timezone.now()
+                campaign.save()
+                results['updated'] += 1
+                results['details'].append({
+                    'id': campaign.id,
+                    'cd_campaign_id': src['id'],
+                    'action': 'updated',
+                    'name': campaign.display_name,
+                    'changes': updates
+                })
+            else:
+                results['unchanged'] += 1
+                
+        except Campaign.DoesNotExist:
+            # Create new campaign
+            campaign = Campaign.objects.create(
+                cd_campaign_id=src['id'],
+                name=src.get('name', ''),
+                display_name=src.get('display_name', src.get('name', '')),
+                sheet_name=src.get('sheet_name', ''),
+                is_active=src.get('is_active', True),
+                description=src.get('description', ''),
+                start_date=src.get('start_date'),
+                end_date=src.get('end_date'),
+                last_synced_at=timezone.now(),
+                created_by=None,  # System-created
+            )
+            results['created'] += 1
+            results['details'].append({
+                'id': campaign.id,
+                'cd_campaign_id': src['id'],
+                'action': 'created',
+                'name': campaign.display_name,
+            })
+    
+    # Deactivate campaigns that no longer exist in source
+    # (Only if we're syncing all campaigns, not just active ones)
+    if not only_active:
+        deactivated_count = 0
+        for existing_id in existing_ids:
+            if existing_id not in source_ids:
+                Campaign.objects.filter(cd_campaign_id=existing_id).update(
+                    is_active=False,
+                    last_synced_at=timezone.now()
+                )
+                deactivated_count += 1
+        results['deactivated'] = deactivated_count
+    
+    return results

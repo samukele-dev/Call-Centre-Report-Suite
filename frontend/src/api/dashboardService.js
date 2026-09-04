@@ -160,11 +160,6 @@ class DashboardService {
     }
   }
 
-  // Refreshes the local QA cache for the given campaigns from the source DB
-  // (a full per-campaign pull — can take a while for a large campaign's first sync).
-  // Callers sync one campaign at a time so progress/cancellation can be
-  // surfaced per-campaign; `signal` (an AbortController.signal) lets an
-  // in-flight sync be cancelled from the UI.
   static async syncQACache(campaignIds = [], signal = null) {
     try {
       const api = await DashboardService._api();
@@ -228,6 +223,17 @@ class DashboardService {
     }
   }
 
+  static async deleteCampaign(id) {
+    try {
+      const api = await DashboardService._api();
+      await api.delete(`/api/campaigns/${id}/`);
+      return { success: true };
+    } catch (error) {
+      console.error('Error deleting campaign:', error);
+      return { success: false, error: error.response?.data || error.message };
+    }
+  }
+
   static async getCampaignStats(campaignId) {
     try {
       const api = await DashboardService._api();
@@ -281,6 +287,52 @@ class DashboardService {
       return {
         success: false,
         error: error.response?.data?.error || error.response?.data || 'Database sync failed'
+      };
+    }
+  }
+
+  // ========== CAMPAIGN SYNC (NEW) ==========
+
+  static async syncCampaigns(onlyActive = true) {
+    try {
+      const api = await DashboardService._api();
+      const response = await api.post('/api/campaigns/sync_campaigns/', {
+        only_active: onlyActive
+      });
+      return { success: true, data: response.data };
+    } catch (error) {
+      console.error('Campaign sync error:', error);
+      return {
+        success: false,
+        error: error.response?.data?.error || error.response?.data || 'Campaign sync failed'
+      };
+    }
+  }
+
+  static async testConnection() {
+    try {
+      const api = await DashboardService._api();
+      const response = await api.get('/api/campaigns/test_connection/');
+      return { success: true, data: response.data };
+    } catch (error) {
+      console.error('Connection test error:', error);
+      return {
+        success: false,
+        error: error.response?.data?.error || error.response?.data || 'Connection test failed'
+      };
+    }
+  }
+
+  static async getSourceCampaigns(onlyActive = true) {
+    try {
+      const api = await DashboardService._api();
+      const response = await api.get(`/api/campaigns/source_campaigns/?only_active=${onlyActive}`);
+      return { success: true, data: response.data };
+    } catch (error) {
+      console.error('Get source campaigns error:', error);
+      return {
+        success: false,
+        error: error.response?.data?.error || error.response?.data || 'Failed to fetch source campaigns'
       };
     }
   }
@@ -339,7 +391,6 @@ class DashboardService {
       });
 
       if (response.data instanceof Blob) {
-        // Guard: check if backend returned a JSON error as a blob
         if (response.data.type === 'application/json') {
           const text = await response.data.text();
           try {
@@ -367,10 +418,6 @@ class DashboardService {
 
   // ========== TEMPLATES ==========
 
-  /**
-   * FIX: accepts campaignId so only templates for the open campaign are returned.
-   * Pass campaignId from useParams() — e.g. getTemplates(id)
-   */
   static async getTemplates(campaignId = null) {
     try {
       const params = campaignId ? `?campaign_id=${campaignId}` : '';
@@ -383,10 +430,6 @@ class DashboardService {
     }
   }
 
-  /**
-   * FIX: accepts campaignId so the uploaded template is linked to the correct campaign.
-   * Pass campaignId from useParams() — e.g. uploadTemplate(file, name, desc, id)
-   */
   static async uploadTemplate(file, name, description, campaignId = null) {
     try {
       const formData = new FormData();
@@ -394,7 +437,7 @@ class DashboardService {
       formData.append('name', name);
       formData.append('description', description || '');
       if (campaignId) {
-        formData.append('campaign_id', campaignId);  // links template to this campaign
+        formData.append('campaign_id', campaignId);
       }
 
       const api = await DashboardService._api();
@@ -445,10 +488,6 @@ class DashboardService {
 
   // ========== REPORTS ==========
 
-  /**
-   * FIX: requires campaignId so the report is generated only from that campaign's data.
-   * Pass campaignId from useParams() — e.g. generateCampaignReport(id)
-   */
   static async generateCampaignReport(campaignId) {
     try {
       if (!campaignId) {
@@ -457,7 +496,7 @@ class DashboardService {
       console.log(`🚀 Generating campaign report for campaign ${campaignId}...`);
       const api = await DashboardService._api();
       const response = await api.post('/api/reports/generate_campaign/', {
-        campaign_id: campaignId   // backend requires this to scope data
+        campaign_id: campaignId
       });
       return { success: true, data: response.data };
     } catch (error) {
@@ -472,11 +511,6 @@ class DashboardService {
     }
   }
 
-  /**
-   * FIX: requires campaignId so the analysis uses the correct campaign's Pivot data
-   * and the correct campaign's template.
-   * Pass campaignId from useParams() — e.g. generateCampaignAnalysis(templateId, sheetName, id)
-   */
   static async generateCampaignAnalysis(templateId, campaignName, campaignId) {
     try {
       if (!campaignId) {
@@ -486,7 +520,7 @@ class DashboardService {
       const response = await api.post('/api/reports/generate_campaign_analysis/', {
         template_id: templateId,
         campaign_name: campaignName,
-        campaign_id: campaignId   // backend uses this to scope the Pivot data lookup
+        campaign_id: campaignId
       });
       return { success: true, data: response.data };
     } catch (error) {
@@ -495,10 +529,6 @@ class DashboardService {
     }
   }
 
-  /**
-   * FIX: accepts campaignId so the list only shows reports for the open campaign.
-   * Pass campaignId from useParams() — e.g. getReports(id)
-   */
   static async getReports(campaignId = null) {
     try {
       const params = campaignId ? `?campaign_id=${campaignId}` : '';
@@ -522,7 +552,6 @@ class DashboardService {
       });
 
       if (response.data instanceof Blob) {
-        // Guard: check if backend returned a JSON error as a blob
         if (response.data.type === 'application/json') {
           const text = await response.data.text();
           try {

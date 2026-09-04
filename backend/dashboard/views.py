@@ -1,4 +1,4 @@
-# backend/dashboard/views.py - COMPLETE FIXED VERSION
+# backend/dashboard/views.py - COMPLETE FIXED VERSION WITH CAMPAIGN SYNC
 from xlsxwriter.utility import xl_rowcol_to_cell
 from django.conf import settings
 from rest_framework.authtoken.views import ObtainAuthToken
@@ -763,15 +763,21 @@ class ReportViewSet(
     def _auto_generate_full_report(file_instance):
         """
         Automatically called after a data file is processed.
-        Generates ONE workbook with up to 5 sheets and saves it as a GeneratedReport:
+        Generates ONE workbook with up to 6 sheets and saves it as a GeneratedReport:
 
-            Sheet 1: Processed Data    — every record from this upload
-            Sheet 2: Pivot             — count per outcome description
-            Sheet 3: Campaign Analysis — summary metrics + category tables
-            Sheet 4: Agent Performance — per-agent call stats (only if the
-                                          campaign has a cd_campaign_id; see
-                                          external_source.fetch_agent_performance)
-            Sheet 5: Sheet1            — the campaign's template, populated
+            Sheet 1: Processed Data       — every record from this upload
+            Sheet 2: Pivot                — count per outcome description
+            Sheet 3: Campaign Analysis    — summary metrics + category tables,
+                                             each Lead Count paired with its %
+                                             of Total Leads
+            Sheet 4: Call Count Breakdown — how many times each contact was
+                                             called in this date range (only if
+                                             the campaign has a cd_campaign_id;
+                                             see external_source.fetch_contact_call_counts)
+            Sheet 5: Agent Performance    — per-agent call stats (only if the
+                                             campaign has a cd_campaign_id; see
+                                             external_source.fetch_agent_performance)
+            Sheet 6: Sheet1               — the campaign's template, populated
 
         This replaces the old two-step flow (Generate Report → Run Analysis).
         Everything is ready to download as soon as the upload completes.
@@ -790,22 +796,22 @@ class ReportViewSet(
             return
 
         print(f"\n{'='*60}")
-        print(f"🚀 AUTO-REPORT: campaign='{campaign.display_name}' "
+        print(f"AUTO-REPORT: campaign='{campaign.display_name}' "
               f"file='{file_instance.original_name}'")
 
         # ── 1. Build outcome map (strictly scoped to this campaign's set) ──
         outcome_map = _build_outcome_map(campaign)
-        print(f"📚 Outcome map: {len(outcome_map)} entries")
+        print(f"Outcome map: {len(outcome_map)} entries")
 
         # ── 2. Load processed data for this file ───────────────────────
         processed_data_query = ProcessedData.objects.filter(
             call_data_file=file_instance
         )
         total_count = processed_data_query.count()
-        print(f"📊 Processed records: {total_count}")
+        print(f"Processed records: {total_count}")
 
         if total_count == 0:
-            print("⚠️  No processed data — skipping auto-report.")
+            print("⚠️ No processed data — skipping auto-report.")
             return
 
         # ── 3. Build Pivot counts ──────────────────────────────────────
@@ -861,18 +867,21 @@ class ReportViewSet(
         conversion_value    = (true_sales / total_leads * 100) if total_leads > 0 else 0
         conversion_decimal  = conversion_value / 100
 
-        print(f"📊 Metrics: TL={total_leads} SC={successful_contacts} "
+        print(f"Metrics: TL={total_leads} SC={successful_contacts} "
               f"TC={true_contacts} TS={true_sales} Conv={conversion_value:.2f}%")
 
-        # ── 4b. Agent Performance (best-effort — only for DB-connected
-        #        campaigns, and never allowed to fail the report) ────────
+        # ── 4b. Agent Performance + Call Count Breakdown (best-effort —
+        #        only for DB-connected campaigns, and neither is allowed to
+        #        fail the report; each is independent of the other) ──────
         agent_rows = None
+        call_counts = None
         if campaign.cd_campaign_id:
+            date_span = processed_data_query.aggregate(
+                min_date=Min('last_called_date'), max_date=Max('last_called_date')
+            )
+
             try:
                 from .external_source import fetch_agent_performance
-                date_span = processed_data_query.aggregate(
-                    min_date=Min('last_called_date'), max_date=Max('last_called_date')
-                )
                 agent_rows = fetch_agent_performance(
                     campaign.cd_campaign_id,
                     start_dt=date_span['min_date'],
@@ -882,6 +891,18 @@ class ReportViewSet(
             except Exception as e:
                 print(f"⚠️  Agent Performance sheet skipped: {e}")
                 agent_rows = None
+
+            try:
+                from .external_source import fetch_contact_call_counts
+                call_counts = fetch_contact_call_counts(
+                    campaign.cd_campaign_id,
+                    start_dt=date_span['min_date'],
+                    end_dt=date_span['max_date'],
+                )
+                print(f"📞 Call Count Breakdown: {len(call_counts)} contacts")
+            except Exception as e:
+                print(f"⚠️  Call Count Breakdown sheet skipped: {e}")
+                call_counts = None
 
         # ── 5. Build workbook ──────────────────────────────────────────
         output = BytesIO()
@@ -989,17 +1010,17 @@ class ReportViewSet(
         pivot_ws.write(curr_row, 0, 'Grand Total', fmts['grand_total'])
         pivot_ws.write(curr_row, 1, grand_total, fmts['grand_total'])
         pivot_range = f"Pivot!$A$2:$B${curr_row}"
-        print(f"✅ Pivot: {curr_row - 1} unique outcomes")
+        print(f"Pivot: {curr_row - 1} unique outcomes")
 
         # ── SHEET 3: CAMPAIGN ANALYSIS ─────────────────────────────────
         ca_ws = workbook.add_worksheet('Campaign Analysis')
-        for i, w in enumerate([18,32,12,32,12,32,12,32,12]):
+        for i, w in enumerate([18,32,12,10,32,12,10,32,12,10,32,12,10]):
             ca_ws.set_column(i, i, w)
 
         title_suffix = 'Campaign Analysis' if campaign.display_name.strip().lower().endswith('leads') \
             else 'Leads Campaign Analysis'
         ca_ws.merge_range(
-            'A1:I2',
+            'A1:M2',
             f'{campaign.display_name} {title_suffix}',
             fmts['ca_title']
         )
@@ -1040,24 +1061,31 @@ class ReportViewSet(
             ]
         }
 
-        # Super-header row: "Customers Reached" spans the True Contacts pair only
+        # Super-header row: "Customers Reached" spans the True Contacts triple only
         SUPER_HDR = 2
-        ca_ws.merge_range(SUPER_HDR, 7, SUPER_HDR, 8, 'Customers Reached', fmts['ca_super_header'])
+        ca_ws.merge_range(SUPER_HDR, 10, SUPER_HDR, 12, 'Customers Reached', fmts['ca_super_header'])
 
+        # Each category is a label/count/% triple — % is the count's share of
+        # Total Leads (the big merged number at A{DATA_START+1}), not of the
+        # category's own subtotal.
         HEADER_ROW = 3
-        ca_ws.write(HEADER_ROW, 0, 'Total Leads Dialled',              fmts['header'])
-        ca_ws.write(HEADER_ROW, 1, 'Unsuccessful Contacts',            fmts['header'])
-        ca_ws.write(HEADER_ROW, 2, 'Lead Count',                       fmts['header'])
-        ca_ws.write(HEADER_ROW, 3, 'Was customer interested in deal?', fmts['header'])
-        ca_ws.write(HEADER_ROW, 4, 'Lead Count',                       fmts['header'])
-        ca_ws.write(HEADER_ROW, 5, 'Succesful Contacts',                fmts['header'])
-        ca_ws.write(HEADER_ROW, 6, 'Lead Count',                       fmts['header'])
-        ca_ws.write(HEADER_ROW, 7, 'True Contacts',                    fmts['header'])
-        ca_ws.write(HEADER_ROW, 8, 'Lead Count',                       fmts['header'])
+        ca_ws.write(HEADER_ROW, 0,  'Total Leads Dialled',              fmts['header'])
+        ca_ws.write(HEADER_ROW, 1,  'Unsuccessful Contacts',            fmts['header'])
+        ca_ws.write(HEADER_ROW, 2,  'Lead Count',                       fmts['header'])
+        ca_ws.write(HEADER_ROW, 3,  '%',                                fmts['header'])
+        ca_ws.write(HEADER_ROW, 4,  'Was customer interested in deal?', fmts['header'])
+        ca_ws.write(HEADER_ROW, 5,  'Lead Count',                       fmts['header'])
+        ca_ws.write(HEADER_ROW, 6,  '%',                                fmts['header'])
+        ca_ws.write(HEADER_ROW, 7,  'Succesful Contacts',                fmts['header'])
+        ca_ws.write(HEADER_ROW, 8,  'Lead Count',                       fmts['header'])
+        ca_ws.write(HEADER_ROW, 9,  '%',                                fmts['header'])
+        ca_ws.write(HEADER_ROW, 10, 'True Contacts',                    fmts['header'])
+        ca_ws.write(HEADER_ROW, 11, 'Lead Count',                       fmts['header'])
+        ca_ws.write(HEADER_ROW, 12, '%',                                fmts['header'])
 
         DATA_START = HEADER_ROW + 1
 
-        def fill_section(desc_list, col_label, col_val, start_row):
+        def fill_section(desc_list, col_label, col_val, col_pct, start_row):
             for i, text in enumerate(desc_list):
                 r = start_row + i
                 ca_ws.write(r, col_label, text, fmts['cell'])
@@ -1066,12 +1094,18 @@ class ReportViewSet(
                     f'=IFERROR(VLOOKUP("{text}",{pivot_range},2,FALSE),0)',
                     fmts['formula_cell']
                 )
+                count_cell = f'{get_column_letter(col_val + 1)}{r + 1}'
+                ca_ws.write_formula(
+                    r, col_pct,
+                    f'=IFERROR({count_cell}/$A${DATA_START + 1},0)',
+                    fmts['percent']
+                )
             return start_row + len(desc_list)
 
-        u_end = fill_section(categories['unsuccessful'], 1, 2, DATA_START)
-        s_end = fill_section(categories['successful'],   3, 4, DATA_START)
-        w_end = fill_section(categories['unworkable'],   5, 6, DATA_START)
-        t_end = fill_section(categories['true_contacts'],7, 8, DATA_START)
+        u_end = fill_section(categories['unsuccessful'], 1,  2,  3,  DATA_START)
+        s_end = fill_section(categories['successful'],   4,  5,  6,  DATA_START)
+        w_end = fill_section(categories['unworkable'],   7,  8,  9,  DATA_START)
+        t_end = fill_section(categories['true_contacts'],10, 11, 12, DATA_START)
 
         # The two longest columns (Unsuccessful / Succesful Contacts) set where every
         # column's subtotal row sits.
@@ -1082,20 +1116,20 @@ class ReportViewSet(
         # "If not, why not?" note fills the gap between the 5 sale rows and the subtotal
         # row, holding the count of everyone who was reached but didn't buy.
         gap_start, gap_end = s_end, SUBTOTAL_ROW - 1
-        why_not_formula = f'=G{SUBTOTAL_ROW+1}+I{SUBTOTAL_ROW+1}'
+        why_not_formula = f'=I{SUBTOTAL_ROW+1}+L{SUBTOTAL_ROW+1}'
         if gap_end > gap_start:
-            ca_ws.merge_range(gap_start, 3, gap_end, 3, 'If not, why not?', fmts['ca_italic_note'])
-            ca_ws.merge_range(gap_start, 4, gap_end, 4, why_not_formula, fmts['formula_cell'])
+            ca_ws.merge_range(gap_start, 4, gap_end, 4, 'If not, why not?', fmts['ca_italic_note'])
+            ca_ws.merge_range(gap_start, 5, gap_end, 5, why_not_formula, fmts['formula_cell'])
         elif gap_end == gap_start:
-            ca_ws.write(gap_start, 3, 'If not, why not?', fmts['ca_italic_note'])
-            ca_ws.write_formula(gap_start, 4, why_not_formula, fmts['formula_cell'])
+            ca_ws.write(gap_start, 4, 'If not, why not?', fmts['ca_italic_note'])
+            ca_ws.write_formula(gap_start, 5, why_not_formula, fmts['formula_cell'])
 
         # Subtotal row — one number per category, aligned under the longest columns
         ca_ws.write_formula(SUBTOTAL_ROW, 2, f'=SUM(C{DATA_START+1}:C{u_end})', fmts['formula_cell'])
-        ca_ws.write(SUBTOTAL_ROW, 3, "Successful Take Up's", fmts['subheader'])
-        ca_ws.write_formula(SUBTOTAL_ROW, 4, f'=SUM(E{DATA_START+1}:E{s_end})', fmts['formula_cell'])
-        ca_ws.write_formula(SUBTOTAL_ROW, 6, f'=SUM(G{DATA_START+1}:G{w_end})', fmts['formula_cell'])
-        ca_ws.write_formula(SUBTOTAL_ROW, 8, f'=SUM(I{DATA_START+1}:I{t_end})', fmts['formula_cell'])
+        ca_ws.write(SUBTOTAL_ROW, 4, "Successful Take Up's", fmts['subheader'])
+        ca_ws.write_formula(SUBTOTAL_ROW, 5, f'=SUM(F{DATA_START+1}:F{s_end})', fmts['formula_cell'])
+        ca_ws.write_formula(SUBTOTAL_ROW, 8, f'=SUM(I{DATA_START+1}:I{w_end})', fmts['formula_cell'])
+        ca_ws.write_formula(SUBTOTAL_ROW, 11, f'=SUM(L{DATA_START+1}:L{t_end})', fmts['formula_cell'])
 
         # Big "Total Leads Dialled" number spans the full height of the data + subtotal rows
         ca_ws.merge_range(DATA_START, 0, SUBTOTAL_ROW, 0, grand_total, fmts['ca_total_number'])
@@ -1104,7 +1138,7 @@ class ReportViewSet(
         GRAND_ROW = SUBTOTAL_ROW + 2
         ca_ws.write_formula(
             GRAND_ROW, 0,
-            f'=E{SUBTOTAL_ROW+1}+G{SUBTOTAL_ROW+1}+I{SUBTOTAL_ROW+1}',
+            f'=F{SUBTOTAL_ROW+1}+I{SUBTOTAL_ROW+1}+L{SUBTOTAL_ROW+1}',
             fmts['ca_grand_total']
         )
 
@@ -1165,7 +1199,63 @@ class ReportViewSet(
             next_row
         )
 
-        print(f"✅ Campaign Analysis sheet built")
+        print(f"Campaign Analysis sheet built")
+
+        # ── SHEET: CALL COUNT BREAKDOWN (only if the campaign is DB-connected
+        #    and the fetch above succeeded — see external_source.py) ─────
+        if call_counts is not None:
+            ccb_ws = workbook.add_worksheet('Call Count Breakdown')
+            ccb_ws.set_column(0, 0, 26)
+            ccb_ws.set_column(1, 3, 18)
+
+            # How many contacts were called exactly N times
+            distribution = {}
+            for count in call_counts.values():
+                distribution[count] = distribution.get(count, 0) + 1
+
+            ccb_ws.merge_range(0, 0, 0, 1, 'Contact Frequency Distribution', fmts['ca_super_header'])
+            ccb_ws.write(1, 0, 'Times Contacted', fmts['header'])
+            ccb_ws.write(1, 1, 'Number of Contacts', fmts['header'])
+            dist_row = 2
+            for times, n_contacts in sorted(distribution.items()):
+                ccb_ws.write(dist_row, 0, times, fmts['number'])
+                ccb_ws.write(dist_row, 1, n_contacts, fmts['number'])
+                dist_row += 1
+            ccb_ws.write(dist_row, 0, 'Total Contacts', fmts['grand_total'])
+            ccb_ws.write(dist_row, 1, len(call_counts), fmts['grand_total'])
+
+            # Per-contact list, sorted by call count descending. Names/phone
+            # come from records already loaded for the Processed Data sheet
+            # (all_records) rather than a second DB round-trip — note that
+            # sheet caps at 10,000 rows, so a contact beyond that cap shows
+            # its raw customer_id instead of a name.
+            list_start = dist_row + 3
+            ccb_ws.merge_range(list_start, 0, list_start, 3, 'Contacts by Call Count', fmts['ca_super_header'])
+            list_header_row = list_start + 1
+            ccb_ws.write(list_header_row, 0, 'Contact ID', fmts['header'])
+            ccb_ws.write(list_header_row, 1, 'Name', fmts['header'])
+            ccb_ws.write(list_header_row, 2, 'Phone', fmts['header'])
+            ccb_ws.write(list_header_row, 3, 'Times Contacted', fmts['header'])
+
+            records_by_customer_id = {
+                str(r.customer_id): r for r in all_records if r.customer_id
+            }
+            sorted_contacts = sorted(call_counts.items(), key=lambda kv: kv[1], reverse=True)
+            for i, (customer_id, count) in enumerate(sorted_contacts):
+                r = list_header_row + 1 + i
+                record = records_by_customer_id.get(customer_id)
+                name = (
+                    f"{(record.firstname or '').strip()} {(record.lastname or '').strip()}".strip()
+                    if record else ''
+                )
+                contact_id = record.contact_id if record else customer_id
+                phone = (record.tel1 if record else '') or ''
+                ccb_ws.write(r, 0, contact_id, fmts['cell'])
+                ccb_ws.write(r, 1, name or '—', fmts['cell'])
+                ccb_ws.write(r, 2, phone or '—', fmts['cell'])
+                ccb_ws.write(r, 3, count, fmts['number'])
+
+            print(f"✅ Call Count Breakdown sheet built: {len(call_counts)} contacts")
 
         # ── SHEET: AGENT PERFORMANCE (only if the campaign is DB-connected
         #    and the fetch above succeeded — see external_source.py) ─────
@@ -1212,7 +1302,7 @@ class ReportViewSet(
                 ap_ws.write(row_num, 18, _as_day_fraction(a['avg_wait_seconds']), fmts['duration'])
                 ap_ws.write(row_num, 19, _as_day_fraction(a['wrap_seconds']), fmts['duration'])
                 ap_ws.write(row_num, 20, _as_day_fraction(a['avg_wrap_seconds']), fmts['duration'])
-            print(f"✅ Agent Performance sheet built: {len(agent_rows)} agents")
+            print(f"Agent Performance sheet built: {len(agent_rows)} agents")
 
         # ── SHEET 4: TEMPLATE (Sheet1) populated from Pivot ────────────
         # Find the newest template for this campaign
@@ -1221,7 +1311,7 @@ class ReportViewSet(
         ).order_by('-uploaded_at').first()
 
         if template_obj and os.path.exists(template_obj.template_file.path):
-            print(f"📋 Populating template: {template_obj.name}")
+            print(f"Populating template: {template_obj.name}")
 
             # Save and re-open the workbook so Pivot data is readable
             # by openpyxl (xlsxwriter can't be read while open)
@@ -1436,8 +1526,9 @@ class ReportViewSet(
                   f"{get_column_letter(data_col)})")
 
             # Add the existing sheets (Processed Data, Pivot, Campaign Analysis,
-            # Agent Performance if built) from the xlsxwriter output into new_wb
-            for extra_name in ['Processed Data', 'Pivot', 'Campaign Analysis', 'Agent Performance']:
+            # Call Count Breakdown/Agent Performance if built) from the
+            # xlsxwriter output into new_wb
+            for extra_name in ['Processed Data', 'Pivot', 'Campaign Analysis', 'Call Count Breakdown', 'Agent Performance']:
                 if extra_name in xl_wb.sheetnames:
                     src_extra = xl_wb[extra_name]
                     dst_extra = new_wb.create_sheet(title=extra_name)
@@ -1468,8 +1559,8 @@ class ReportViewSet(
 
             # Reorder sheets EXACTLY as requested:
             # 1. Processed Data  2. Sheet1  3. Campaign Analysis
-            # 4. Agent Performance (if built)  5. Pivot
-            desired_order = ['Processed Data', target_sheet_name, 'Campaign Analysis', 'Agent Performance', 'Pivot']
+            # 4. Call Count Breakdown (if built)  5. Agent Performance (if built)  6. Pivot
+            desired_order = ['Processed Data', target_sheet_name, 'Campaign Analysis', 'Call Count Breakdown', 'Agent Performance', 'Pivot']
             for i, name in enumerate(desired_order):
                 if name in new_wb.sheetnames:
                     idx = new_wb.sheetnames.index(name)
@@ -1527,8 +1618,8 @@ class ReportViewSet(
             }
         )
 
-        print(f"✅ Report saved: {filename} (ID: {report.id})")
-        print(f"📑 Sheets: {new_wb.sheetnames if template_obj else '3-sheet (no template)'}")
+        print(f"Report saved: {filename} (ID: {report.id})")
+        print(f"Sheets: {new_wb.sheetnames if template_obj else '3-sheet (no template)'}")
         print(f"{'='*60}\n")
         return report
 
@@ -1551,7 +1642,7 @@ class ReportViewSet(
         """
         try:
             print("=" * 50)
-            print("📊 GENERATE REPORT (manual trigger)")
+            print("GENERATE REPORT (manual trigger)")
 
             campaign_id = request.data.get('campaign_id')
             if not campaign_id:
@@ -1590,8 +1681,8 @@ class ReportViewSet(
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-            print(f"📁 Campaign : {campaign_obj.display_name}")
-            print(f"📁 Source   : {latest_file.original_name}")
+            print(f"Campaign : {campaign_obj.display_name}")
+            print(f"Source   : {latest_file.original_name}")
 
             # Delegate to the SAME generator used by auto-generation,
             # so manual and automatic reports are always identical.
@@ -1710,7 +1801,7 @@ class ReportViewSet(
             campaign_name = request.data.get('campaign_name')
             campaign_id   = request.data.get('campaign_id')
 
-            print(f"📊 generate_campaign_analysis: template={template_id}, "
+            print(f"generate_campaign_analysis: template={template_id}, "
                   f"sheet={campaign_name}, campaign_id={campaign_id}")
 
             if not template_id:
@@ -1772,7 +1863,7 @@ class ReportTemplateViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         instance = serializer.save()
 
-        print(f"✅ Template ID={instance.id}, Campaign={instance.campaign}")
+        print(f"Template ID={instance.id}, Campaign={instance.campaign}")
 
         # Extract sheet names after file is saved
         try:
@@ -1783,7 +1874,7 @@ class ReportTemplateViewSet(viewsets.ModelViewSet):
                 excel_file = pd.ExcelFile(file_path)
                 instance.sheet_names = excel_file.sheet_names
                 instance.save(update_fields=['sheet_names'])
-                print(f"📑 Sheets: {instance.sheet_names}")
+                print(f"Sheets: {instance.sheet_names}")
         except Exception as e:
             print(f"⚠️ Could not extract sheet names: {e}")
 
@@ -2752,6 +2843,142 @@ class CampaignViewSet(viewsets.ModelViewSet):
             return Response({'error': f'Database sync failed: {e}'}, status=status.HTTP_502_BAD_GATEWAY)
 
         return Response(CallDataFileSerializer(instance).data)
+
+    # ============================================================
+    # NEW: CAMPAIGN METADATA SYNC ACTIONS
+    # ============================================================
+
+    @action(detail=False, methods=['get'])
+    def test_connection(self, request):
+        """
+        Test the connection to the external database.
+        GET /api/campaigns/test_connection/
+        """
+        from .external_source import test_connection, ExternalSourceError
+        
+        try:
+            success, message, details = test_connection()
+            return Response({
+                'success': success,
+                'message': message,
+                'details': details
+            })
+        except Exception as e:
+            traceback.print_exc()
+            return Response({
+                'success': False,
+                'error': f'Connection test failed: {str(e)}'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=False, methods=['post'])
+    def sync_campaigns(self, request):
+        """
+        Sync campaign metadata from the external source database.
+        This updates campaign names, sheet names, and creates new campaigns.
+        
+        POST body (optional):
+            - only_active: bool (default: True) - if False, syncs all campaigns
+            - dry_run: bool (default: False) - if True, only previews changes without saving
+        """
+        from .external_source import sync_campaigns_from_source, ExternalSourceError, test_connection
+        import traceback
+        
+        try:
+            only_active = request.data.get('only_active', True)
+            dry_run = request.data.get('dry_run', False)
+            
+            print(f"🔄 Starting campaign sync (only_active={only_active})...")
+            
+            # Test connection first
+            conn_ok, conn_msg, conn_details = test_connection()
+            if not conn_ok:
+                print(f"❌ Connection test failed: {conn_msg}")
+                return Response({
+                    'success': False,
+                    'error': f'Cannot connect to external database: {conn_msg}',
+                    'details': conn_details
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            print(f"✅ Connection test passed")
+            
+            if dry_run:
+                # Preview what would be synced without saving
+                from .external_source import fetch_campaigns_from_source
+                campaigns = fetch_campaigns_from_source(only_active=only_active)
+                return Response({
+                    'success': True,
+                    'dry_run': True,
+                    'message': f'Preview: {len(campaigns)} campaigns would be synced from source.',
+                    'campaigns': campaigns
+                })
+            
+            results = sync_campaigns_from_source(only_active=only_active)
+            
+            # Build a human-readable message
+            parts = []
+            if results['created']:
+                parts.append(f"{results['created']} created")
+            if results['updated']:
+                parts.append(f"{results['updated']} updated")
+            if results['deactivated']:
+                parts.append(f"{results['deactivated']} deactivated")
+            if results['unchanged']:
+                parts.append(f"{results['unchanged']} unchanged")
+            
+            message = f"Synced {results['total_synced']} campaigns from source. " + ", ".join(parts) + "."
+            print(f"✅ {message}")
+            
+            return Response({
+                'success': True,
+                'message': message,
+                'results': results
+            })
+            
+        except ExternalSourceError as e:
+            print(f"❌ External source error: {e}")
+            traceback.print_exc()
+            return Response(
+                {'success': False, 'error': str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        except Exception as e:
+            print(f"❌ Sync failed: {e}")
+            traceback.print_exc()
+            return Response(
+                {'success': False, 'error': f'Sync failed: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+    @action(detail=False, methods=['get'])
+    def source_campaigns(self, request):
+        """
+        Preview campaigns from the external source without syncing.
+        Useful for seeing what would be synced.
+        
+        Query params:
+            - only_active: true/false (default: true)
+        """
+        from .external_source import fetch_campaigns_from_source, ExternalSourceError
+        
+        try:
+            only_active = request.query_params.get('only_active', 'true').lower() == 'true'
+            campaigns = fetch_campaigns_from_source(only_active=only_active)
+            return Response({
+                'success': True,
+                'count': len(campaigns),
+                'campaigns': campaigns
+            })
+        except ExternalSourceError as e:
+            return Response(
+                {'success': False, 'error': str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        except Exception as e:
+            return Response(
+                {'success': False, 'error': f'Failed to fetch campaigns: {e}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
 
 
 # ===========================================================
