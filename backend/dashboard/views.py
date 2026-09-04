@@ -1863,7 +1863,7 @@ class ReportTemplateViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         instance = serializer.save()
 
-        print(f"Template ID={instance.id}, Campaign={instance.campaign}")
+        print(f"✅ Template ID={instance.id}, Campaign={instance.campaign}")
 
         # Extract sheet names after file is saved
         try:
@@ -1874,7 +1874,7 @@ class ReportTemplateViewSet(viewsets.ModelViewSet):
                 excel_file = pd.ExcelFile(file_path)
                 instance.sheet_names = excel_file.sheet_names
                 instance.save(update_fields=['sheet_names'])
-                print(f"Sheets: {instance.sheet_names}")
+                print(f"📑 Sheets: {instance.sheet_names}")
         except Exception as e:
             print(f"⚠️ Could not extract sheet names: {e}")
 
