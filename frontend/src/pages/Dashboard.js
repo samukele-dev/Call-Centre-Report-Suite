@@ -563,6 +563,13 @@ const Dashboard = () => {
               <h6>Upload Data</h6>
             </Link>
 
+            <Link to="/export-data" className="quick-action-link">
+              <div className="quick-action-icon">
+                <i className="bi bi-download"></i>
+              </div>
+              <h6>Export Data</h6>
+            </Link>
+
             <Link to="/campaigns" className="quick-action-link">
               <div className="quick-action-icon">
                 <i className="bi bi-file-earmark-bar-graph"></i>

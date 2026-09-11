@@ -6,6 +6,7 @@ import { useAuth } from '../../context/AuthContext';
 const NAV_ITEMS = [
   { path: '/', icon: 'bi-speedometer2', label: 'Dashboard', end: true },
   { path: '/campaigns', icon: 'bi-megaphone', label: 'Campaigns', end: false },
+  { path: '/export-data', icon: 'bi-download', label: 'Export Data', end: false },
   { path: '/qa', icon: 'bi-clipboard-check', label: 'QA', end: false },
   { path: '/agent-reports', icon: 'bi-file-earmark-bar-graph', label: 'Agent Reports', end: false },
   { path: '/outcomes', icon: 'bi-list-check', label: 'Outcomes', end: false },

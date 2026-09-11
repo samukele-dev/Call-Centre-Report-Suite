@@ -176,12 +176,15 @@ class CallDataFileSerializer(serializers.ModelSerializer):
             print(f"✅ Data processed: {len(processed_df)} rows, {len(processed_df.columns)} columns")
             print(f"📋 Columns: {list(processed_df.columns)}")
 
-            # Save Excel copy
+            # Save a processed copy to disk. CSV, not .xlsx: XLSX caps a sheet
+            # at 1,048,576 rows (a hard limit of the file format, not
+            # something openpyxl/pandas can be configured past), and a large
+            # db-synced campaign can exceed that. CSV has no such ceiling.
             output_dir = os.path.join(settings.MEDIA_ROOT, 'processed_files')
             os.makedirs(output_dir, exist_ok=True)
             original_name_without_ext = os.path.splitext(instance.original_name)[0]
-            output_path = os.path.join(output_dir, f"processed_{original_name_without_ext}.xlsx")
-            processed_df.to_excel(output_path, index=False)
+            output_path = os.path.join(output_dir, f"processed_{original_name_without_ext}.csv")
+            processed_df.to_csv(output_path, index=False)
 
             records_saved = self._save_all_to_processed_data(instance, processed_df)
 
@@ -220,15 +223,11 @@ class CallDataFileSerializer(serializers.ModelSerializer):
         try:
             from .models import ProcessedData
 
-            print(f"💾 Saving {len(processed_df)} records to database...")
+            n_rows = len(processed_df)
+            print(f"💾 Saving {n_rows} records to database...")
 
             deleted_count, _ = ProcessedData.objects.filter(call_data_file=instance).delete()
             print(f"🧹 Cleared {deleted_count} existing records for file {instance.id}")
-
-            processed_records = []
-            records_saved = 0
-            batch_size = 500
-            errors = []
 
             column_mapping = {
                 'contact_id': 'contact_id',
@@ -271,102 +270,104 @@ class CallDataFileSerializer(serializers.ModelSerializer):
                 'dob': 'dob',
             }
 
-            for index, row in processed_df.iterrows():
-                try:
-                    processed_data = ProcessedData(call_data_file=instance)
+            # ------------------------------------------------------------------
+            # Column-level (vectorized) prep, replacing the per-cell work that
+            # used to run inside df.iterrows() below — including a fresh
+            # pd.to_datetime() call for every single date cell. That's why a
+            # big campaign sync (e.g. telkom-lte, hundreds of thousands of
+            # rows) could run 30+ minutes and still not finish: the same
+            # parsing now runs once per COLUMN instead of once per CELL, which
+            # is orders of magnitude fewer Python-level operations for the
+            # same result.
+            # ------------------------------------------------------------------
+            df = processed_df
 
-                    for df_col, model_field in column_mapping.items():
-                        if df_col not in processed_df.columns:
-                            continue
-                        value = row[df_col]
-                        if pd.isna(value):
-                            continue
+            for date_col in ('last_called_date', 'created_at', 'updated_at'):
+                if date_col in df.columns:
+                    df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
 
-                        try:
-                            if model_field in ['last_called_date', 'created_at', 'updated_at']:
-                                if value and str(value).strip():
-                                    dt_value = pd.to_datetime(value, errors='coerce')
-                                    if pd.notna(dt_value):
-                                        setattr(processed_data, model_field, dt_value.to_pydatetime())
+            if 'dob' in df.columns:
+                df['dob'] = pd.to_datetime(df['dob'], errors='coerce').dt.date
 
-                            elif model_field == 'dob':
-                                if value and str(value).strip():
-                                    dt_value = pd.to_datetime(value, errors='coerce')
-                                    if pd.notna(dt_value):
-                                        setattr(processed_data, model_field, dt_value.date())
+            if 'called_count' in df.columns:
+                df['called_count'] = pd.to_numeric(df['called_count'], errors='coerce').fillna(0).astype(int)
 
-                            elif model_field == 'called_count':
-                                try:
-                                    setattr(processed_data, model_field, int(float(value)))
-                                except Exception:
-                                    setattr(processed_data, model_field, 0)
+            if 'email_address' in df.columns:
+                email = df['email_address'].astype(str).str.strip()
+                has_at = email.str.contains('@', na=False)
+                df['email_address'] = email.where(has_at, None).str.slice(0, 254)
 
-                            elif model_field == 'email_address':
-                                if value and '@' in str(value):
-                                    setattr(processed_data, model_field, str(value).strip()[:254])
+            if 'website' in df.columns:
+                website = df['website'].astype(str).str.strip()
+                has_value = website.ne('')
+                needs_scheme = has_value & ~website.str.startswith(('http://', 'https://'))
+                website = website.where(~needs_scheme, 'http://' + website)
+                df['website'] = website.where(has_value, None).str.slice(0, 500)
 
-                            elif model_field == 'website':
-                                if value and str(value).strip():
-                                    url_str = str(value).strip()
-                                    if not url_str.startswith(('http://', 'https://')):
-                                        url_str = 'http://' + url_str
-                                    setattr(processed_data, model_field, url_str[:500])
+            specially_handled = {
+                'last_called_date', 'created_at', 'updated_at', 'dob',
+                'called_count', 'email_address', 'website',
+            }
+            wide_fields = {'list_name', 'company_name'}
+            for df_col, model_field in column_mapping.items():
+                if df_col not in df.columns or model_field in specially_handled:
+                    continue
+                max_length = 500 if model_field in wide_fields else 255
+                df[df_col] = df[df_col].astype(str).str.strip().str.slice(0, max_length)
 
-                            elif model_field in [
-                                'address1', 'address2', 'address3',
-                                'security_phrase', 'outcome_description'
-                            ]:
-                                setattr(processed_data, model_field, str(value).strip())
+            if 'contact_id' in df.columns:
+                missing = df['contact_id'].isna() | (df['contact_id'] == '')
+                df.loc[missing, 'contact_id'] = [f"ID_{i}" for i in df.index[missing]]
+            if 'last_outcome' in df.columns:
+                missing_outcome = df['last_outcome'].isna() | (df['last_outcome'] == '')
+                df.loc[missing_outcome, 'last_outcome'] = 'UNKNOWN'
 
-                            else:
-                                str_value = str(value).strip()
-                                max_length = 500 if model_field in ['list_name', 'company_name'] else 255
-                                setattr(processed_data, model_field, str_value[:max_length])
+            records = df.to_dict('records')
 
-                        except Exception as field_error:
-                            print(f"⚠️ Field error for {model_field}: {field_error}")
-                            continue
+            processed_records = []
+            records_saved = 0
+            batch_size = 1000
+            errors = []
 
-                    if not processed_data.contact_id:
-                        processed_data.contact_id = f"ID_{index}"
-                    if not processed_data.last_outcome:
-                        processed_data.last_outcome = 'UNKNOWN'
+            # One transaction for the whole sync instead of one auto-committed
+            # transaction per batch (the old behaviour, with batch_size=500):
+            # SQLite fsyncs on every commit, so a large sync used to pay that
+            # cost hundreds or thousands of times over. This pays it once.
+            with transaction.atomic():
+                for index, row in enumerate(records):
+                    try:
+                        kwargs = {'call_data_file': instance}
+                        for df_col, model_field in column_mapping.items():
+                            if df_col not in row:
+                                continue
+                            value = row[df_col]
+                            if value is None or value == '' or pd.isna(value):
+                                continue
+                            kwargs[model_field] = value
 
-                    processed_records.append(processed_data)
-                    records_saved += 1
+                        if not kwargs.get('contact_id'):
+                            kwargs['contact_id'] = f"ID_{index}"
+                        if not kwargs.get('last_outcome'):
+                            kwargs['last_outcome'] = 'UNKNOWN'
 
-                    if records_saved % 1000 == 0:
-                        print(f"⏳ Processed {records_saved} records...")
+                        processed_records.append(ProcessedData(**kwargs))
+                        records_saved += 1
 
-                    if len(processed_records) >= batch_size:
-                        try:
+                        if records_saved % 20000 == 0:
+                            print(f"⏳ Processed {records_saved} records...")
+
+                        if len(processed_records) >= batch_size:
                             ProcessedData.objects.bulk_create(processed_records, ignore_conflicts=True)
                             processed_records = []
-                        except Exception as bulk_error:
-                            print(f"⚠️ Batch save error: {bulk_error}")
-                            for record in processed_records:
-                                try:
-                                    record.save()
-                                except Exception as e:
-                                    errors.append(f"Record {index}: {e}")
-                            processed_records = []
 
-                except Exception as row_error:
-                    errors.append(f"Row {index}: {str(row_error)}")
-                    if len(errors) <= 10:
-                        print(f"⚠️ Error in row {index}: {row_error}")
-                    continue
+                    except Exception as row_error:
+                        errors.append(f"Row {index}: {str(row_error)}")
+                        if len(errors) <= 10:
+                            print(f"⚠️ Error in row {index}: {row_error}")
+                        continue
 
-            if processed_records:
-                try:
+                if processed_records:
                     ProcessedData.objects.bulk_create(processed_records, ignore_conflicts=True)
-                except Exception as e:
-                    print(f"⚠️ Final batch save error: {e}")
-                    for record in processed_records:
-                        try:
-                            record.save()
-                        except Exception:
-                            pass
 
             if errors:
                 print(f"⚠️ Total errors during save: {len(errors)}")

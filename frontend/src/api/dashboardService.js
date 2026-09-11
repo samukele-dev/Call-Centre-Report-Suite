@@ -577,6 +577,74 @@ class DashboardService {
     }
   }
 
+
+  // ========== EXPORT FORMATTED DATA ==========
+  static async exportFormattedData(campaignId = null, fileId = null) {
+    try {
+      const api = await DashboardService._api();
+      const params = new URLSearchParams();
+      
+      if (fileId) {
+        params.append('file_id', fileId);
+      } else if (campaignId) {
+        params.append('campaign_id', campaignId);
+      } else {
+        return { success: false, error: 'Either campaign_id or file_id is required' };
+      }
+      
+      const response = await api.get(`/api/files/export_formatted/?${params.toString()}`, {
+        responseType: 'blob'
+      });
+      
+      if (response.data instanceof Blob) {
+        // Check if it's an error response (JSON blob)
+        if (response.data.type === 'application/json') {
+          const text = await response.data.text();
+          try {
+            const errorData = JSON.parse(text);
+            return { success: false, error: errorData.error || 'Export failed' };
+          } catch {
+            // Not JSON, treat as success
+          }
+        }
+        
+        // Generate filename from headers or use default
+        let filename = `export_data_${new Date().toISOString().slice(0,10)}.xlsx`;
+        const contentDisposition = response.headers.get('Content-Disposition');
+        if (contentDisposition) {
+          const match = contentDisposition.match(/filename="(.+)"/);
+          if (match) {
+            filename = match[1];
+          }
+        }
+        
+        return { success: true, data: response.data, filename };
+      }
+      
+      return { success: false, error: 'Invalid response format' };
+    } catch (error) {
+      console.error('Export error:', error);
+      // responseType: 'blob' applies to error responses too, so a 400/404/500
+      // from export_formatted (all JSON) arrives here as error.response.data
+      // being a Blob, not a parsed object — error.response.data.error would
+      // silently be undefined and fall through to axios's generic HTTP-status
+      // message. Read the blob back out as text/JSON to get the real reason.
+      if (error.response?.data instanceof Blob) {
+        try {
+          const text = await error.response.data.text();
+          const errorData = JSON.parse(text);
+          return { success: false, error: errorData.error || 'Export failed' };
+        } catch {
+          // Body wasn't JSON either — fall through to the generic message below.
+        }
+      }
+      return {
+        success: false,
+        error: error.response?.data?.error || error.message || 'Export failed'
+      };
+    }
+  }
+
   static async generateAnalysisReport() {
     try {
       const api = await DashboardService._api();

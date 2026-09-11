@@ -550,12 +550,22 @@ def sync_campaign_from_database(campaign, user=None, start_date=None, end_date=N
         date_tag = f"_{start_date or 'start'}_to_{end_date or 'end'}"
     if list_ids:
         date_tag += f"_{len(list_ids)}lists"
-    original_name = f"db_sync_{campaign.name}{date_tag}_{timestamp}.xlsx"
+    # CSV, not .xlsx: a large campaign (e.g. a 20-month telkom-lte pull) can
+    # run to hundreds of thousands of rows. df.to_excel()/pd.read_excel() go
+    # through openpyxl's per-cell Python writer/reader, which is orders of
+    # magnitude slower than pandas' C-based CSV path for a frame this wide
+    # (35 columns) — this alone was enough to make a sync take 30+ minutes
+    # and still not finish. It also has a hard ceiling: Excel caps a sheet at
+    # 1,048,576 rows, so a pull past that raises outright. This file is only
+    # a hand-off buffer for the upload pipeline, which reads both formats the
+    # same way (dtype=str — see SimpleDataProcessor.process_call_data), so
+    # CSV loses nothing and has no row limit.
+    original_name = f"db_sync_{campaign.name}{date_tag}_{timestamp}.csv"
 
     buffer_path = os.path.join(settings.MEDIA_ROOT, 'tmp')
     os.makedirs(buffer_path, exist_ok=True)
     tmp_file_path = os.path.join(buffer_path, original_name)
-    df.to_excel(tmp_file_path, index=False)
+    df.to_csv(tmp_file_path, index=False, encoding='utf-8')
 
     try:
         with open(tmp_file_path, 'rb') as f:

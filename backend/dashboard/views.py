@@ -316,12 +316,24 @@ class CallDataFileViewSet(viewsets.ModelViewSet):
             else:
                 df['Description'] = descriptions
 
+            base_name = os.path.splitext(file_obj.original_name or 'data')[0]
+
+            # XLSX caps a sheet at 1,048,576 rows (a hard limit of the file
+            # format itself, not something openpyxl/pandas can be configured
+            # past — see the same ceiling hit during db sync). A campaign
+            # this large can't fit in one sheet, so fall back to CSV, which
+            # has no such ceiling, rather than 500ing on the download.
+            if len(df) > 2**20 - 1:
+                output = df.to_csv(index=False).encode('utf-8')
+                response = HttpResponse(output, content_type='text/csv')
+                response['Content-Disposition'] = f'attachment; filename="{base_name}_processed.csv"'
+                return response
+
             output = BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 df.to_excel(writer, sheet_name='Processed Data', index=False)
             output.seek(0)
 
-            base_name = os.path.splitext(file_obj.original_name or 'data')[0]
             response = HttpResponse(
                 output.getvalue(),
                 content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
@@ -336,6 +348,120 @@ class CallDataFileViewSet(viewsets.ModelViewSet):
             traceback.print_exc()
             return Response({'success': False, 'error': f'Error generating file: {e}'},
                             status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    
+    # ============================================================
+    # ADD THE export_formatted ACTION HERE
+    # ============================================================
+    @action(detail=False, methods=['get'], url_path='export_formatted')
+    def export_formatted(self, request):
+        """
+        Export processed data in the specified format with custom columns.
+        GET /api/files/export_formatted/?campaign_id=X&file_id=Y
+        
+        Returns Excel file with columns:
+        firstname, lastname, contact_id, Client ID number, Contact, 
+        Right party contact, Presentation, Sale, Policy number,
+        Disposition, Call attempts, Campaign, FICA Reference,
+        Contact Number, IMEI, Agent Name, LastCall Date, batch, Product Sold
+        """
+        from io import BytesIO
+        import pandas as pd
+        from django.db.models import Q
+        from datetime import datetime
+        
+        try:
+            campaign_id = request.query_params.get('campaign_id')
+            file_id = request.query_params.get('file_id')
+            
+            # Query processed data
+            qs = ProcessedData.objects.all()
+            
+            if file_id:
+                qs = qs.filter(call_data_file_id=file_id)
+            elif campaign_id:
+                qs = qs.filter(call_data_file__campaign_id=campaign_id)
+            else:
+                return Response(
+                    {'error': 'Either campaign_id or file_id is required'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            qs = qs.order_by('-last_called_date')
+            
+            if not qs.exists():
+                return Response(
+                    {'error': 'No processed data found for the specified criteria'},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+            
+            # Build the data with the specified columns
+            data = []
+            for record in qs:
+                row = {
+                    'firstname': record.firstname or '',
+                    'lastname': record.lastname or '',
+                    'contact_id': record.contact_id or '',
+                    'Client ID number': record.customer_id or '',
+                    'Contact': f"{record.firstname or ''} {record.lastname or ''}".strip() or '',
+                    'Right party contact': '',
+                    'Presentation': '',
+                    'Sale': 'Yes' if record.last_outcome and 'sale' in record.last_outcome.lower() else 'No',
+                    'Policy number': '',
+                    'Disposition': record.last_outcome or '',
+                    'Call attempts': record.called_count or 0,
+                    'Campaign': record.call_data_file.campaign.display_name if record.call_data_file and record.call_data_file.campaign else '',
+                    'FICA Reference': '',
+                    'Contact Number': record.tel1 or record.tel2 or '',
+                    'IMEI': '',
+                    'Agent Name': record.last_user or '',
+                    'LastCall Date': record.last_called_date.strftime('%Y-%m-%d %H:%M:%S') if record.last_called_date else '',
+                    'batch': record.list_name or '',
+                    'Product Sold': '',
+                }
+                data.append(row)
+            
+            df = pd.DataFrame(data)
+            
+            # Create Excel file
+            output = BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                df.to_excel(writer, sheet_name='Export Data', index=False)
+                
+                # Auto-adjust column widths
+                worksheet = writer.sheets['Export Data']
+                for idx, col in enumerate(df.columns):
+                    max_length = max(
+                        df[col].astype(str).map(len).max(),
+                        len(str(col))
+                    ) + 2
+                    col_letter = chr(65 + idx) if idx < 26 else chr(65 + idx // 26 - 1) + chr(65 + idx % 26)
+                    worksheet.column_dimensions[col_letter].width = min(max_length, 50)
+            
+            output.seek(0)
+            
+            # Generate filename
+            filename = f"export_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+            if campaign_id:
+                try:
+                    campaign = Campaign.objects.get(id=campaign_id)
+                    filename = f"export_{campaign.name}_{datetime.now().strftime('%Y%m%d')}.xlsx"
+                except Campaign.DoesNotExist:
+                    pass
+            
+            response = HttpResponse(
+                output.getvalue(),
+                content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            )
+            response['Content-Disposition'] = f'attachment; filename="{filename}"'
+            return response
+            
+        except Exception as e:
+            traceback.print_exc()
+            return Response(
+                {'error': f'Export failed: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
 
 # ===========================================================

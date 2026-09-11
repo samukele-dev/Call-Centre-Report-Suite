@@ -10,6 +10,7 @@ import Layout from './components/Layout/Layout';
 // Global Pages
 import Login from './pages/Login';
 import Dashboard from './pages/Dashboard';
+import ExportData from './pages/ExportData';
 import OutcomeDescriptions from './pages/OutcomeDescriptions';  // Keep this global
 import QA from './pages/QA';  // Global — spans multiple campaigns at once
 import AgentReports from './pages/AgentReports';  // Global — spans multiple campaigns at once
@@ -22,7 +23,6 @@ import CampaignTemplates from './pages/CampaignTemplates';
 import CampaignReports from './pages/CampaignReports';
 import CampaignAnalysis from './pages/CampaignAnalysis';
 
-// REMOVED: UploadData, Reports (standalone pages)
 
 // Components
 import ProtectedRoute from './components/ProtectedRoute';
@@ -40,6 +40,15 @@ function App() {
             <ProtectedRoute>
               <Layout>
                 <Dashboard />
+              </Layout>
+            </ProtectedRoute>
+          } />
+
+          {/* Global Export data Page */}
+          <Route path="/export-data" element={
+            <ProtectedRoute>
+              <Layout>
+                <ExportData />
               </Layout>
             </ProtectedRoute>
           } />
