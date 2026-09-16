@@ -89,6 +89,21 @@ services:
         sync: false
       - key: SOURCE_DB_PASSWORD
         sync: false
+      # Login user build.sh creates automatically on every deploy (see
+      # create_test_user.py) if it doesn't already exist. `sync: false`
+      # for the password specifically — Render prompts for it once in the
+      # dashboard rather than this file defaulting to a predictable one on
+      # a real, public deployment handling real PII. Username/email have
+      # sensible defaults (see create_test_user.py) and don't need to be
+      # secrets, so they're left as plain values here rather than also
+      # prompted for — override them too if you want something other than
+      # admin@altitudebpo.co.za.
+      - key: TEST_USER_USERNAME
+        value: admin
+      - key: TEST_USER_EMAIL
+        value: admin@altitudebpo.co.za
+      - key: TEST_USER_PASSWORD
+        sync: false
 
 databases:
   # This app's OWN database (Campaign, ProcessedData, GeneratedReport,
