@@ -15,13 +15,17 @@ services:
     runtime: static
     rootDir: frontend
     buildCommand: "npm install && npm run build"
-    # staticPublishPath is ALWAYS relative to the repo root, regardless of
-    # rootDir (rootDir only changes where buildCommand itself runs from) —
-    # confirmed against Render's docs after "build" alone produced a
-    # total 404 (Render found no publish directory at <repo>/build, since
-    # the real output from `npm run build` running inside frontend/ is at
-    # <repo>/frontend/build).
-    staticPublishPath: frontend/build
+    # staticPublishPath is relative to rootDir when rootDir is set (NOT
+    # repo-root-relative in that case — confirmed the hard way: Render's
+    # own generic docs say "relative to the repo root" with no mention of
+    # the rootDir interaction, which led to setting this to "frontend/build"
+    # once already; the actual build log then failed with "Publish
+    # directory frontend/build does not exist!", i.e. Render was looking
+    # for <rootDir>/frontend/build = frontend/frontend/build. CRA's own
+    # build output ("The build folder is ready to be deployed") confirmed
+    # the build itself succeeded — only the publish path was wrong. Real
+    # deploy behavior here overrides the docs wording.
+    staticPublishPath: build
     envVars:
       # CRA bakes REACT_APP_* vars into the build at BUILD time, not read
       # at runtime — see src/api/apiConfig.js. The backend's real deployed
