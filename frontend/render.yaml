@@ -15,18 +15,21 @@ services:
     runtime: static
     rootDir: frontend
     buildCommand: "npm install && npm run build"
-    staticPublishPath: build
+    # staticPublishPath is ALWAYS relative to the repo root, regardless of
+    # rootDir (rootDir only changes where buildCommand itself runs from) —
+    # confirmed against Render's docs after "build" alone produced a
+    # total 404 (Render found no publish directory at <repo>/build, since
+    # the real output from `npm run build` running inside frontend/ is at
+    # <repo>/frontend/build).
+    staticPublishPath: frontend/build
     envVars:
       # CRA bakes REACT_APP_* vars into the build at BUILD time, not read
-      # at runtime — see src/api/apiConfig.js. Set this by hand in the
-      # Render dashboard once you know the backend's real deployed URL
-      # (e.g. https://call-centre-backend.onrender.com) — left unset here
-      # rather than guessed, since this Blueprint deploys independently of
-      # backend/render.yaml and can't rely on referencing it directly.
-      # Changing it later means triggering a fresh build (env var changes
-      # alone don't retroactively affect an already-built static bundle).
+      # at runtime — see src/api/apiConfig.js. The backend's real deployed
+      # URL (from backend/render.yaml, a separate Blueprint). Changing
+      # this means triggering a fresh build — env var changes alone don't
+      # retroactively affect an already-built static bundle.
       - key: REACT_APP_API_URL
-        sync: false
+        value: https://call-centre-report-suite-backend.onrender.com
     routes:
       # React Router does client-side routing — without this rewrite,
       # refreshing (or deep-linking) any route other than "/" (e.g.
