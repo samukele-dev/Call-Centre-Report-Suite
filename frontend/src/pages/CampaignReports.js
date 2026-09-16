@@ -1,12 +1,14 @@
 // src/pages/CampaignReports.js - FIXED: reports scoped to campaign
 import React, { useState, useEffect } from 'react';
 import { useParams, Link } from 'react-router-dom';
-import { 
+import {
   Card, Button, Alert, Spinner,
-  Row, Col, Table, Badge, Modal, ProgressBar
+  Row, Col, Table, Badge, Modal, ProgressBar, Form
 } from 'react-bootstrap';
 import DashboardService from '../api/dashboardService';
 import { saveAs } from 'file-saver';
+import { REPORT_SHEETS, toggleReportSheet, FULL_OUTCOME_HISTORY_OPTION } from '../utils/reportSheets';
+import ReportPreviewModal from '../components/ReportPreviewModal';
 
 const CampaignReports = () => {
   const { id } = useParams();  // campaign ID from URL
@@ -15,7 +17,16 @@ const CampaignReports = () => {
   const [loading, setLoading] = useState(true);
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState(null);
+  const [previewReportId, setPreviewReportId] = useState(null);
   const [showGenerateModal, setShowGenerateModal] = useState(false);
+  const [selectedSheets, setSelectedSheets] = useState(REPORT_SHEETS.map(s => s.key));
+  const [fullOutcomeHistory, setFullOutcomeHistory] = useState(false);
+
+  const pivotLocked = selectedSheets.includes('campaign_analysis') || selectedSheets.includes('template');
+
+  const toggleSheet = (key) => {
+    setSelectedSheets(prev => toggleReportSheet(prev, key));
+  };
 
   useEffect(() => {
     fetchCampaign();
@@ -54,7 +65,7 @@ const CampaignReports = () => {
     setGenerating(true);
     try {
       // FIX: pass campaign id so the report is generated for THIS campaign
-      const result = await DashboardService.generateCampaignReport(id);
+      const result = await DashboardService.generateCampaignReport(id, selectedSheets, fullOutcomeHistory);
       
       if (result.success) {
         alert(`Campaign report for "${campaign?.display_name}" generated successfully!`);
@@ -229,6 +240,15 @@ const CampaignReports = () => {
                       </td>
                       <td>
                         <Button
+                          variant="outline-secondary"
+                          size="sm"
+                          className="me-2"
+                          onClick={() => setPreviewReportId(report.id)}
+                        >
+                          <i className="bi bi-eye me-1"></i>
+                          Preview
+                        </Button>
+                        <Button
                           variant="outline-success"
                           size="sm"
                           onClick={() => handleDownloadReport(
@@ -262,16 +282,53 @@ const CampaignReports = () => {
           <Modal.Title>Generate Campaign Report</Modal.Title>
         </Modal.Header>
         <Modal.Body>
-          <Alert variant="info">
+          <Alert variant="info" className="mb-3">
             <i className="bi bi-info-circle me-2"></i>
             This will generate a report for <strong>{campaign?.display_name}</strong> using
             the latest uploaded data file for this campaign.
-            <ul className="mt-2 mb-0">
-              <li><strong>Processed Data</strong> – All raw data from your latest upload</li>
-              <li><strong>Pivot</strong> – Count of each outcome description</li>
-              <li><strong>Campaign Analysis</strong> – Categorized metrics with Excel formulas</li>
-            </ul>
           </Alert>
+          <div className="mb-3">
+            <div className="fw-semibold mb-2">Sheets to include</div>
+            {REPORT_SHEETS.map(sheet => {
+              const dbUnavailable = sheet.dbOnly && !campaign?.cd_campaign_id;
+              const locked = (sheet.key === 'pivot' || sheet.key === 'lead_count') && pivotLocked;
+              return (
+                <Form.Check
+                  key={sheet.key}
+                  type="checkbox"
+                  id={`sheet-${sheet.key}`}
+                  className="mb-1"
+                  disabled={generating || dbUnavailable || locked}
+                  checked={selectedSheets.includes(sheet.key)}
+                  onChange={() => toggleSheet(sheet.key)}
+                  label={
+                    <span>
+                      <strong>{sheet.label}</strong> – {sheet.description}
+                      {locked && <span className="text-muted"> (required by Campaign Analysis/Template)</span>}
+                      {dbUnavailable && <span className="text-muted"> (requires a Source Database Campaign ID)</span>}
+                    </span>
+                  }
+                />
+              );
+            })}
+          </div>
+          <div className="mb-3">
+            <div className="fw-semibold mb-2">Accuracy</div>
+            <Form.Check
+              type="checkbox"
+              id="full-outcome-history"
+              disabled={generating || !campaign?.cd_campaign_id}
+              checked={fullOutcomeHistory}
+              onChange={(e) => setFullOutcomeHistory(e.target.checked)}
+              label={
+                <span>
+                  <strong>{FULL_OUTCOME_HISTORY_OPTION.label}</strong> – {FULL_OUTCOME_HISTORY_OPTION.description}
+                  <span className="text-muted"> (slower — a full database scan)</span>
+                  {!campaign?.cd_campaign_id && <span className="text-muted"> (requires a Source Database Campaign ID)</span>}
+                </span>
+              }
+            />
+          </div>
           {generating && (
             <div className="mb-3">
               <ProgressBar animated now={100} variant="primary" />
@@ -283,10 +340,10 @@ const CampaignReports = () => {
           <Button variant="secondary" onClick={() => setShowGenerateModal(false)}>
             Cancel
           </Button>
-          <Button 
-            variant="primary" 
+          <Button
+            variant="primary"
             onClick={handleGenerateCampaignReport}
-            disabled={generating}
+            disabled={generating || selectedSheets.length === 0}
           >
             {generating ? (
               <>
@@ -297,6 +354,12 @@ const CampaignReports = () => {
           </Button>
         </Modal.Footer>
       </Modal>
+
+      <ReportPreviewModal
+        show={!!previewReportId}
+        onHide={() => setPreviewReportId(null)}
+        reportId={previewReportId}
+      />
     </div>
   );
 };

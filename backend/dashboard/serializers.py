@@ -140,17 +140,20 @@ class CallDataFileSerializer(serializers.ModelSerializer):
         self._start_processing(instance)
         return instance
 
-    def _start_processing(self, instance):
+    def _start_processing(self, instance, sheets=None, full_outcome_history=False, auto_generate_report=True):
         try:
             instance.status = 'processing'
             instance.save()
-            self._process_file_sync(instance)
+            self._process_file_sync(
+                instance, sheets=sheets, full_outcome_history=full_outcome_history,
+                auto_generate_report=auto_generate_report
+            )
         except Exception as e:
             instance.status = 'failed'
             instance.processing_errors = str(e)
             instance.save()
 
-    def _process_file_sync(self, instance):
+    def _process_file_sync(self, instance, sheets=None, full_outcome_history=False, auto_generate_report=True):
         try:
             from .views import SimpleDataProcessor
             from django.utils import timezone
@@ -199,17 +202,37 @@ class CallDataFileSerializer(serializers.ModelSerializer):
             # ── AUTO-GENERATE the full 4-sheet report ──────────────────
             # Triggered immediately after file processing so the report
             # is ready by the time the user navigates to the Reports page.
-            try:
-                from .views import ReportViewSet
-                print(f"🚀 Auto-generating full report for campaign "
-                      f"{instance.campaign_id}...")
-                ReportViewSet._auto_generate_full_report(instance)
-                print(f"✅ Auto-report generation complete.")
-            except Exception as auto_err:
-                # Never fail the upload just because report generation failed
-                print(f"⚠️  Auto-report failed (non-fatal): {auto_err}")
-                import traceback as _tb
-                _tb.print_exc()
+            #
+            # Skipped when auto_generate_report=False (the db-sync call
+            # path — see external_source.sync_campaign_from_database). A
+            # db sync's own data pull/save is already done by this point
+            # (status is 'processed' above); report generation used to run
+            # anyway, inside this same synchronous call, before the sync's
+            # HTTP response could return — so on a big campaign the sync
+            # looked "stuck" for as long as the report's own extra
+            # external-DB queries (Agent Performance/Call Count Breakdown)
+            # took, even though the sync itself had already finished. Sync
+            # now always returns as soon as the data is saved; the report
+            # is built later via the separate "Generate Report" action
+            # (ReportViewSet.generate_campaign), on the user's own timing.
+            # A plain CSV/Excel upload (this method's other caller) keeps
+            # the old auto-generate-immediately behaviour, since it has no
+            # such slow external-DB step to worry about.
+            if auto_generate_report:
+                try:
+                    from .views import ReportViewSet
+                    print(f"🚀 Auto-generating full report for campaign "
+                          f"{instance.campaign_id}...")
+                    ReportViewSet._auto_generate_full_report(instance, sheets=sheets, full_outcome_history=full_outcome_history)
+                    print(f"✅ Auto-report generation complete.")
+                except Exception as auto_err:
+                    # Never fail the upload just because report generation failed
+                    print(f"⚠️  Auto-report failed (non-fatal): {auto_err}")
+                    import traceback as _tb
+                    _tb.print_exc()
+            else:
+                print("ℹ️  Skipping auto-report generation for this db sync — "
+                      "use Generate Report when you're ready to build it.")
 
         except Exception as e:
             print(f"❌ Error processing file: {e}")
@@ -232,6 +255,7 @@ class CallDataFileSerializer(serializers.ModelSerializer):
             column_mapping = {
                 'contact_id': 'contact_id',
                 'customer_id': 'customer_id',
+                'id_number': 'id_number',
                 'lead_reference': 'lead_reference',
                 'list_id': 'list_id',
                 'list_name': 'list_name',

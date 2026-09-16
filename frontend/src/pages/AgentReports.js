@@ -3,6 +3,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { Form, Dropdown, Alert } from 'react-bootstrap';
 import { saveAs } from 'file-saver';
 import DashboardService from '../api/dashboardService';
+import ReportPreviewModal from '../components/ReportPreviewModal';
 
 const AgentReports = () => {
   const [campaigns, setCampaigns] = useState([]);
@@ -17,6 +18,7 @@ const AgentReports = () => {
   const [progress, setProgress] = useState(null); // { index, total, campaignName }
   const [results, setResults] = useState([]);
   const [downloadingId, setDownloadingId] = useState(null);
+  const [previewReportId, setPreviewReportId] = useState(null);
   const [error, setError] = useState(null);
   const stopRequestedRef = useRef(false);
   const runInFlightRef = useRef(false);
@@ -322,23 +324,37 @@ const AgentReports = () => {
               </span>
               <span>
                 {r.status === 'success' && r.report ? (
-                  <button
-                    className="btn btn-sm btn-outline-secondary"
-                    onClick={() => handleDownload(r.report, r.campaignName)}
-                    disabled={downloadingId === r.report.id}
-                  >
-                    {downloadingId === r.report.id ? (
-                      <span className="spinner-border spinner-border-sm"></span>
-                    ) : (
-                      <><i className="bi bi-download me-1"></i>Download</>
-                    )}
-                  </button>
+                  <>
+                    <button
+                      className="btn btn-sm btn-outline-secondary me-2"
+                      onClick={() => setPreviewReportId(r.report.id)}
+                    >
+                      <i className="bi bi-eye me-1"></i>Preview
+                    </button>
+                    <button
+                      className="btn btn-sm btn-outline-secondary"
+                      onClick={() => handleDownload(r.report, r.campaignName)}
+                      disabled={downloadingId === r.report.id}
+                    >
+                      {downloadingId === r.report.id ? (
+                        <span className="spinner-border spinner-border-sm"></span>
+                      ) : (
+                        <><i className="bi bi-download me-1"></i>Download</>
+                      )}
+                    </button>
+                  </>
                 ) : '—'}
               </span>
             </div>
           ))}
         </div>
       )}
+
+      <ReportPreviewModal
+        show={!!previewReportId}
+        onHide={() => setPreviewReportId(null)}
+        reportId={previewReportId}
+      />
     </div>
   );
 };

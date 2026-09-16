@@ -166,6 +166,13 @@ class ProcessedData(models.Model):
 
     contact_id = models.CharField(max_length=255, db_index=True, null=True, blank=True)
     customer_id = models.CharField(max_length=255, null=True, blank=True)
+    # Contact's ID/passport number, e.g. an SA ID number — pulled from the
+    # source DB's per-campaign custom jsonb field (see
+    # external_source.SOURCE_QUERY_TEMPLATE's comment for which key, and why
+    # it varies by campaign). Populated for db-synced campaigns whose lead
+    # data carries one (Telkom LTE among them); blank for manual CSV
+    # uploads unless their sheet has an 'id_number' column.
+    id_number = models.CharField(max_length=255, null=True, blank=True)
     lead_reference = models.CharField(max_length=255, null=True, blank=True)
     list_id = models.CharField(max_length=255, null=True, blank=True)
     list_name = models.CharField(max_length=500, null=True, blank=True)
@@ -312,10 +319,19 @@ class QACallRecord(models.Model):
     Deliberately separate from ProcessedData (the Campaign upload/sync
     pipeline's table): different columns (full outcome name, recording ref),
     different source query, different purpose.
+
+    One row per historical interaction/disposition, not per contact — a
+    contact called twice with two different outcomes produces two rows.
+    Earlier versions of this cache held one row per contact (their current
+    state only, unique on campaign+contact_id), which silently lost any
+    outcome a contact was later redispositioned away from; interaction_id
+    (the source DB's own per-call identifier, permanent and never reused)
+    is what makes multiple rows per contact possible without duplicates.
     """
     campaign = models.ForeignKey(
         Campaign, on_delete=models.CASCADE, related_name='qa_records'
     )
+    interaction_id = models.CharField(max_length=64, db_index=True)
     contact_id = models.CharField(max_length=255, db_index=True)
     customer = models.CharField(max_length=500, null=True, blank=True)
     phone_number = models.CharField(max_length=100, null=True, blank=True)
@@ -328,11 +344,12 @@ class QACallRecord(models.Model):
 
     class Meta:
         constraints = [
-            models.UniqueConstraint(fields=['campaign', 'contact_id'], name='unique_qa_record_per_contact')
+            models.UniqueConstraint(fields=['campaign', 'interaction_id'], name='unique_qa_record_per_interaction')
         ]
         indexes = [
             models.Index(fields=['campaign', 'call_date']),
             models.Index(fields=['campaign', 'outcome']),
+            models.Index(fields=['campaign', 'contact_id']),
         ]
         ordering = ['-call_date']
 

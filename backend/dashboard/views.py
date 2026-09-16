@@ -19,6 +19,7 @@ import numpy as np
 from io import BytesIO, StringIO
 import json
 import os
+import re
 import uuid
 from datetime import datetime, timedelta
 import csv
@@ -120,6 +121,15 @@ def _build_outcome_map(campaign):
     }
 
 
+# id_number is an acronym, not a regular word — field.replace('_', ' ').title()
+# would otherwise render it as "Id Number" on Processed Data sheet headers.
+COLUMN_HEADER_OVERRIDES = {'id_number': 'ID Number'}
+
+
+def _column_header(field_name):
+    return COLUMN_HEADER_OVERRIDES.get(field_name, field_name.replace('_', ' ').title())
+
+
 class SimpleDataProcessor:
     @staticmethod
     def process_call_data(file_path, user, file_type='excel', delimiter=',', has_headers=True, campaign=None):
@@ -186,6 +196,24 @@ class SimpleDataProcessor:
                 df = df.rename(columns={contact_id_col: 'contact_id'})
             elif not contact_id_col:
                 df['contact_id'] = [f"ID_{i + 1}" for i in range(len(df))]
+
+            # Normalise ID/passport number column. The DB-synced path
+            # (external_source.SOURCE_QUERY_TEMPLATE) already COALESCEs across
+            # every spelling observed on the source DB — 'idn', 'id_num',
+            # 'idno', 'id_no', 'idnumber', 'id_number' — for the same reason:
+            # different campaigns (and upload batches within a campaign) use
+            # different lead-form field names for a contact's 13-digit ID
+            # number. Manually uploaded sheets carry that same variance, so
+            # match on the same spellings here (case/spacing/underscore
+            # insensitive) rather than requiring an exact 'id_number' header.
+            id_number_aliases = {'idn', 'idnum', 'idno', 'idnumber'}
+            id_number_col = None
+            for col in df.columns:
+                if re.sub(r'[^a-z0-9]', '', col.lower()) in id_number_aliases:
+                    id_number_col = col
+                    break
+            if id_number_col and id_number_col != 'id_number':
+                df = df.rename(columns={id_number_col: 'id_number'})
 
             # Build outcome map — strictly scoped to this campaign's outcome
             # set (see _build_outcome_map). No cross-set fallback: a code
@@ -881,32 +909,174 @@ class ReportViewSet(
             return Response({'success': False, 'error': str(e)},
                             status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    # Hard cap on rows returned per preview request — this reads the sheet
+    # into a browser table, not a download; a Processed Data sheet can run
+    # to hundreds of thousands of rows (see external_source.py's csv-not-xlsx
+    # comment) and there is no reason to ship more than a human will
+    # actually look at in a preview.
+    PREVIEW_ROW_LIMIT = 200
+
+    @action(detail=True, methods=['get'])
+    def preview(self, request, pk=None):
+        """
+        Preview a generated report's data without downloading the file —
+        read straight from the same .xlsx a "Download" button would fetch,
+        so the preview is always exactly what's in the file (no separate
+        recomputation from the DB that could drift from it).
+
+        GET /api/reports/<id>/preview/?sheet=<name> — sheet optional,
+        defaults to 'Processed Data' when present (the most useful sheet
+        to eyeball before downloading), else the workbook's first sheet.
+
+        Returns {sheet, sheets, columns, rows, total_rows, truncated} —
+        rows/total_rows/truncated describe `sheet`; `sheets` lists every
+        sheet name in the workbook so the frontend can offer a switcher.
+        Formula cells (e.g. Campaign Analysis's VLOOKUPs) come back as
+        their formula text rather than a computed number — this workbook
+        is written by xlsxwriter, which never calculates formulas or
+        caches a result, so data_only=True would show these cells as
+        blank instead; the raw formula string is at least visible content.
+        Sheets with no formulas (Processed Data, Pivot, Lead Count's
+        values, Call Count Breakdown) are unaffected and preview exactly
+        as their real values either way.
+        """
+        try:
+            report = self.get_object()
+            if not report.file or not os.path.exists(report.file.path):
+                return Response(
+                    {'success': False, 'error': 'Report file not found on server.'},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+
+            wb = load_workbook(report.file.path, read_only=True, data_only=False)
+            try:
+                sheet_names = wb.sheetnames
+                requested = request.query_params.get('sheet')
+                if requested and requested in sheet_names:
+                    sheet_name = requested
+                elif 'Processed Data' in sheet_names:
+                    sheet_name = 'Processed Data'
+                else:
+                    sheet_name = sheet_names[0]
+
+                ws = wb[sheet_name]
+                row_iter = ws.iter_rows(values_only=True)
+                header = next(row_iter, None) or []
+                columns = ['' if c is None else str(c) for c in header]
+
+                rows = []
+                total_rows = 0
+                for row in row_iter:
+                    total_rows += 1
+                    if len(rows) < ReportViewSet.PREVIEW_ROW_LIMIT:
+                        rows.append(['' if c is None else c for c in row])
+
+                return Response({
+                    'success': True,
+                    'data': {
+                        'sheet': sheet_name,
+                        'sheets': sheet_names,
+                        'columns': columns,
+                        'rows': rows,
+                        'total_rows': total_rows,
+                        'truncated': total_rows > len(rows),
+                    }
+                })
+            finally:
+                wb.close()
+        except GeneratedReport.DoesNotExist:
+            return Response({'success': False, 'error': 'Report not found'},
+                            status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            traceback.print_exc()
+            return Response({'success': False, 'error': str(e)},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
     # ----------------------------------------------------------
     # GENERATE CAMPAIGN REPORT  ← FIX: fully campaign-scoped
     # ----------------------------------------------------------
 
+    ALL_REPORT_SHEETS = {
+        'processed_data', 'pivot', 'lead_count', 'campaign_analysis',
+        'call_count_breakdown', 'agent_performance', 'template',
+    }
+
     @staticmethod
-    def _auto_generate_full_report(file_instance):
+    def _auto_generate_full_report(file_instance, sheets=None, full_outcome_history=False):
         """
         Automatically called after a data file is processed.
-        Generates ONE workbook with up to 6 sheets and saves it as a GeneratedReport:
+        Generates ONE workbook with up to 7 sheets and saves it as a GeneratedReport:
 
             Sheet 1: Processed Data       — every record from this upload
-            Sheet 2: Pivot                — count per outcome description
-            Sheet 3: Campaign Analysis    — summary metrics + category tables,
+            Sheet 2: Pivot                — count per outcome description;
+                                             every historical disposition
+                                             when full_outcome_history is on,
+                                             so this can legitimately exceed
+                                             Lead Count's Total Leads
+            Sheet 3: Lead Count           — total leads + New/Sales/True
+                                             Contacts/Unsuccessful/Unworkable
+                                             breakdown, always one row per
+                                             contact's CURRENT outcome — never
+                                             inflated by full_outcome_history,
+                                             so this always matches Processed
+                                             Data's row count exactly. Forced
+                                             into `wanted` whenever
+                                             'campaign_analysis'/'template' is,
+                                             since Campaign Analysis's %
+                                             formulas reference this sheet's
+                                             Total Leads cell directly instead
+                                             of showing/holding that number
+                                             itself (previously the two could
+                                             visually look inconsistent with
+                                             each other and with Processed
+                                             Data whenever full_outcome_history
+                                             was on).
+            Sheet 4: Campaign Analysis    — summary metrics + category tables,
                                              each Lead Count paired with its %
-                                             of Total Leads
-            Sheet 4: Call Count Breakdown — how many times each contact was
+                                             of Total Leads (from the Lead
+                                             Count sheet, see above)
+            Sheet 5: Call Count Breakdown — how many times each contact was
                                              called in this date range (only if
                                              the campaign has a cd_campaign_id;
                                              see external_source.fetch_contact_call_counts)
-            Sheet 5: Agent Performance    — per-agent call stats (only if the
+            Sheet 6: Agent Performance    — per-agent call stats, sorted by
+                                             sales descending (only if the
                                              campaign has a cd_campaign_id; see
                                              external_source.fetch_agent_performance)
-            Sheet 6: Sheet1               — the campaign's template, populated
+            Sheet 7: Sheet1               — the campaign's template, populated
 
         This replaces the old two-step flow (Generate Report → Run Analysis).
         Everything is ready to download as soon as the upload completes.
+
+        `sheets`, when given, is an iterable of keys from ALL_REPORT_SHEETS
+        limiting which sheets get built — the auto-generate-after-upload
+        call site leaves it as None (build everything, the historical
+        behaviour). Skipping 'agent_performance'/'call_count_breakdown' also
+        skips their external-database queries entirely, not just the
+        worksheet — that's the actual point, since those two are the slow,
+        sometimes-timing-out ones (see external_source.fetch_agent_performance/
+        fetch_contact_call_counts).
+
+        Two dependencies are enforced regardless of what's requested:
+        'campaign_analysis' needs 'pivot' (its cells are live VLOOKUPs against
+        the Pivot sheet), and 'template' needs 'pivot' too (Sheet1 population
+        reads its category counts back out of the actual Pivot worksheet
+        cells, not from the Python dict). Requesting one without the other
+        silently includes Pivot rather than producing a broken workbook.
+
+        full_outcome_history (default False, opt-in): when True, Pivot/
+        Campaign Analysis count every historical disposition for the
+        campaign (via external_source.fetch_outcome_history_counts) instead
+        of each contact's current/latest outcome only. This is the
+        *correct* number — ProcessedData.last_outcome loses a contact's
+        earlier dispositions (e.g. a sale made last month) the moment
+        they're called again for any reason — but it's a full external-DB
+        scan of every interaction, verified to take several minutes even
+        on one campaign (a 90-day range took ~8 minutes on a
+        ~25k-interactions/day campaign), so it's opt-in rather than run on
+        every report generation (including the automatic one after every
+        upload/sync, which needs to stay fast). False falls back to the
+        original ProcessedData-based counting, same as before this existed.
         """
         from django.conf import settings
         import xlsxwriter, openpyxl, os, traceback
@@ -915,6 +1085,18 @@ class ReportViewSet(
         from django.db.models import Count, Min, Max
         from openpyxl import load_workbook
         from openpyxl.utils import get_column_letter
+
+        wanted = set(sheets) if sheets else set(ReportViewSet.ALL_REPORT_SHEETS)
+        wanted &= ReportViewSet.ALL_REPORT_SHEETS
+        if not wanted:
+            wanted = set(ReportViewSet.ALL_REPORT_SHEETS)
+        if 'campaign_analysis' in wanted or 'template' in wanted:
+            wanted.add('pivot')
+            # Campaign Analysis's %-of-total-leads formulas reference the
+            # Lead Count sheet's Total Leads cell directly (see below) —
+            # it no longer shows that number itself, so it can't work
+            # without Lead Count also existing in the same workbook.
+            wanted.add('lead_count')
 
         campaign = file_instance.campaign
         if not campaign:
@@ -940,28 +1122,89 @@ class ReportViewSet(
             print("⚠️ No processed data — skipping auto-report.")
             return
 
-        # ── 3. Build Pivot counts ──────────────────────────────────────
-        raw_counts = processed_data_query.values('last_outcome').annotate(
-            count=Count('id')
+        # date_span — the actual min/max last_called_date across THIS
+        # file's processed rows. Used to scope every external-DB query this
+        # function makes (Full Outcome History below, and Agent Performance/
+        # Call Count Breakdown further down) to whatever range the sync/
+        # upload that produced this file was itself scoped to — a sync run
+        # for "yesterday" should have its outcome history counted for
+        # yesterday too, not the campaign's entire lifetime. Computed once,
+        # unconditionally, since every one of those three consumers needs
+        # the same thing and this query is cheap (an indexed aggregate over
+        # this file's own rows, not an external-DB round trip).
+        date_span = processed_data_query.aggregate(
+            min_date=Min('last_called_date'), max_date=Max('last_called_date')
         )
-        description_counts = {}
-        grand_total = 0
-        for item in raw_counts:
-            key  = item['last_outcome'] or 'Unknown'
-            desc = outcome_map.get(key, key)
-            description_counts[desc] = description_counts.get(desc, 0) + item['count']
-            grand_total += item['count']
 
+        # ── 3. Build Pivot counts ──────────────────────────────────────
+        # description_counts reflects every historical disposition for this
+        # campaign (via reporting.interaction_voice), not just each
+        # contact's current/latest outcome. ProcessedData.last_outcome only
+        # ever holds the latter — a contact who made a sale last month and
+        # was called again since (for any reason, even just "Answering
+        # Machine") silently lost that sale from every count derived from
+        # ProcessedData, permanently, since the sync only refreshes current
+        # state. total_leads stays a contact count (unchanged meaning — see
+        # every Campaign Analysis %/total below, which all still divide by
+        # it) computed separately, since disposition counts can now
+        # legitimately sum to more than total_leads (one contact can
+        # contribute several outcomes over its call history).
+        #
+        # Falls back to the old ProcessedData-based (latest-outcome-only)
+        # counting when the campaign isn't DB-connected or the external
+        # query fails outright — an under-counted Pivot beats none at all.
+        total_leads = total_count
+        description_counts = None
+        outcome_history_skipped_ranges = []
+        if full_outcome_history and campaign.cd_campaign_id:
+            try:
+                from .external_source import fetch_outcome_history_counts, default_campaign_date_range
+                # Scope the scan to this file's own date_span (see above) —
+                # i.e. whatever range the sync/upload that produced this
+                # file was itself scoped to — rather than always the
+                # campaign's entire lifetime. Previously this always called
+                # default_campaign_date_range(campaign) unconditionally,
+                # which ignored any date range the sync panel was given
+                # entirely: picking "yesterday" and checking Full Outcome
+                # History still scanned the campaign's full history (back
+                # to 2015 — see default_campaign_date_range's docstring),
+                # which is both the slow "full database scan" this option
+                # is warned for and not what "yesterday" implied. Falls
+                # back to default_campaign_date_range only when this file's
+                # rows have no last_called_date at all to derive a range
+                # from (both None) — same "never silently miss data" reasoning
+                # as everywhere else this fallback is used.
+                if date_span['min_date'] and date_span['max_date']:
+                    hist_start, hist_end = date_span['min_date'], date_span['max_date']
+                else:
+                    hist_start, hist_end = default_campaign_date_range(campaign)
+                raw_history_counts, outcome_history_skipped_ranges = fetch_outcome_history_counts(
+                    campaign.cd_campaign_id, start_dt=hist_start, end_dt=hist_end
+                )
+                description_counts = {}
+                for key, count in raw_history_counts.items():
+                    desc = outcome_map.get(key, key)
+                    description_counts[desc] = description_counts.get(desc, 0) + count
+                print(f"📊 Outcome history: {sum(description_counts.values())} dispositions "
+                      f"({hist_start} .. {hist_end}), {len(outcome_history_skipped_ranges)} range(s) skipped")
+            except Exception as e:
+                print(f"⚠️  Outcome history query failed, falling back to latest-outcome counting: {e}")
+                description_counts = None
+
+        if description_counts is None:
+            raw_counts = processed_data_query.values('last_outcome').annotate(count=Count('id'))
+            description_counts = {}
+            for item in raw_counts:
+                key  = item['last_outcome'] or 'Unknown'
+                desc = outcome_map.get(key, key)
+                description_counts[desc] = description_counts.get(desc, 0) + item['count']
+
+        total_dispositions = sum(description_counts.values())
         sorted_desc_counts = sorted(
             description_counts.items(), key=lambda x: x[1], reverse=True
         )
 
         # ── 4. Compute summary metrics ─────────────────────────────────
-        total_leads = grand_total
-        unworked_leads = processed_data_query.filter(
-            last_outcome__iexact='New'
-        ).count()
-
         SALE_TERMS = [
             'sale made', 'upsell', 'tyme bank account sale',
             'sale made - completed mandate', 'sale made - pending mandate',
@@ -976,13 +1219,32 @@ class ReportViewSet(
             'not interested sms', 'call back via ms teams',
         ]
 
+        # SALE_TERMS is a generic name-keyword guess and can miss a
+        # campaign's real conversions outright when its outcome names don't
+        # happen to contain a sales word (verified live: Vodacom Retentions'
+        # actual wins are 'Change debit date'/'Client Contacted For
+        # Documents'/'Special Debit'/'Still Active' — Campaign Analysis
+        # showed 0 sales from SALE_TERMS alone while Agent Performance,
+        # which reads the dialer's own sale=1 flag per outcome, correctly
+        # showed 64). Fetching that authoritative flag set here and OR-ing
+        # it into the same classification closes that gap without touching
+        # anything for campaigns where the keyword list already matched.
+        sale_outcome_names = set()
+        if campaign.cd_campaign_id:
+            try:
+                from .external_source import fetch_sale_outcome_names
+                sale_outcome_names = fetch_sale_outcome_names()
+            except Exception as e:
+                print(f"⚠️  Could not fetch authoritative sale outcome names, "
+                      f"falling back to SALE_TERMS only: {e}")
+
         true_sales = 0
         true_contacts = 0
         unworked_leads = 0
 
         for desc, count in description_counts.items():
             d = desc.lower().strip()
-            if any(t in d for t in SALE_TERMS):
+            if any(t in d for t in SALE_TERMS) or d in sale_outcome_names:
                 true_sales += count
             elif any(t in d for t in TRUE_CONTACT_TERMS):
                 true_contacts += count
@@ -996,39 +1258,145 @@ class ReportViewSet(
         print(f"Metrics: TL={total_leads} SC={successful_contacts} "
               f"TC={true_contacts} TS={true_sales} Conv={conversion_value:.2f}%")
 
+        # ── 4c. Lead Count categories — ALWAYS contact-based ────────────
+        # Same 4 status-category term lists Campaign Analysis uses for its
+        # per-outcome breakdown (hoisted here so the Lead Count sheet below
+        # can share them without duplicating the lists a third time).
+        LEAD_COUNT_CATEGORIES = {
+            'unsuccessful': [
+                'Answering Machine Autodial','No Answer Autodial','Auto Engaged',
+                'Disconnected Number Auto','Answering Machine','Selected','No Answer',
+                'Busy Tone','Dropped','New','Call Dropped','Inbound After Hours Drop',
+                'TPS Registered Number','Temporary Disconnected Number','Bad Line Quality',
+                'Inbound Abandon','Outbound Pre-Routing Drop','Engaged','Disconnected',
+                'CONGESTED','Flow Inbound Abandon','Multiple Calls','Missed','Answered',
+                'Customer drop','Auto Dial Disconnected','Disconnected Number Temporary'
+            ],
+            'successful': [
+                'Sale Made - Completed Mandate','Sale Made - Pending Mandate',
+                'Sale Made','Tyme Bank Account Sale','QA Rework','QA Verify'
+            ],
+            'unworkable': [
+                'Already Contacted','Existing Client','Unemployed','Wrong Number',
+                'Do Not Call','No Smartphones','Client Deceased',
+                'Right Party Not Available','Client Overage Limit','Language Barrier',
+                'Non SA Citizen','No Bank Account','Client Underage','Go To The Branch',
+                'Completed','Cannot Afford Upfront Payment','Account Suspended',
+                'Insured at another company','Scheduled Appointment','Refund Request',
+                'Does Not Qualify','NTU Policy','Does Not Have a Business',
+                "Refer To Store - Doesn't want to complete online",
+                'Does Not Need It Now','Technical Issue','Unsuccessful Application'
+            ],
+            'true_contacts': [
+                'Client Hung Up','CallBack','Not Interested','Not Interested Upfront',
+                'Cannot Afford Premium','Not interested - Pitched','Affordability',
+                'Quoted Client Not Interested',
+                'Not interested business does not use speed point mac',
+                'Call Back Technical Error','Not Interested Transaction Fees',
+                'Cannot Afford','Not Interested Household Contents',
+                'Call Back Hold','Declined Sale'
+            ]
+        }
+        # Extend 'successful' with this campaign's own dispositions that
+        # carry the dialer's authoritative sale=1 flag (see
+        # sale_outcome_names above) but aren't already covered by name —
+        # otherwise a real conversion outcome with no sales keyword in its
+        # name (e.g. Vodacom Retentions' 'Still Active'/'Special Debit')
+        # would fall into 'other' here, undercounting Lead Count/Campaign
+        # Analysis's Sales row even after true_sales above was fixed, since
+        # this dict drives both sheets' own row labels independently.
+        if sale_outcome_names:
+            _already_categorized = {t.lower() for terms in LEAD_COUNT_CATEGORIES.values() for t in terms}
+            for desc in description_counts.keys():
+                d = desc.lower().strip()
+                if d in sale_outcome_names and d not in _already_categorized:
+                    LEAD_COUNT_CATEGORIES['successful'].append(desc)
+                    _already_categorized.add(d)
+        _category_lookup = {
+            term.lower(): cat for cat, terms in LEAD_COUNT_CATEGORIES.items() for term in terms
+        }
+
+        # contact_status_counts: one row per contact's CURRENT outcome only
+        # (never the full call-history version — see description_counts
+        # above) — a straight GROUP BY over this file's own ProcessedData,
+        # so it is mathematically guaranteed to sum to exactly total_leads,
+        # regardless of whether full_outcome_history is on. This is what
+        # the new Lead Count sheet is built from, so "lead count" stays
+        # trustworthy and matches Processed Data even when Pivot is
+        # deliberately showing an inflated full-history view.
+        raw_contact_counts = processed_data_query.values('last_outcome').annotate(count=Count('id'))
+        contact_status_counts = {}
+        for item in raw_contact_counts:
+            key = item['last_outcome'] or 'Unknown'
+            desc = outcome_map.get(key, key)
+            contact_status_counts[desc] = contact_status_counts.get(desc, 0) + item['count']
+
+        lead_count_breakdown = {'new': 0, 'successful': 0, 'true_contacts': 0, 'unsuccessful': 0, 'unworkable': 0, 'other': 0}
+        for desc, count in contact_status_counts.items():
+            d = desc.lower().strip()
+            if d in _category_lookup:
+                lead_count_breakdown[_category_lookup[d]] += count
+            elif d == 'new' or d.startswith('not contacted'):
+                lead_count_breakdown['new'] += count
+            else:
+                lead_count_breakdown['other'] += count
+        # Guaranteed by construction (every contact lands in exactly one
+        # bucket), asserted rather than silently trusted — if this ever
+        # fails it means a contact's outcome got double-counted or dropped
+        # above, which is exactly the class of bug this sheet exists to
+        # rule out.
+        assert sum(lead_count_breakdown.values()) == total_leads, (
+            f"Lead Count breakdown ({sum(lead_count_breakdown.values())}) "
+            f"!= total_leads ({total_leads})"
+        )
+
         # ── 4b. Agent Performance + Call Count Breakdown (best-effort —
         #        only for DB-connected campaigns, and neither is allowed to
         #        fail the report; each is independent of the other) ──────
         agent_rows = None
         call_counts = None
-        if campaign.cd_campaign_id:
-            date_span = processed_data_query.aggregate(
-                min_date=Min('last_called_date'), max_date=Max('last_called_date')
-            )
+        # Set only when the sheet was actually requested AND actively
+        # failed (both the live attempt and its one retry — see
+        # fetch_agent_performance/fetch_contact_call_counts) — never for a
+        # sheet that simply wasn't asked for. Carried into the saved
+        # report's parameters (below) and the sync/generate response, so a
+        # failure is visible where the user actually looks instead of only
+        # in a server console print nobody sees — this is what previously
+        # made Agent Performance/Call Count Breakdown disappear from a
+        # report with zero indication anything had gone wrong.
+        agent_performance_error = None
+        call_count_breakdown_error = None
+        if campaign.cd_campaign_id and ('agent_performance' in wanted or 'call_count_breakdown' in wanted):
+            # date_span computed once, above, right after total_count is
+            # confirmed non-zero — shared with the Full Outcome History
+            # block for the same reason it's used here.
+            if 'agent_performance' in wanted:
+                try:
+                    from .external_source import fetch_agent_performance
+                    agent_rows = fetch_agent_performance(
+                        campaign.cd_campaign_id,
+                        start_dt=date_span['min_date'],
+                        end_dt=date_span['max_date'],
+                    )
+                    print(f"👥 Agent Performance: {len(agent_rows)} agents")
+                except Exception as e:
+                    print(f"⚠️  Agent Performance sheet skipped: {e}")
+                    agent_rows = None
+                    agent_performance_error = str(e) or type(e).__name__
 
-            try:
-                from .external_source import fetch_agent_performance
-                agent_rows = fetch_agent_performance(
-                    campaign.cd_campaign_id,
-                    start_dt=date_span['min_date'],
-                    end_dt=date_span['max_date'],
-                )
-                print(f"👥 Agent Performance: {len(agent_rows)} agents")
-            except Exception as e:
-                print(f"⚠️  Agent Performance sheet skipped: {e}")
-                agent_rows = None
-
-            try:
-                from .external_source import fetch_contact_call_counts
-                call_counts = fetch_contact_call_counts(
-                    campaign.cd_campaign_id,
-                    start_dt=date_span['min_date'],
-                    end_dt=date_span['max_date'],
-                )
-                print(f"📞 Call Count Breakdown: {len(call_counts)} contacts")
-            except Exception as e:
-                print(f"⚠️  Call Count Breakdown sheet skipped: {e}")
-                call_counts = None
+            if 'call_count_breakdown' in wanted:
+                try:
+                    from .external_source import fetch_contact_call_counts
+                    call_counts = fetch_contact_call_counts(
+                        campaign.cd_campaign_id,
+                        start_dt=date_span['min_date'],
+                        end_dt=date_span['max_date'],
+                    )
+                    print(f"📞 Call Count Breakdown: {len(call_counts)} contacts")
+                except Exception as e:
+                    print(f"⚠️  Call Count Breakdown sheet skipped: {e}")
+                    call_counts = None
+                    call_count_breakdown_error = str(e) or type(e).__name__
 
         # ── 5. Build workbook ──────────────────────────────────────────
         output = BytesIO()
@@ -1100,232 +1468,344 @@ class ReportViewSet(
         })
 
         # ── SHEET 1: PROCESSED DATA ────────────────────────────────────
-        data_ws = workbook.add_worksheet('Processed Data')
-        all_records = list(processed_data_query[:10000])
-        field_names = [
-            f.name for f in ProcessedData._meta.fields
-            # outcome_description dropped: now that last_outcome is pulled as the
-            # source DB's full name (see external_source.SOURCE_QUERY_TEMPLATE),
-            # it's just a duplicate of last_outcome, not a separate abbreviation
-            # lookup — same exclusion download_processed already applies.
-            if f.name not in ['id', 'call_data_file', 'processed_at', 'outcome_description']
-        ]
-        for col, field in enumerate(field_names):
-            data_ws.write(0, col, field.replace('_', ' ').title(), fmts['header'])
-        for row_num, record in enumerate(all_records, start=1):
-            for col, field in enumerate(field_names):
-                val = getattr(record, field, '')
-                if val is not None and val != '':
-                    data_ws.write(
-                        row_num, col,
-                        val.strftime('%Y-%m-%d %H:%M:%S') if hasattr(val, 'strftime') else val
-                    )
-        print(f"✅ Processed Data: {len(all_records)} rows")
+        # Streamed via .values(...).iterator() rather than list()-ed into
+        # memory, and used two ways in one pass: writing the Processed Data
+        # sheet(s) themselves, and — when Call Count Breakdown is wanted —
+        # building a lightweight (contact_id, name, phone) lookup keyed by
+        # customer_id. .values() returns plain dicts instead of full
+        # ProcessedData model instances, which matters at this scale: a
+        # 1.1M-row campaign (Telkom LTE) constructing 1.1M live ORM objects
+        # — each with ~35 fields worth of descriptor overhead — was slow
+        # enough to make report generation look hung for well over an hour.
+        # write_row() (one call per row) replaces 35 individual .write()
+        # calls per row for the same reason: fewer, cheaper Python-level
+        # calls across ~35M cells.
+        #
+        # This sheet used to hard-cap at 10,000 rows regardless of how many
+        # records actually existed (silently showing only the first 10,000
+        # while Pivot/Campaign Analysis reflected the true total). XLSX caps
+        # a single SHEET at 1,048,576 rows (the same format ceiling fixed
+        # elsewhere in this codebase — see serializers.py's CSV switch), so
+        # a campaign whose processed data exceeds that now spills into
+        # "Processed Data (2)", "Processed Data (3)", etc. instead of
+        # silently dropping rows.
+        MAX_SHEET_DATA_ROWS = 1_000_000  # safely under Excel's 1,048,576-row ceiling, room for the header
+        contact_lookup = {}  # customer_id (str) -> (contact_id, name, phone); only filled if call_count_breakdown is wanted
+        total_processed_rows = 0
+
+        if 'processed_data' in wanted or 'call_count_breakdown' in wanted:
+            field_names = [
+                f.name for f in ProcessedData._meta.fields
+                # outcome_description dropped: now that last_outcome is pulled as the
+                # source DB's full name (see external_source.SOURCE_QUERY_TEMPLATE),
+                # it's just a duplicate of last_outcome, not a separate abbreviation
+                # lookup — same exclusion download_processed already applies.
+                if f.name not in ['id', 'call_data_file', 'processed_at', 'outcome_description']
+            ]
+            date_fields = {'last_called_date', 'created_at', 'updated_at', 'dob'}
+
+            def _new_processed_data_sheet(idx):
+                sheet_name = 'Processed Data' if idx == 1 else f'Processed Data ({idx})'
+                ws = workbook.add_worksheet(sheet_name)
+                for col, field in enumerate(field_names):
+                    ws.write(0, col, _column_header(field), fmts['header'])
+                return ws
+
+            data_ws = None
+            data_sheet_index = 1
+            data_row_num = 1
+            if 'processed_data' in wanted:
+                data_ws = _new_processed_data_sheet(data_sheet_index)
+
+            for record in processed_data_query.values(*field_names).iterator(chunk_size=5000):
+                if 'processed_data' in wanted:
+                    if data_row_num > MAX_SHEET_DATA_ROWS:
+                        data_sheet_index += 1
+                        data_ws = _new_processed_data_sheet(data_sheet_index)
+                        data_row_num = 1
+                    row_values = [
+                        record[field].strftime('%Y-%m-%d %H:%M:%S') if field in date_fields and record[field] else record[field]
+                        for field in field_names
+                    ]
+                    data_ws.write_row(data_row_num, 0, row_values)
+                    data_row_num += 1
+
+                if 'call_count_breakdown' in wanted and record['customer_id']:
+                    name = f"{(record['firstname'] or '').strip()} {(record['lastname'] or '').strip()}".strip()
+                    contact_lookup[str(record['customer_id'])] = (record['contact_id'], name, record['tel1'] or '')
+
+                total_processed_rows += 1
+
+            if 'processed_data' in wanted:
+                print(f"✅ Processed Data: {total_processed_rows} rows across {data_sheet_index} sheet(s)")
 
         # ── SHEET 2: PIVOT ─────────────────────────────────────────────
-        pivot_ws = workbook.add_worksheet('Pivot')
-        pivot_ws.set_column('A:A', 40)
-        pivot_ws.set_column('B:B', 20)
-        pivot_ws.write('A1', 'Outcome Description', fmts['header'])
-        pivot_ws.write('B1', 'Count', fmts['header'])
-        curr_row = 1
-        for desc, count in sorted_desc_counts:
-            pivot_ws.write(curr_row, 0, desc, fmts['cell'])
-            pivot_ws.write(curr_row, 1, count, fmts['number'])
-            curr_row += 1
-        pivot_ws.write(curr_row, 0, 'Grand Total', fmts['grand_total'])
-        pivot_ws.write(curr_row, 1, grand_total, fmts['grand_total'])
-        pivot_range = f"Pivot!$A$2:$B${curr_row}"
-        print(f"Pivot: {curr_row - 1} unique outcomes")
+        # pivot_range stays undefined when this sheet is skipped, which is
+        # safe: it's only read inside the Campaign Analysis block below, and
+        # 'campaign_analysis' in wanted forces 'pivot' into wanted too (see
+        # docstring), so that block never runs without pivot_range existing.
+        if 'pivot' in wanted:
+            pivot_ws = workbook.add_worksheet('Pivot')
+            pivot_ws.set_column('A:A', 40)
+            pivot_ws.set_column('B:B', 20)
+            pivot_ws.write('A1', 'Outcome Description', fmts['header'])
+            pivot_ws.write('B1', 'Count', fmts['header'])
+            curr_row = 1
+            for desc, count in sorted_desc_counts:
+                pivot_ws.write(curr_row, 0, desc, fmts['cell'])
+                pivot_ws.write(curr_row, 1, count, fmts['number'])
+                curr_row += 1
+            pivot_ws.write(curr_row, 0, 'Grand Total', fmts['grand_total'])
+            pivot_ws.write(curr_row, 1, total_dispositions, fmts['grand_total'])
+            pivot_range = f"Pivot!$A$2:$B${curr_row}"
+            print(f"Pivot: {curr_row - 1} unique outcomes")
+
+            # Surfaced in the sheet itself, not just a server console log —
+            # a handful of individual days can be too dense for even the
+            # finest chunking to scan in time (verified live), so counts
+            # here may slightly undercount those specific ranges.
+            if outcome_history_skipped_ranges:
+                note_row = curr_row + 2
+                ranges_str = "; ".join(
+                    f"{s.strftime('%Y-%m-%d')} to {e.strftime('%Y-%m-%d')}"
+                    for s, e in outcome_history_skipped_ranges
+                )
+                pivot_ws.merge_range(
+                    note_row, 0, note_row, 1,
+                    f"⚠ {len(outcome_history_skipped_ranges)} date range(s) could not be fully "
+                    f"scanned in time and may be undercounted: {ranges_str}",
+                    fmts['ca_italic_note']
+                )
+
+        # ── SHEET: LEAD COUNT ────────────────────────────────────────────
+        # Always contact-based (see lead_count_breakdown, computed earlier
+        # alongside the other summary metrics) — the one leads figure in
+        # this whole report guaranteed to equal Processed Data's row count,
+        # no matter what full_outcome_history is set to. Forced into
+        # `wanted` whenever Campaign Analysis/Template is (see the wanted
+        # setup near the top of this function), since Campaign Analysis no
+        # longer shows/holds its own Total Leads number — its %-of-total
+        # formulas reference LEAD_COUNT_TOTAL_CELL below instead, so the
+        # two sheets can never visually disagree with each other.
+        LEAD_COUNT_TOTAL_CELL = "'Lead Count'!$B$3"
+        if 'lead_count' in wanted:
+            lc_ws = workbook.add_worksheet('Lead Count')
+            lc_ws.set_column('A:A', 26)
+            lc_ws.set_column('B:B', 16)
+            lc_ws.set_column('C:C', 14)
+            lc_ws.merge_range(0, 0, 0, 2, f'{campaign.display_name} Lead Count', fmts['ca_title'])
+
+            lc_ws.write(2, 0, 'Total Leads', fmts['header'])
+            lc_ws.write(2, 1, total_leads, fmts['ca_total_number'])  # B3 — see LEAD_COUNT_TOTAL_CELL above
+
+            LC_HEADER_ROW = 4
+            lc_ws.write(LC_HEADER_ROW, 0, 'Status', fmts['header'])
+            lc_ws.write(LC_HEADER_ROW, 1, 'Lead Count', fmts['header'])
+            lc_ws.write(LC_HEADER_ROW, 2, '% of Total', fmts['header'])
+
+            lc_rows = [
+                ('New / Not Contacted', lead_count_breakdown['new']),
+                ('Sales', lead_count_breakdown['successful']),
+                ('True Contacts', lead_count_breakdown['true_contacts']),
+                ('Unsuccessful', lead_count_breakdown['unsuccessful']),
+                ('Unworkable', lead_count_breakdown['unworkable']),
+            ]
+            if lead_count_breakdown['other']:
+                lc_rows.append(('Other', lead_count_breakdown['other']))
+
+            r = LC_HEADER_ROW + 1
+            first_lc_row = r
+            for label, count in lc_rows:
+                lc_ws.write(r, 0, label, fmts['cell'])
+                lc_ws.write(r, 1, count, fmts['number'])
+                lc_ws.write(r, 2, (count / total_leads) if total_leads else 0, fmts['percent'])
+                r += 1
+            last_lc_row = r - 1
+
+            # A live SUM formula, not a repeated literal — this is the
+            # sheet's own visible proof that the breakdown really does add
+            # up to Total Leads above (also asserted in Python when this
+            # is computed, but that assertion is invisible to anyone who
+            # isn't reading the server console).
+            lc_ws.write(r, 0, 'TOTAL', fmts['grand_total'])
+            lc_ws.write_formula(r, 1, f'=SUM(B{first_lc_row + 1}:B{last_lc_row + 1})', fmts['grand_total'])
+            lc_ws.write_formula(r, 2, f'=B{r + 1}/$B$3', fmts['summary_percent'])
+
+            print(f"Lead Count sheet built: {total_leads} total leads across {len(lc_rows)} categories")
 
         # ── SHEET 3: CAMPAIGN ANALYSIS ─────────────────────────────────
-        ca_ws = workbook.add_worksheet('Campaign Analysis')
-        for i, w in enumerate([18,32,12,10,32,12,10,32,12,10,32,12,10]):
-            ca_ws.set_column(i, i, w)
+        if 'campaign_analysis' in wanted:
+            ca_ws = workbook.add_worksheet('Campaign Analysis')
+            for i, w in enumerate([18,32,12,10,32,12,10,32,12,10,32,12,10]):
+                ca_ws.set_column(i, i, w)
 
-        title_suffix = 'Campaign Analysis' if campaign.display_name.strip().lower().endswith('leads') \
-            else 'Leads Campaign Analysis'
-        ca_ws.merge_range(
-            'A1:M2',
-            f'{campaign.display_name} {title_suffix}',
-            fmts['ca_title']
-        )
+            title_suffix = 'Campaign Analysis' if campaign.display_name.strip().lower().endswith('leads') \
+                else 'Leads Campaign Analysis'
+            ca_ws.merge_range(
+                'A1:M2',
+                f'{campaign.display_name} {title_suffix}',
+                fmts['ca_title']
+            )
 
-        categories = {
-            'unsuccessful': [
-                'Answering Machine Autodial','No Answer Autodial','Auto Engaged',
-                'Disconnected Number Auto','Answering Machine','Selected','No Answer',
-                'Busy Tone','Dropped','New','Call Dropped','Inbound After Hours Drop',
-                'TPS Registered Number','Temporary Disconnected Number','Bad Line Quality',
-                'Inbound Abandon','Outbound Pre-Routing Drop','Engaged','Disconnected',
-                'CONGESTED','Flow Inbound Abandon','Multiple Calls','Missed','Answered',
-                'Customer drop','Auto Dial Disconnected','Disconnected Number Temporary'
-            ],
-            'successful': [
-                'Sale Made - Completed Mandate','Sale Made - Pending Mandate',
-                'Sale Made','Tyme Bank Account Sale','QA Rework','QA Verify'
-            ],
-            'unworkable': [
-                'Already Contacted','Existing Client','Unemployed','Wrong Number',
-                'Do Not Call','No Smartphones','Client Deceased',
-                'Right Party Not Available','Client Overage Limit','Language Barrier',
-                'Non SA Citizen','No Bank Account','Client Underage','Go To The Branch',
-                'Completed','Cannot Afford Upfront Payment','Account Suspended',
-                'Insured at another company','Scheduled Appointment','Refund Request',
-                'Does Not Qualify','NTU Policy','Does Not Have a Business',
-                "Refer To Store - Doesn't want to complete online",
-                'Does Not Need It Now','Technical Issue','Unsuccessful Application'
-            ],
-            'true_contacts': [
-                'Client Hung Up','CallBack','Not Interested','Not Interested Upfront',
-                'Cannot Afford Premium','Not interested - Pitched','Affordability',
-                'Quoted Client Not Interested',
-                'Not interested business does not use speed point mac',
-                'Call Back Technical Error','Not Interested Transaction Fees',
-                'Cannot Afford','Not Interested Household Contents',
-                'Call Back Hold','Declined Sale'
+            # Same 4 term lists the Lead Count sheet uses (hoisted earlier
+            # as LEAD_COUNT_CATEGORIES, alongside lead_count_breakdown) —
+            # reused here rather than redefined a second time.
+            categories = LEAD_COUNT_CATEGORIES
+
+            # Super-header row: "Customers Reached" spans the True Contacts triple only
+            SUPER_HDR = 2
+            ca_ws.merge_range(SUPER_HDR, 10, SUPER_HDR, 12, 'Customers Reached', fmts['ca_super_header'])
+
+            # Each category is a label/count/% triple — % is the count's share of
+            # Total Leads, which now lives on the Lead Count sheet (see
+            # LEAD_COUNT_TOTAL_CELL) rather than a number shown here, so
+            # this sheet can't visually drift from Lead Count/Processed
+            # Data even when Pivot's own counts are running inflated
+            # (full_outcome_history on).
+            HEADER_ROW = 3
+            ca_ws.write(HEADER_ROW, 0,  'Total Leads',                    fmts['header'])
+            ca_ws.write(HEADER_ROW, 1,  'Unsuccessful Contacts',            fmts['header'])
+            ca_ws.write(HEADER_ROW, 2,  'Lead Count',                       fmts['header'])
+            ca_ws.write(HEADER_ROW, 3,  '%',                                fmts['header'])
+            ca_ws.write(HEADER_ROW, 4,  'Was customer interested in deal?', fmts['header'])
+            ca_ws.write(HEADER_ROW, 5,  'Lead Count',                       fmts['header'])
+            ca_ws.write(HEADER_ROW, 6,  '%',                                fmts['header'])
+            ca_ws.write(HEADER_ROW, 7,  'Succesful Contacts',                fmts['header'])
+            ca_ws.write(HEADER_ROW, 8,  'Lead Count',                       fmts['header'])
+            ca_ws.write(HEADER_ROW, 9,  '%',                                fmts['header'])
+            ca_ws.write(HEADER_ROW, 10, 'True Contacts',                    fmts['header'])
+            ca_ws.write(HEADER_ROW, 11, 'Lead Count',                       fmts['header'])
+            ca_ws.write(HEADER_ROW, 12, '%',                                fmts['header'])
+
+            DATA_START = HEADER_ROW + 1
+
+            def fill_section(desc_list, col_label, col_val, col_pct, start_row):
+                for i, text in enumerate(desc_list):
+                    r = start_row + i
+                    ca_ws.write(r, col_label, text, fmts['cell'])
+                    ca_ws.write_formula(
+                        r, col_val,
+                        f'=IFERROR(VLOOKUP("{text}",{pivot_range},2,FALSE),0)',
+                        fmts['formula_cell']
+                    )
+                    count_cell = f'{get_column_letter(col_val + 1)}{r + 1}'
+                    ca_ws.write_formula(
+                        r, col_pct,
+                        f'=IFERROR({count_cell}/{LEAD_COUNT_TOTAL_CELL},0)',
+                        fmts['percent']
+                    )
+                return start_row + len(desc_list)
+
+            u_end = fill_section(categories['unsuccessful'], 1,  2,  3,  DATA_START)
+            s_end = fill_section(categories['successful'],   4,  5,  6,  DATA_START)
+            w_end = fill_section(categories['unworkable'],   7,  8,  9,  DATA_START)
+            t_end = fill_section(categories['true_contacts'],10, 11, 12, DATA_START)
+
+            # The two longest columns (Unsuccessful / Succesful Contacts) set where every
+            # column's subtotal row sits.
+            SUBTOTAL_ROW = DATA_START + max(
+                len(categories['unsuccessful']), len(categories['unworkable'])
+            )
+
+            # "If not, why not?" note fills the gap between the 5 sale rows and the subtotal
+            # row, holding the count of everyone who was reached but didn't buy.
+            gap_start, gap_end = s_end, SUBTOTAL_ROW - 1
+            why_not_formula = f'=I{SUBTOTAL_ROW+1}+L{SUBTOTAL_ROW+1}'
+            if gap_end > gap_start:
+                ca_ws.merge_range(gap_start, 4, gap_end, 4, 'If not, why not?', fmts['ca_italic_note'])
+                ca_ws.merge_range(gap_start, 5, gap_end, 5, why_not_formula, fmts['formula_cell'])
+            elif gap_end == gap_start:
+                ca_ws.write(gap_start, 4, 'If not, why not?', fmts['ca_italic_note'])
+                ca_ws.write_formula(gap_start, 5, why_not_formula, fmts['formula_cell'])
+
+            # Subtotal row — one number per category, aligned under the longest columns
+            ca_ws.write_formula(SUBTOTAL_ROW, 2, f'=SUM(C{DATA_START+1}:C{u_end})', fmts['formula_cell'])
+            ca_ws.write(SUBTOTAL_ROW, 4, "Successful Take Up's", fmts['subheader'])
+            ca_ws.write_formula(SUBTOTAL_ROW, 5, f'=SUM(F{DATA_START+1}:F{s_end})', fmts['formula_cell'])
+            ca_ws.write_formula(SUBTOTAL_ROW, 8, f'=SUM(I{DATA_START+1}:I{w_end})', fmts['formula_cell'])
+            ca_ws.write_formula(SUBTOTAL_ROW, 11, f'=SUM(L{DATA_START+1}:L{t_end})', fmts['formula_cell'])
+
+            # This column used to hold a big literal Total Leads number
+            # (Processed Data's row count) written straight from Python —
+            # now a live formula referencing the Lead Count sheet's own
+            # Total Leads cell instead, so the number is still visible here
+            # but can never silently disagree with Lead Count (always
+            # contact-based, never inflated by full_outcome_history) since
+            # it's the exact same cell, not a second copy of the number.
+            ca_ws.merge_range(
+                DATA_START, 0, SUBTOTAL_ROW, 0,
+                f'={LEAD_COUNT_TOTAL_CELL}',
+                fmts['ca_total_number']
+            )
+
+            # Grand total of the "successful pipeline": Take Ups + Succesful Contacts + True Contacts
+            GRAND_ROW = SUBTOTAL_ROW + 2
+            ca_ws.write_formula(
+                GRAND_ROW, 0,
+                f'=F{SUBTOTAL_ROW+1}+I{SUBTOTAL_ROW+1}+L{SUBTOTAL_ROW+1}',
+                fmts['ca_grand_total']
+            )
+
+            # ── SUMMARY + ranked status tables ─────────────────────────────
+            def top_n_from_category(cat_list, n):
+                """Top n (description, count) pairs from sorted_desc_counts that
+                belong to the given category list, case-insensitive."""
+                cat_lower = {c.lower() for c in cat_list}
+                matched = [(d, c) for d, c in sorted_desc_counts if d.lower() in cat_lower]
+                return matched[:n]
+
+            SUMMARY_ROW = GRAND_ROW + 3
+            ca_ws.merge_range(SUMMARY_ROW, 0, SUMMARY_ROW, 1, 'SUMMARY', fmts['subheader'])
+            conversion_ratio = (true_sales / true_contacts) if true_contacts else 0
+            contact_ratio = (successful_contacts / total_leads) if total_leads else 0
+            summary_items = [
+                ('Successful Contacts',      successful_contacts, fmts['formula_cell']),
+                ('True Contacts (TC)',       true_contacts,        fmts['formula_cell']),
+                ('Conversions',              true_sales,           fmts['formula_cell']),
+                ('Conversion Ratio (vs TC)', conversion_ratio,     fmts['percent']),
+                ('Contact Ratio',            contact_ratio,        fmts['percent']),
             ]
-        }
+            for i, (label, value, fmt) in enumerate(summary_items):
+                r = SUMMARY_ROW + 1 + i
+                ca_ws.write(r, 0, label, fmts['cell'])
+                ca_ws.write(r, 1, value, fmt)
 
-        # Super-header row: "Customers Reached" spans the True Contacts triple only
-        SUPER_HDR = 2
-        ca_ws.merge_range(SUPER_HDR, 10, SUPER_HDR, 12, 'Customers Reached', fmts['ca_super_header'])
+            # Row kept as spacing only (downstream layout still anchors off
+            # it) — used to also write a literal "TOTAL LEADS" number here;
+            # removed per the same "Lead Count sheet is the one place this
+            # number lives" reasoning as the big tile above.
+            TOTAL_LEADS_ROW = SUMMARY_ROW + len(summary_items) + 2
 
-        # Each category is a label/count/% triple — % is the count's share of
-        # Total Leads (the big merged number at A{DATA_START+1}), not of the
-        # category's own subtotal.
-        HEADER_ROW = 3
-        ca_ws.write(HEADER_ROW, 0,  'Total Leads Dialled',              fmts['header'])
-        ca_ws.write(HEADER_ROW, 1,  'Unsuccessful Contacts',            fmts['header'])
-        ca_ws.write(HEADER_ROW, 2,  'Lead Count',                       fmts['header'])
-        ca_ws.write(HEADER_ROW, 3,  '%',                                fmts['header'])
-        ca_ws.write(HEADER_ROW, 4,  'Was customer interested in deal?', fmts['header'])
-        ca_ws.write(HEADER_ROW, 5,  'Lead Count',                       fmts['header'])
-        ca_ws.write(HEADER_ROW, 6,  '%',                                fmts['header'])
-        ca_ws.write(HEADER_ROW, 7,  'Succesful Contacts',                fmts['header'])
-        ca_ws.write(HEADER_ROW, 8,  'Lead Count',                       fmts['header'])
-        ca_ws.write(HEADER_ROW, 9,  '%',                                fmts['header'])
-        ca_ws.write(HEADER_ROW, 10, 'True Contacts',                    fmts['header'])
-        ca_ws.write(HEADER_ROW, 11, 'Lead Count',                       fmts['header'])
-        ca_ws.write(HEADER_ROW, 12, '%',                                fmts['header'])
+            def write_ranked_table(title, rows_data, start_row):
+                ca_ws.merge_range(start_row, 0, start_row, 2, title, fmts['subheader'])
+                ca_ws.write(start_row + 1, 0, 'Status',        fmts['header'])
+                ca_ws.write(start_row + 1, 1, 'Lead Count',    fmts['header'])
+                ca_ws.write(start_row + 1, 2, 'Lead % Result', fmts['header'])
+                r = start_row + 2
+                total_count = 0
+                for desc, count in rows_data:
+                    ca_ws.write(r, 0, desc, fmts['cell'])
+                    ca_ws.write(r, 1, count, fmts['number'])
+                    ca_ws.write(r, 2, (count / total_leads) if total_leads else 0, fmts['percent'])
+                    total_count += count
+                    r += 1
+                ca_ws.write(r, 0, 'TOTAL', fmts['subheader'])
+                ca_ws.write(r, 1, total_count, fmts['formula_cell'])
+                ca_ws.write(r, 2, (total_count / total_leads) if total_leads else 0, fmts['percent'])
+                return r + 2  # next block starts 1 blank row below
 
-        DATA_START = HEADER_ROW + 1
+            next_row = write_ranked_table(
+                'Top 5 Failed Status Codes',
+                top_n_from_category(categories['unsuccessful'], 5),
+                TOTAL_LEADS_ROW + 2
+            )
+            write_ranked_table(
+                'Successful Leads',
+                top_n_from_category(categories['successful'], 3),
+                next_row
+            )
 
-        def fill_section(desc_list, col_label, col_val, col_pct, start_row):
-            for i, text in enumerate(desc_list):
-                r = start_row + i
-                ca_ws.write(r, col_label, text, fmts['cell'])
-                ca_ws.write_formula(
-                    r, col_val,
-                    f'=IFERROR(VLOOKUP("{text}",{pivot_range},2,FALSE),0)',
-                    fmts['formula_cell']
-                )
-                count_cell = f'{get_column_letter(col_val + 1)}{r + 1}'
-                ca_ws.write_formula(
-                    r, col_pct,
-                    f'=IFERROR({count_cell}/$A${DATA_START + 1},0)',
-                    fmts['percent']
-                )
-            return start_row + len(desc_list)
-
-        u_end = fill_section(categories['unsuccessful'], 1,  2,  3,  DATA_START)
-        s_end = fill_section(categories['successful'],   4,  5,  6,  DATA_START)
-        w_end = fill_section(categories['unworkable'],   7,  8,  9,  DATA_START)
-        t_end = fill_section(categories['true_contacts'],10, 11, 12, DATA_START)
-
-        # The two longest columns (Unsuccessful / Succesful Contacts) set where every
-        # column's subtotal row sits.
-        SUBTOTAL_ROW = DATA_START + max(
-            len(categories['unsuccessful']), len(categories['unworkable'])
-        )
-
-        # "If not, why not?" note fills the gap between the 5 sale rows and the subtotal
-        # row, holding the count of everyone who was reached but didn't buy.
-        gap_start, gap_end = s_end, SUBTOTAL_ROW - 1
-        why_not_formula = f'=I{SUBTOTAL_ROW+1}+L{SUBTOTAL_ROW+1}'
-        if gap_end > gap_start:
-            ca_ws.merge_range(gap_start, 4, gap_end, 4, 'If not, why not?', fmts['ca_italic_note'])
-            ca_ws.merge_range(gap_start, 5, gap_end, 5, why_not_formula, fmts['formula_cell'])
-        elif gap_end == gap_start:
-            ca_ws.write(gap_start, 4, 'If not, why not?', fmts['ca_italic_note'])
-            ca_ws.write_formula(gap_start, 5, why_not_formula, fmts['formula_cell'])
-
-        # Subtotal row — one number per category, aligned under the longest columns
-        ca_ws.write_formula(SUBTOTAL_ROW, 2, f'=SUM(C{DATA_START+1}:C{u_end})', fmts['formula_cell'])
-        ca_ws.write(SUBTOTAL_ROW, 4, "Successful Take Up's", fmts['subheader'])
-        ca_ws.write_formula(SUBTOTAL_ROW, 5, f'=SUM(F{DATA_START+1}:F{s_end})', fmts['formula_cell'])
-        ca_ws.write_formula(SUBTOTAL_ROW, 8, f'=SUM(I{DATA_START+1}:I{w_end})', fmts['formula_cell'])
-        ca_ws.write_formula(SUBTOTAL_ROW, 11, f'=SUM(L{DATA_START+1}:L{t_end})', fmts['formula_cell'])
-
-        # Big "Total Leads Dialled" number spans the full height of the data + subtotal rows
-        ca_ws.merge_range(DATA_START, 0, SUBTOTAL_ROW, 0, grand_total, fmts['ca_total_number'])
-
-        # Grand total of the "successful pipeline": Take Ups + Succesful Contacts + True Contacts
-        GRAND_ROW = SUBTOTAL_ROW + 2
-        ca_ws.write_formula(
-            GRAND_ROW, 0,
-            f'=F{SUBTOTAL_ROW+1}+I{SUBTOTAL_ROW+1}+L{SUBTOTAL_ROW+1}',
-            fmts['ca_grand_total']
-        )
-
-        # ── SUMMARY + ranked status tables ─────────────────────────────
-        def top_n_from_category(cat_list, n):
-            """Top n (description, count) pairs from sorted_desc_counts that
-            belong to the given category list, case-insensitive."""
-            cat_lower = {c.lower() for c in cat_list}
-            matched = [(d, c) for d, c in sorted_desc_counts if d.lower() in cat_lower]
-            return matched[:n]
-
-        SUMMARY_ROW = GRAND_ROW + 3
-        ca_ws.merge_range(SUMMARY_ROW, 0, SUMMARY_ROW, 1, 'SUMMARY', fmts['subheader'])
-        conversion_ratio = (true_sales / true_contacts) if true_contacts else 0
-        contact_ratio = (successful_contacts / grand_total) if grand_total else 0
-        summary_items = [
-            ('Successful Contacts',      successful_contacts, fmts['formula_cell']),
-            ('True Contacts (TC)',       true_contacts,        fmts['formula_cell']),
-            ('Conversions',              true_sales,           fmts['formula_cell']),
-            ('Conversion Ratio (vs TC)', conversion_ratio,     fmts['percent']),
-            ('Contact Ratio',            contact_ratio,        fmts['percent']),
-        ]
-        for i, (label, value, fmt) in enumerate(summary_items):
-            r = SUMMARY_ROW + 1 + i
-            ca_ws.write(r, 0, label, fmts['cell'])
-            ca_ws.write(r, 1, value, fmt)
-
-        TOTAL_LEADS_ROW = SUMMARY_ROW + len(summary_items) + 2
-        ca_ws.write(TOTAL_LEADS_ROW, 0, 'TOTAL LEADS', fmts['subheader'])
-        ca_ws.write(TOTAL_LEADS_ROW, 1, grand_total, fmts['formula_cell'])
-
-        def write_ranked_table(title, rows_data, start_row):
-            ca_ws.merge_range(start_row, 0, start_row, 2, title, fmts['subheader'])
-            ca_ws.write(start_row + 1, 0, 'Status',        fmts['header'])
-            ca_ws.write(start_row + 1, 1, 'Lead Count',    fmts['header'])
-            ca_ws.write(start_row + 1, 2, 'Lead % Result', fmts['header'])
-            r = start_row + 2
-            total_count = 0
-            for desc, count in rows_data:
-                ca_ws.write(r, 0, desc, fmts['cell'])
-                ca_ws.write(r, 1, count, fmts['number'])
-                ca_ws.write(r, 2, (count / grand_total) if grand_total else 0, fmts['percent'])
-                total_count += count
-                r += 1
-            ca_ws.write(r, 0, 'TOTAL', fmts['subheader'])
-            ca_ws.write(r, 1, total_count, fmts['formula_cell'])
-            ca_ws.write(r, 2, (total_count / grand_total) if grand_total else 0, fmts['percent'])
-            return r + 2  # next block starts 1 blank row below
-
-        next_row = write_ranked_table(
-            'Top 5 Failed Status Codes',
-            top_n_from_category(categories['unsuccessful'], 5),
-            TOTAL_LEADS_ROW + 2
-        )
-        write_ranked_table(
-            'Successful Leads',
-            top_n_from_category(categories['successful'], 3),
-            next_row
-        )
-
-        print(f"Campaign Analysis sheet built")
+            print(f"Campaign Analysis sheet built")
 
         # ── SHEET: CALL COUNT BREAKDOWN (only if the campaign is DB-connected
         #    and the fetch above succeeded — see external_source.py) ─────
@@ -1351,10 +1831,10 @@ class ReportViewSet(
             ccb_ws.write(dist_row, 1, len(call_counts), fmts['grand_total'])
 
             # Per-contact list, sorted by call count descending. Names/phone
-            # come from records already loaded for the Processed Data sheet
-            # (all_records) rather than a second DB round-trip — note that
-            # sheet caps at 10,000 rows, so a contact beyond that cap shows
-            # its raw customer_id instead of a name.
+            # come from contact_lookup, built alongside the Processed Data
+            # sheet above (see SHEET 1) — a full pass over every processed
+            # record, not just the first 10,000, so every contact gets a
+            # name/phone here regardless of campaign size.
             list_start = dist_row + 3
             ccb_ws.merge_range(list_start, 0, list_start, 3, 'Contacts by Call Count', fmts['ca_super_header'])
             list_header_row = list_start + 1
@@ -1363,28 +1843,44 @@ class ReportViewSet(
             ccb_ws.write(list_header_row, 2, 'Phone', fmts['header'])
             ccb_ws.write(list_header_row, 3, 'Times Contacted', fmts['header'])
 
-            records_by_customer_id = {
-                str(r.customer_id): r for r in all_records if r.customer_id
-            }
             sorted_contacts = sorted(call_counts.items(), key=lambda kv: kv[1], reverse=True)
             for i, (customer_id, count) in enumerate(sorted_contacts):
                 r = list_header_row + 1 + i
-                record = records_by_customer_id.get(customer_id)
-                name = (
-                    f"{(record.firstname or '').strip()} {(record.lastname or '').strip()}".strip()
-                    if record else ''
-                )
-                contact_id = record.contact_id if record else customer_id
-                phone = (record.tel1 if record else '') or ''
+                looked_up = contact_lookup.get(customer_id)
+                contact_id, name, phone = looked_up if looked_up else (customer_id, '', '')
                 ccb_ws.write(r, 0, contact_id, fmts['cell'])
                 ccb_ws.write(r, 1, name or '—', fmts['cell'])
                 ccb_ws.write(r, 2, phone or '—', fmts['cell'])
                 ccb_ws.write(r, 3, count, fmts['number'])
 
             print(f"✅ Call Count Breakdown sheet built: {len(call_counts)} contacts")
+        elif call_count_breakdown_error:
+            # Requested but failed (even after fetch_contact_call_counts's
+            # own retry) — build the sheet anyway, as a visible error
+            # placeholder, rather than silently dropping it. Previously
+            # this case produced no sheet at all and nothing but a server
+            # console print, so a genuine failure looked identical to
+            # "user didn't ask for this sheet."
+            ccb_ws = workbook.add_worksheet('Call Count Breakdown')
+            ccb_ws.set_column(0, 0, 100)
+            ccb_ws.merge_range(
+                0, 0, 2, 0,
+                f"⚠ Call Count Breakdown could not be built — the database "
+                f"query failed even after a retry:\n{call_count_breakdown_error}\n\n"
+                f"Try Generate Report again; if it keeps failing, the source "
+                f"database may be under heavy load or unreachable.",
+                fmts['ca_italic_note']
+            )
+            print(f"⚠️  Call Count Breakdown sheet shows an error placeholder: {call_count_breakdown_error}")
 
         # ── SHEET: AGENT PERFORMANCE (only if the campaign is DB-connected
         #    and the fetch above succeeded — see external_source.py) ─────
+        # Columns match the source platform's own "Combined Summary" report
+        # (Reports > Voice > Combined Summary) exactly, verified against a
+        # live screenshot of its header row — no data-source change needed,
+        # this is purely the visual layer: a KPI-tile summary banner above
+        # the existing per-agent table, native Excel table banding, and a
+        # red/yellow/green scale on the three rate columns.
         if agent_rows is not None:
             ap_ws = workbook.add_worksheet('Agent Performance')
             ap_headers = [
@@ -1394,11 +1890,9 @@ class ReportViewSet(
                 'DMC Talk', 'Avg DMC Talk', 'Pause', 'Wait', 'Avg Wait',
                 'Wrap', 'Avg Wrap',
             ]
-            for col, h in enumerate(ap_headers):
-                ap_ws.write(0, col, h, fmts['header'])
+            n_cols = len(ap_headers)  # 21 — matches 7 KPI tiles at 3 columns each below
             ap_ws.set_column(0, 1, 22)
-            ap_ws.set_column(2, len(ap_headers) - 1, 13)
-            ap_ws.freeze_panes(1, 0)
+            ap_ws.set_column(2, n_cols - 1, 13)
 
             def _as_day_fraction(seconds):
                 # Excel stores elapsed time as a fraction of a 24h day; the
@@ -1406,29 +1900,142 @@ class ReportViewSet(
                 # correctly instead of wrapping like a real clock would.
                 return (seconds or 0) / 86400
 
-            for row_num, a in enumerate(agent_rows, start=1):
-                ap_ws.write(row_num, 0, a['display_name'], fmts['cell'])
-                ap_ws.write(row_num, 1, a['team_name'], fmts['cell'])
-                ap_ws.write(row_num, 2, a['outbound'], fmts['number'])
-                ap_ws.write(row_num, 3, a['inbound'], fmts['number'])
-                ap_ws.write(row_num, 4, a['combined'], fmts['number'])
-                ap_ws.write(row_num, 5, a['connects'], fmts['number'])
-                ap_ws.write(row_num, 6, a['connect_rate'], fmts['percent'])
-                ap_ws.write(row_num, 7, a['dmcs'], fmts['number'])
-                ap_ws.write(row_num, 8, a['dmc_rate'], fmts['percent'])
-                ap_ws.write(row_num, 9, a['sales'], fmts['number'])
-                ap_ws.write(row_num, 10, a['conversion'], fmts['percent'])
-                ap_ws.write(row_num, 11, a['completed'], fmts['number'])
-                ap_ws.write(row_num, 12, _as_day_fraction(a['talk_seconds']), fmts['duration'])
-                ap_ws.write(row_num, 13, _as_day_fraction(a['avg_talk_seconds']), fmts['duration'])
-                ap_ws.write(row_num, 14, _as_day_fraction(a['dmc_talk_seconds']), fmts['duration'])
-                ap_ws.write(row_num, 15, _as_day_fraction(a['avg_dmc_talk_seconds']), fmts['duration'])
-                ap_ws.write(row_num, 16, _as_day_fraction(a['pause_seconds']), fmts['duration'])
-                ap_ws.write(row_num, 17, _as_day_fraction(a['wait_seconds']), fmts['duration'])
-                ap_ws.write(row_num, 18, _as_day_fraction(a['avg_wait_seconds']), fmts['duration'])
-                ap_ws.write(row_num, 19, _as_day_fraction(a['wrap_seconds']), fmts['duration'])
-                ap_ws.write(row_num, 20, _as_day_fraction(a['avg_wrap_seconds']), fmts['duration'])
+            if not agent_rows:
+                ap_ws.merge_range(0, 0, 2, n_cols - 1,
+                                   'No agent activity found for this campaign in range.',
+                                   fmts['ca_italic_note'])
+            else:
+                # ── Dashboard formats (local to this sheet) ──────────────
+                navy, navy_light = '#1F4E78', '#DCE6F1'
+                green, green_light = '#375623', '#E2EFDA'
+                ap_title_fmt = workbook.add_format({
+                    'bold': True, 'font_size': 18, 'font_color': 'white',
+                    'bg_color': navy, 'align': 'center', 'valign': 'vcenter'
+                })
+                kpi_label = workbook.add_format({
+                    'bold': True, 'font_size': 10, 'font_color': 'white', 'bg_color': navy,
+                    'align': 'center', 'valign': 'vcenter', 'border': 1, 'border_color': 'white',
+                })
+                kpi_value = workbook.add_format({
+                    'bold': True, 'font_size': 22, 'font_color': navy, 'bg_color': navy_light,
+                    'align': 'center', 'valign': 'vcenter', 'border': 1, 'border_color': 'white',
+                })
+                kpi_value_pct = workbook.add_format({
+                    'bold': True, 'font_size': 22, 'font_color': navy, 'bg_color': navy_light,
+                    'align': 'center', 'valign': 'vcenter', 'border': 1, 'border_color': 'white',
+                    'num_format': '0.0%',
+                })
+                kpi_label_good = workbook.add_format({
+                    'bold': True, 'font_size': 10, 'font_color': 'white', 'bg_color': green,
+                    'align': 'center', 'valign': 'vcenter', 'border': 1, 'border_color': 'white',
+                })
+                kpi_value_good = workbook.add_format({
+                    'bold': True, 'font_size': 22, 'font_color': green, 'bg_color': green_light,
+                    'align': 'center', 'valign': 'vcenter', 'border': 1, 'border_color': 'white',
+                })
+                kpi_value_good_pct = workbook.add_format({
+                    'bold': True, 'font_size': 22, 'font_color': green, 'bg_color': green_light,
+                    'align': 'center', 'valign': 'vcenter', 'border': 1, 'border_color': 'white',
+                    'num_format': '0.0%',
+                })
+                kpi_value_good_dur = workbook.add_format({
+                    'bold': True, 'font_size': 18, 'font_color': green, 'bg_color': green_light,
+                    'align': 'center', 'valign': 'vcenter', 'border': 1, 'border_color': 'white',
+                    'num_format': '[h]:mm:ss',
+                })
+
+                # ── Title banner ──────────────────────────────────────
+                ap_ws.merge_range(0, 0, 1, n_cols - 1, 'Agent Performance Dashboard', ap_title_fmt)
+
+                # ── KPI tiles: 7 tiles × 3 columns = 21, spanning the
+                #    full table width below ──────────────────────────
+                total_combined = sum(a['combined'] for a in agent_rows)
+                total_connects = sum(a['connects'] for a in agent_rows)
+                total_dmcs = sum(a['dmcs'] for a in agent_rows)
+                total_sales = sum(a['sales'] for a in agent_rows)
+                total_talk_seconds = sum(a['talk_seconds'] for a in agent_rows)
+                kpi_connect_rate = (total_connects / total_combined) if total_combined else 0
+                kpi_dmc_rate = (total_dmcs / total_connects) if total_connects else 0
+                kpi_conversion = (total_sales / total_dmcs) if total_dmcs else 0
+                kpi_avg_talk = _as_day_fraction(total_talk_seconds / total_combined) if total_combined else 0
+
+                kpis = [
+                    ('AGENTS', len(agent_rows), kpi_label, kpi_value),
+                    ('TOTAL CALLS', total_combined, kpi_label, kpi_value),
+                    ('CONNECT RATE', kpi_connect_rate, kpi_label, kpi_value_pct),
+                    ('DMC RATE', kpi_dmc_rate, kpi_label, kpi_value_pct),
+                    ('SALES', total_sales, kpi_label_good, kpi_value_good),
+                    ('CONVERSION', kpi_conversion, kpi_label_good, kpi_value_good_pct),
+                    ('AVG TALK TIME', kpi_avg_talk, kpi_label_good, kpi_value_good_dur),
+                ]
+                KPI_LABEL_ROW = 3
+                KPI_VALUE_ROW = 4
+                for i, (label, value, label_fmt, value_fmt) in enumerate(kpis):
+                    col_start, col_end = i * 3, i * 3 + 2
+                    ap_ws.merge_range(KPI_LABEL_ROW, col_start, KPI_LABEL_ROW, col_end, label, label_fmt)
+                    ap_ws.merge_range(KPI_VALUE_ROW, col_start, KPI_VALUE_ROW + 1, col_end, value, value_fmt)
+
+                # ── Data table (native Excel Table — banded rows, filter
+                #    dropdowns on headers — instead of a plain range) ───
+                TABLE_HEADER_ROW = KPI_VALUE_ROW + 3  # one blank row below the tiles
+                first_data_row = TABLE_HEADER_ROW + 1
+                for row_num, a in enumerate(agent_rows, start=first_data_row):
+                    ap_ws.write(row_num, 0, a['display_name'], fmts['cell'])
+                    ap_ws.write(row_num, 1, a['team_name'], fmts['cell'])
+                    ap_ws.write(row_num, 2, a['outbound'], fmts['number'])
+                    ap_ws.write(row_num, 3, a['inbound'], fmts['number'])
+                    ap_ws.write(row_num, 4, a['combined'], fmts['number'])
+                    ap_ws.write(row_num, 5, a['connects'], fmts['number'])
+                    ap_ws.write(row_num, 6, a['connect_rate'], fmts['percent'])
+                    ap_ws.write(row_num, 7, a['dmcs'], fmts['number'])
+                    ap_ws.write(row_num, 8, a['dmc_rate'], fmts['percent'])
+                    ap_ws.write(row_num, 9, a['sales'], fmts['number'])
+                    ap_ws.write(row_num, 10, a['conversion'], fmts['percent'])
+                    ap_ws.write(row_num, 11, a['completed'], fmts['number'])
+                    ap_ws.write(row_num, 12, _as_day_fraction(a['talk_seconds']), fmts['duration'])
+                    ap_ws.write(row_num, 13, _as_day_fraction(a['avg_talk_seconds']), fmts['duration'])
+                    ap_ws.write(row_num, 14, _as_day_fraction(a['dmc_talk_seconds']), fmts['duration'])
+                    ap_ws.write(row_num, 15, _as_day_fraction(a['avg_dmc_talk_seconds']), fmts['duration'])
+                    ap_ws.write(row_num, 16, _as_day_fraction(a['pause_seconds']), fmts['duration'])
+                    ap_ws.write(row_num, 17, _as_day_fraction(a['wait_seconds']), fmts['duration'])
+                    ap_ws.write(row_num, 18, _as_day_fraction(a['avg_wait_seconds']), fmts['duration'])
+                    ap_ws.write(row_num, 19, _as_day_fraction(a['wrap_seconds']), fmts['duration'])
+                    ap_ws.write(row_num, 20, _as_day_fraction(a['avg_wrap_seconds']), fmts['duration'])
+                last_data_row = first_data_row + len(agent_rows) - 1
+
+                ap_ws.add_table(TABLE_HEADER_ROW, 0, last_data_row, n_cols - 1, {
+                    'columns': [{'header': h} for h in ap_headers],
+                    'style': 'Table Style Medium 2',
+                    'banded_rows': True,
+                })
+                ap_ws.freeze_panes(first_data_row, 0)
+
+                # Red/yellow/green scale on the three rate columns — lets a
+                # reader spot strong/weak agents at a glance without reading
+                # every number.
+                for col in (6, 8, 10):  # Connect Rate Combined, DMC Rate, Conversion
+                    ap_ws.conditional_format(first_data_row, col, last_data_row, col, {
+                        'type': '3_color_scale',
+                        'min_color': '#F8696B', 'mid_color': '#FFEB84', 'max_color': '#63BE7B',
+                    })
+
             print(f"Agent Performance sheet built: {len(agent_rows)} agents")
+        elif agent_performance_error:
+            # Requested but failed (even after fetch_agent_performance's
+            # own retry) — same reasoning as Call Count Breakdown's
+            # identical elif above: a visible error placeholder instead of
+            # silently vanishing.
+            ap_ws = workbook.add_worksheet('Agent Performance')
+            ap_ws.set_column(0, 0, 100)
+            ap_ws.merge_range(
+                0, 0, 2, 0,
+                f"⚠ Agent Performance could not be built — the database "
+                f"query failed even after a retry:\n{agent_performance_error}\n\n"
+                f"Try Generate Report again; if it keeps failing, the source "
+                f"database may be under heavy load or unreachable.",
+                fmts['ca_italic_note']
+            )
+            print(f"⚠️  Agent Performance sheet shows an error placeholder: {agent_performance_error}")
 
         # ── SHEET 4: TEMPLATE (Sheet1) populated from Pivot ────────────
         # Find the newest template for this campaign
@@ -1436,7 +2043,7 @@ class ReportViewSet(
             campaign=campaign, is_active=True
         ).order_by('-uploaded_at').first()
 
-        if template_obj and os.path.exists(template_obj.template_file.path):
+        if 'template' in wanted and template_obj and os.path.exists(template_obj.template_file.path):
             print(f"Populating template: {template_obj.name}")
 
             # Save and re-open the workbook so Pivot data is readable
@@ -1651,10 +2258,14 @@ class ReportViewSet(
                   f"(labels untouched, values in col "
                   f"{get_column_letter(data_col)})")
 
-            # Add the existing sheets (Processed Data, Pivot, Campaign Analysis,
-            # Call Count Breakdown/Agent Performance if built) from the
-            # xlsxwriter output into new_wb
-            for extra_name in ['Processed Data', 'Pivot', 'Campaign Analysis', 'Call Count Breakdown', 'Agent Performance']:
+            # Add the existing sheets (Processed Data, Pivot, Lead Count,
+            # Campaign Analysis, Call Count Breakdown/Agent Performance if
+            # built) from the xlsxwriter output into new_wb. Lead Count
+            # must be included here — Campaign Analysis's %-of-total-leads
+            # formulas reference 'Lead Count'!$B$3 directly, so omitting it
+            # would leave those formulas pointing at a sheet that doesn't
+            # exist in the final merged workbook.
+            for extra_name in ['Processed Data', 'Pivot', 'Lead Count', 'Campaign Analysis', 'Call Count Breakdown', 'Agent Performance']:
                 if extra_name in xl_wb.sheetnames:
                     src_extra = xl_wb[extra_name]
                     dst_extra = new_wb.create_sheet(title=extra_name)
@@ -1684,9 +2295,9 @@ class ReportViewSet(
                             dst_extra.row_dimensions[row_idx].height = dim.height
 
             # Reorder sheets EXACTLY as requested:
-            # 1. Processed Data  2. Sheet1  3. Campaign Analysis
-            # 4. Call Count Breakdown (if built)  5. Agent Performance (if built)  6. Pivot
-            desired_order = ['Processed Data', target_sheet_name, 'Campaign Analysis', 'Call Count Breakdown', 'Agent Performance', 'Pivot']
+            # 1. Processed Data  2. Sheet1  3. Lead Count  4. Campaign Analysis
+            # 5. Call Count Breakdown (if built)  6. Agent Performance (if built)  7. Pivot
+            desired_order = ['Processed Data', target_sheet_name, 'Lead Count', 'Campaign Analysis', 'Call Count Breakdown', 'Agent Performance', 'Pivot']
             for i, name in enumerate(desired_order):
                 if name in new_wb.sheetnames:
                     idx = new_wb.sheetnames.index(name)
@@ -1726,15 +2337,19 @@ class ReportViewSet(
                 'campaign_id':     campaign.id,
                 'campaign_name':   campaign.display_name,
                 'source_file':     file_instance.original_name,
-                'record_count':    grand_total,
+                'record_count':    total_leads,
                 'auto_generated':  True,
-                'has_sheet1':      template_obj is not None,
-                'template_name':   template_obj.name if template_obj else None,
-                'rows_populated':  rows_populated if template_obj else 0,
+                'has_sheet1':      'template' in wanted and template_obj is not None,
+                'template_name':   template_obj.name if ('template' in wanted and template_obj) else None,
+                'rows_populated':  rows_populated if ('template' in wanted and template_obj) else 0,
                 'has_agent_performance': agent_rows is not None,
                 'agent_count':     len(agent_rows) if agent_rows else 0,
+                'agent_performance_error': agent_performance_error,
+                'has_call_count_breakdown': call_counts is not None,
+                'call_count_breakdown_error': call_count_breakdown_error,
                 'metrics': {
                     'total_leads':         total_leads,
+                    'total_dispositions':  total_dispositions,
                     'unworked_leads':      unworked_leads,
                     'successful_contacts': successful_contacts,
                     'true_contacts':       true_contacts,
@@ -1765,6 +2380,14 @@ class ReportViewSet(
         uploading a new template or re-uploading data).
 
         Required POST body field: campaign_id
+        Optional POST body field: sheets — a list of sheet keys from
+        ReportViewSet.ALL_REPORT_SHEETS limiting which sheets get built.
+        Omitted/empty means all sheets, the historical behaviour.
+        Optional POST body field: full_outcome_history (bool, default
+        False) — when True, Pivot/Campaign Analysis count every historical
+        disposition instead of each contact's latest only. Opt-in because
+        it's a full external-DB scan that can take several minutes on a
+        busy campaign (see _auto_generate_full_report's docstring).
         """
         try:
             print("=" * 50)
@@ -1777,6 +2400,19 @@ class ReportViewSet(
                      'error': 'campaign_id is required in the request body.'},
                     status=status.HTTP_400_BAD_REQUEST
                 )
+
+            sheets = request.data.get('sheets')
+            if sheets is not None:
+                invalid = set(sheets) - ReportViewSet.ALL_REPORT_SHEETS
+                if invalid:
+                    return Response(
+                        {'success': False,
+                         'error': f'Unknown sheet(s): {", ".join(sorted(invalid))}. '
+                                  f'Valid values: {", ".join(sorted(ReportViewSet.ALL_REPORT_SHEETS))}.'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+
+            full_outcome_history = bool(request.data.get('full_outcome_history', False))
 
             try:
                 campaign_obj = Campaign.objects.get(id=campaign_id, is_active=True)
@@ -1812,7 +2448,9 @@ class ReportViewSet(
 
             # Delegate to the SAME generator used by auto-generation,
             # so manual and automatic reports are always identical.
-            report = ReportViewSet._auto_generate_full_report(latest_file)
+            report = ReportViewSet._auto_generate_full_report(
+                latest_file, sheets=sheets, full_outcome_history=full_outcome_history
+            )
 
             if report is None:
                 return Response(
@@ -1839,6 +2477,642 @@ class ReportViewSet(
 
         except Exception as e:
             print(f"❌ REPORT ERROR: {e}")
+            traceback.print_exc()
+            return Response(
+                {'success': False, 'error': f'Generation failed: {e}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+    COMBINED_REPORT_SHEETS = {
+        'processed_data', 'pivot', 'campaign_analysis',
+        'agent_performance', 'call_count_breakdown',
+    }
+
+    @staticmethod
+    def _generate_combined_report(campaigns, file_ids=None, sheets=None, user=None,
+                                   start_date=None, end_date=None, start_time=None, end_time=None,
+                                   full_outcome_history=False, sync_missing=True):
+        """
+        Builds one workbook combining several campaigns' processed data into
+        comparison-style sheets — every sheet gets a leading Campaign column
+        rather than each campaign getting its own tab.
+
+        Unlike _auto_generate_full_report this doesn't clone a per-campaign
+        template (there's no single coherent template across campaigns that
+        may each have their own), so 'template' isn't a valid sheet here,
+        and Campaign Analysis is a plain per-campaign comparison table with
+        computed values rather than live VLOOKUPs against a per-campaign
+        Pivot sheet — there's no single Pivot range that could serve every
+        campaign's formulas at once.
+
+        file_ids: optional explicit list of CallDataFile ids to pull from,
+        spanning any mix of the given campaigns — lets a caller pick which
+        upload/sync batch(es) to include per campaign instead of always the
+        latest. Campaigns with none of their files represented here fall
+        back to their single latest processed file (the original default
+        behaviour), so omitting file_ids entirely preserves it for every
+        campaign.
+
+        start_date/end_date/start_time/end_time: optional strings (dates as
+        'YYYY-MM-DD', times as 'HH:MM' or 'HH:MM:SS') scoping every sheet to
+        records whose last_called_date falls in that range — same fields
+        CampaignViewSet.sync_from_database already takes. When given, this
+        range is also used directly as the Agent Performance/Call Count
+        Breakdown external-database query window instead of aggregating
+        min/max from the (now range-filtered) processed data.
+
+        sheets: iterable of keys from COMBINED_REPORT_SHEETS. None means
+        {'processed_data','pivot','campaign_analysis'} — Agent Performance
+        and Call Count Breakdown are opt-in only even by default, since each
+        is N external-database round trips (one or two per campaign, see
+        external_source.fetch_agent_performance/fetch_contact_call_counts).
+
+        full_outcome_history (default False, opt-in): same meaning as
+        _auto_generate_full_report's parameter of the same name — counts
+        every historical disposition per campaign instead of each contact's
+        latest only. Verified to take several minutes per campaign on a
+        busy one, so it's opt-in here too, applied per campaign (skipped
+        for any campaign without a cd_campaign_id, same fallback as the
+        single-campaign report).
+
+        sync_missing (default True): when a selected campaign has no
+        processed CallDataFile at all (and none of file_ids covers it
+        either), pull its data from the external source database on the
+        spot — same sync_campaign_from_database call the single-campaign
+        Upload page's "Sync from Database" button makes, with
+        auto_generate_report=False since this method builds its own
+        workbook rather than needing a separate per-campaign report. Scoped
+        by start_date/end_date/start_time/end_time like everything else
+        here. Pass False to instead skip such campaigns immediately, same
+        as this method's older behaviour.
+
+        Returns (report, skipped) where report is the GeneratedReport (or
+        None if no campaign had any matching processed data at all) and
+        skipped is a list of {'campaign_id','display_name','reason'} for
+        campaigns left out.
+        """
+        from django.conf import settings
+        import xlsxwriter, os
+        from io import BytesIO
+        from datetime import datetime
+        from django.db.models import Count, Min, Max
+        from django.utils.dateparse import parse_datetime
+        from django.utils import timezone as dj_timezone
+        from .external_source import sync_campaign_from_database, ExternalSourceError
+
+        wanted = set(sheets) if sheets else {'processed_data', 'pivot', 'campaign_analysis'}
+        wanted &= ReportViewSet.COMBINED_REPORT_SHEETS
+        if not wanted:
+            wanted = {'processed_data', 'pivot', 'campaign_analysis'}
+
+        def _bound(date_str, time_str, default_time):
+            if not date_str:
+                return None
+            dt = parse_datetime(f"{date_str} {time_str or default_time}")
+            if dt is None:
+                return None
+            if dj_timezone.is_naive(dt):
+                dt = dj_timezone.make_aware(dt)
+            return dt
+
+        range_start = _bound(start_date, start_time, '00:00:00')
+        range_end = _bound(end_date, end_time, '23:59:59')
+
+        files_by_campaign = {}
+        if file_ids:
+            for f in CallDataFile.objects.filter(id__in=file_ids, status='processed').select_related('campaign'):
+                files_by_campaign.setdefault(f.campaign_id, []).append(f)
+
+        # Same category terms _auto_generate_full_report uses for its
+        # single-campaign summary metrics — duplicated here rather than
+        # shared because the single-campaign version computes them inline
+        # rather than as a module-level constant.
+        SALE_TERMS = [
+            'sale made', 'upsell', 'tyme bank account sale',
+            'sale made - completed mandate', 'sale made - pending mandate',
+            'qa verify',
+        ]
+        TRUE_CONTACT_TERMS = [
+            'not interested', 'callback', 'call back', 'client hung up',
+            'affordability', 'cannot afford', 'declined sale', 'qa rework',
+            'qa fail', 'quoted client not interested', 'not interested upfront',
+            'call back hold', 'not interested transaction fees',
+            'cannot afford premium', 'not interested household contents',
+            'not interested sms', 'call back via ms teams',
+        ]
+        # See _auto_generate_full_report's identical fetch for why: SALE_TERMS
+        # is a name-keyword guess that can miss a campaign's real
+        # conversions outright (e.g. Vodacom Retentions' actual sale=1
+        # outcomes contain no sales keyword at all) — OR-ing in the
+        # dialer's own authoritative flag closes that gap without changing
+        # anything for campaigns the keyword list already matched.
+        try:
+            from .external_source import fetch_sale_outcome_names
+            sale_outcome_names = fetch_sale_outcome_names()
+        except Exception as e:
+            print(f"⚠️  Could not fetch authoritative sale outcome names, "
+                  f"falling back to SALE_TERMS only: {e}")
+            sale_outcome_names = set()
+
+        # ── Resolve which file(s) + per-campaign data ────────────────────
+        entries = []
+        skipped = []
+        outcome_history_skipped_ranges = []  # (campaign_display_name, start, end) tuples, across all campaigns
+        for campaign in campaigns:
+            campaign_files = files_by_campaign.get(campaign.id)
+            if campaign_files:
+                query = ProcessedData.objects.filter(call_data_file__in=campaign_files)
+            else:
+                latest_file = CallDataFile.objects.filter(
+                    campaign=campaign, status='processed'
+                ).order_by('-uploaded_at').first()
+                if not latest_file and sync_missing:
+                    if not campaign.cd_campaign_id:
+                        skipped.append({'campaign_id': campaign.id, 'display_name': campaign.display_name,
+                                         'reason': 'No processed data file for this campaign, and no '
+                                                    'cd_campaign_id configured to sync one from the database.'})
+                        continue
+                    try:
+                        latest_file = sync_campaign_from_database(
+                            campaign, user=user, start_date=start_date, end_date=end_date,
+                            start_time=start_time, end_time=end_time, auto_generate_report=False,
+                        )
+                    except ExternalSourceError as e:
+                        skipped.append({'campaign_id': campaign.id, 'display_name': campaign.display_name,
+                                         'reason': f'Database sync failed: {e}'})
+                        continue
+                    except Exception as e:
+                        skipped.append({'campaign_id': campaign.id, 'display_name': campaign.display_name,
+                                         'reason': f'Database sync failed: {e}'})
+                        continue
+                if not latest_file:
+                    skipped.append({'campaign_id': campaign.id, 'display_name': campaign.display_name,
+                                     'reason': 'No processed data file for this campaign.'})
+                    continue
+                query = ProcessedData.objects.filter(call_data_file=latest_file)
+
+            if range_start:
+                query = query.filter(last_called_date__gte=range_start)
+            if range_end:
+                query = query.filter(last_called_date__lte=range_end)
+
+            if not query.exists():
+                reason = ('No processed records in the selected date range.' if (range_start or range_end)
+                          else 'Selected file(s) have no processed records.')
+                skipped.append({'campaign_id': campaign.id, 'display_name': campaign.display_name,
+                                 'reason': reason})
+                continue
+
+            outcome_map = _build_outcome_map(campaign)
+            total_leads = query.count()
+
+            # description_counts reflects every historical disposition for
+            # this campaign, not just each contact's current/latest outcome
+            # — same reasoning as _auto_generate_full_report's identical
+            # fallback chain (see its comments). Reuses the combined
+            # report's own date range when one was given (range_start/
+            # range_end, from the modal's Date & Time Range fields) so the
+            # outcome history matches whatever scope the caller asked for;
+            # falls back to default_campaign_date_range otherwise.
+            description_counts = None
+            if full_outcome_history and campaign.cd_campaign_id:
+                try:
+                    from .external_source import fetch_outcome_history_counts, default_campaign_date_range
+                    if range_start or range_end:
+                        hist_start, hist_end = range_start, range_end
+                    else:
+                        hist_start, hist_end = default_campaign_date_range(campaign)
+                    raw_history_counts, campaign_skipped_ranges = fetch_outcome_history_counts(
+                        campaign.cd_campaign_id, start_dt=hist_start, end_dt=hist_end
+                    )
+                    description_counts = {}
+                    for key, count in raw_history_counts.items():
+                        desc = outcome_map.get(key, key)
+                        description_counts[desc] = description_counts.get(desc, 0) + count
+                    for s, e in campaign_skipped_ranges:
+                        outcome_history_skipped_ranges.append((campaign.display_name, s, e))
+                except Exception as e:
+                    print(f"⚠️  Outcome history query failed for '{campaign.display_name}', "
+                          f"falling back to latest-outcome counting: {e}")
+                    description_counts = None
+
+            if description_counts is None:
+                raw_counts = query.values('last_outcome').annotate(count=Count('id'))
+                description_counts = {}
+                for item in raw_counts:
+                    key = item['last_outcome'] or 'Unknown'
+                    desc = outcome_map.get(key, key)
+                    description_counts[desc] = description_counts.get(desc, 0) + item['count']
+
+            true_sales = true_contacts = unworked_leads = 0
+            for desc, count in description_counts.items():
+                d = desc.lower().strip()
+                if any(t in d for t in SALE_TERMS) or d in sale_outcome_names:
+                    true_sales += count
+                elif any(t in d for t in TRUE_CONTACT_TERMS):
+                    true_contacts += count
+                elif any(t == d or d.startswith(t) for t in ['new', 'not contacted']):
+                    unworked_leads += count
+            successful_contacts = true_contacts + true_sales
+            conversion_value = (true_sales / total_leads) if total_leads else 0
+
+            entries.append({
+                'campaign': campaign,
+                'query': query,
+                'description_counts': description_counts,
+                'total_leads': total_leads,
+                'total_dispositions': sum(description_counts.values()),
+                'true_sales': true_sales,
+                'true_contacts': true_contacts,
+                'successful_contacts': successful_contacts,
+                'conversion_value': conversion_value,
+            })
+
+        if not entries:
+            return None, skipped
+
+        print(f"\n{'='*60}")
+        print(f"COMBINED REPORT: {len(entries)} campaign(s), "
+              f"{len(skipped)} skipped, sheets={sorted(wanted)}")
+
+        # ── Build workbook ───────────────────────────────────────────
+        output = BytesIO()
+        workbook = xlsxwriter.Workbook(output, {'nan_inf_to_errors': True})
+        fmts = {
+            'header': workbook.add_format({
+                'bold': True, 'bg_color': '#366092', 'font_color': 'white',
+                'border': 1, 'align': 'center', 'valign': 'vcenter'
+            }),
+            'cell': workbook.add_format({'border': 1, 'align': 'left', 'valign': 'vcenter'}),
+            'number': workbook.add_format({'border': 1, 'align': 'center', 'num_format': '#,##0'}),
+            'percent': workbook.add_format({'border': 1, 'align': 'center', 'num_format': '0.00%'}),
+            'grand_total': workbook.add_format({
+                'bold': True, 'bg_color': '#8EA9DB', 'border': 1, 'num_format': '#,##0'
+            }),
+            'italic_note': workbook.add_format({'italic': True, 'align': 'left', 'valign': 'vcenter'}),
+        }
+
+        # ── Processed Data (+ Call Count Breakdown's contact lookup) ────
+        # Streamed via .values(...).iterator() per campaign rather than
+        # materializing every record into a Python list or full ORM model
+        # instances — a combined pull across several large campaigns (e.g.
+        # Telkom LTE alone was 1.1M+ records) is easily too much to hold in
+        # memory, and constructing that many live model instances (~35
+        # fields of descriptor overhead each) is slow enough on its own to
+        # make report generation look hung for well over an hour. .values()
+        # returns plain dicts instead, and write_row() (one call per row)
+        # replaces ~35 individual .write() calls per row for the same
+        # reason: fewer, cheaper Python-level calls across tens of millions
+        # of cells.
+        #
+        # This used to hard-cap at 10,000 rows total regardless of how many
+        # records actually existed, while Pivot/Campaign Analysis kept
+        # showing the true totals — the same sheet-to-sheet mismatch, just
+        # here across every selected campaign at once. XLSX caps a single
+        # SHEET at 1,048,576 rows, so once the combined total exceeds that
+        # it now spills into "Processed Data (2)", "Processed Data (3)",
+        # etc. (numbered continuously across campaigns) instead of silently
+        # dropping rows.
+        MAX_SHEET_DATA_ROWS = 1_000_000  # safely under Excel's 1,048,576-row ceiling, room for the header
+        need_records_pass = 'processed_data' in wanted or 'call_count_breakdown' in wanted
+
+        if need_records_pass:
+            field_names = [
+                f.name for f in ProcessedData._meta.fields
+                if f.name not in ['id', 'call_data_file', 'processed_at', 'outcome_description']
+            ]
+            date_fields = {'last_called_date', 'created_at', 'updated_at', 'dob'}
+
+            def _new_combined_data_sheet(idx):
+                sheet_name = 'Processed Data' if idx == 1 else f'Processed Data ({idx})'
+                ws = workbook.add_worksheet(sheet_name)
+                ws.set_column(0, 0, 24)
+                ws.write(0, 0, 'Campaign', fmts['header'])
+                for col, field in enumerate(field_names, start=1):
+                    ws.write(0, col, _column_header(field), fmts['header'])
+                return ws
+
+            data_ws = None
+            data_sheet_index = 1
+            data_row_num = 1
+            if 'processed_data' in wanted:
+                data_ws = _new_combined_data_sheet(data_sheet_index)
+
+            total_processed_rows = 0
+            for entry in entries:
+                # Keyed by customer_id, only within this campaign — the same
+                # raw id can mean different contacts across different source
+                # campaigns, so this deliberately isn't merged into one
+                # cross-campaign dict.
+                entry['contact_lookup'] = {}
+
+                for record in entry['query'].values(*field_names).iterator(chunk_size=5000):
+                    if 'processed_data' in wanted:
+                        if data_row_num > MAX_SHEET_DATA_ROWS:
+                            data_sheet_index += 1
+                            data_ws = _new_combined_data_sheet(data_sheet_index)
+                            data_row_num = 1
+                        data_ws.write(data_row_num, 0, entry['campaign'].display_name, fmts['cell'])
+                        row_values = [
+                            record[field].strftime('%Y-%m-%d %H:%M:%S') if field in date_fields and record[field] else record[field]
+                            for field in field_names
+                        ]
+                        data_ws.write_row(data_row_num, 1, row_values)
+                        data_row_num += 1
+
+                    if 'call_count_breakdown' in wanted and record['customer_id']:
+                        name = f"{(record['firstname'] or '').strip()} {(record['lastname'] or '').strip()}".strip()
+                        entry['contact_lookup'][str(record['customer_id'])] = (record['contact_id'], name, record['tel1'] or '')
+
+                    total_processed_rows += 1
+
+            if 'processed_data' in wanted:
+                print(f"✅ Combined Processed Data: {total_processed_rows} rows across {data_sheet_index} sheet(s)")
+
+        if 'pivot' in wanted:
+            pivot_ws = workbook.add_worksheet('Pivot')
+            pivot_ws.set_column(0, 0, 24)
+            pivot_ws.set_column(1, 1, 40)
+            pivot_ws.set_column(2, 2, 14)
+            pivot_ws.write(0, 0, 'Campaign', fmts['header'])
+            pivot_ws.write(0, 1, 'Outcome Description', fmts['header'])
+            pivot_ws.write(0, 2, 'Count', fmts['header'])
+            r = 1
+            grand_all = 0
+            for entry in entries:
+                for desc, count in sorted(entry['description_counts'].items(), key=lambda x: x[1], reverse=True):
+                    pivot_ws.write(r, 0, entry['campaign'].display_name, fmts['cell'])
+                    pivot_ws.write(r, 1, desc, fmts['cell'])
+                    pivot_ws.write(r, 2, count, fmts['number'])
+                    r += 1
+                grand_all += entry['total_dispositions']
+            pivot_ws.write(r, 1, 'Grand Total', fmts['grand_total'])
+            pivot_ws.write(r, 2, grand_all, fmts['grand_total'])
+            print(f"✅ Combined Pivot: {r - 1} rows")
+
+            # Surfaced in the sheet itself, not just a server console log —
+            # see _auto_generate_full_report's identical note for why.
+            if outcome_history_skipped_ranges:
+                note_row = r + 2
+                ranges_str = "; ".join(
+                    f"{name}: {s.strftime('%Y-%m-%d')} to {e.strftime('%Y-%m-%d')}"
+                    for name, s, e in outcome_history_skipped_ranges
+                )
+                pivot_ws.merge_range(
+                    note_row, 0, note_row, 2,
+                    f"⚠ {len(outcome_history_skipped_ranges)} date range(s) could not be fully "
+                    f"scanned in time and may be undercounted: {ranges_str}",
+                    fmts['italic_note']
+                )
+
+        if 'campaign_analysis' in wanted:
+            ca_ws = workbook.add_worksheet('Campaign Analysis')
+            ca_ws.set_column(0, 0, 28)
+            ca_ws.set_column(1, 5, 18)
+            headers = ['Campaign', 'Total Leads', 'Successful Contacts',
+                       'True Contacts', 'True Sales', 'Conversion %']
+            for col, h in enumerate(headers):
+                ca_ws.write(0, col, h, fmts['header'])
+            r = 1
+            totals = {'leads': 0, 'sc': 0, 'tc': 0, 'ts': 0}
+            for entry in entries:
+                ca_ws.write(r, 0, entry['campaign'].display_name, fmts['cell'])
+                ca_ws.write(r, 1, entry['total_leads'], fmts['number'])
+                ca_ws.write(r, 2, entry['successful_contacts'], fmts['number'])
+                ca_ws.write(r, 3, entry['true_contacts'], fmts['number'])
+                ca_ws.write(r, 4, entry['true_sales'], fmts['number'])
+                ca_ws.write(r, 5, entry['conversion_value'], fmts['percent'])
+                totals['leads'] += entry['total_leads']
+                totals['sc'] += entry['successful_contacts']
+                totals['tc'] += entry['true_contacts']
+                totals['ts'] += entry['true_sales']
+                r += 1
+            ca_ws.write(r, 0, 'GRAND TOTAL', fmts['grand_total'])
+            ca_ws.write(r, 1, totals['leads'], fmts['grand_total'])
+            ca_ws.write(r, 2, totals['sc'], fmts['grand_total'])
+            ca_ws.write(r, 3, totals['tc'], fmts['grand_total'])
+            ca_ws.write(r, 4, totals['ts'], fmts['grand_total'])
+            overall_conv = (totals['ts'] / totals['leads']) if totals['leads'] else 0
+            ca_ws.write(r, 5, overall_conv, fmts['grand_total'])
+            print(f"✅ Combined Campaign Analysis: {len(entries)} campaign row(s)")
+
+        if 'agent_performance' in wanted:
+            from .external_source import fetch_agent_performance
+            ap_ws = workbook.add_worksheet('Agent Performance')
+            headers = ['Campaign', 'User', 'Team', 'Outbound', 'Inbound', 'Combined',
+                       'Connects', 'Connect Rate', 'DMCs', 'DMC Rate', 'Sales',
+                       'Conversion', 'Completed']
+            for col, h in enumerate(headers):
+                ap_ws.write(0, col, h, fmts['header'])
+            ap_ws.set_column(0, 1, 22)
+            r = 1
+            for entry in entries:
+                campaign = entry['campaign']
+                if not campaign.cd_campaign_id:
+                    continue
+                if range_start or range_end:
+                    span_start, span_end = range_start, range_end
+                else:
+                    date_span = entry['query'].aggregate(min_date=Min('last_called_date'), max_date=Max('last_called_date'))
+                    span_start, span_end = date_span['min_date'], date_span['max_date']
+                try:
+                    agent_rows = fetch_agent_performance(
+                        campaign.cd_campaign_id,
+                        start_dt=span_start, end_dt=span_end,
+                    )
+                except Exception as e:
+                    print(f"⚠️  Agent Performance skipped for '{campaign.display_name}': {e}")
+                    continue
+                for a in agent_rows:
+                    ap_ws.write(r, 0, campaign.display_name, fmts['cell'])
+                    ap_ws.write(r, 1, a['display_name'], fmts['cell'])
+                    ap_ws.write(r, 2, a['team_name'], fmts['cell'])
+                    ap_ws.write(r, 3, a['outbound'], fmts['number'])
+                    ap_ws.write(r, 4, a['inbound'], fmts['number'])
+                    ap_ws.write(r, 5, a['combined'], fmts['number'])
+                    ap_ws.write(r, 6, a['connects'], fmts['number'])
+                    ap_ws.write(r, 7, a['connect_rate'], fmts['percent'])
+                    ap_ws.write(r, 8, a['dmcs'], fmts['number'])
+                    ap_ws.write(r, 9, a['dmc_rate'], fmts['percent'])
+                    ap_ws.write(r, 10, a['sales'], fmts['number'])
+                    ap_ws.write(r, 11, a['conversion'], fmts['percent'])
+                    ap_ws.write(r, 12, a['completed'], fmts['number'])
+                    r += 1
+            print(f"✅ Combined Agent Performance: {r - 1} rows")
+
+        if 'call_count_breakdown' in wanted:
+            from .external_source import fetch_contact_call_counts
+            ccb_ws = workbook.add_worksheet('Call Count Breakdown')
+            headers = ['Campaign', 'Contact ID', 'Name', 'Phone', 'Times Contacted']
+            for col, h in enumerate(headers):
+                ccb_ws.write(0, col, h, fmts['header'])
+            ccb_ws.set_column(0, 0, 22)
+            ccb_ws.set_column(2, 2, 26)
+            r = 1
+            for entry in entries:
+                campaign = entry['campaign']
+                if not campaign.cd_campaign_id:
+                    continue
+                if range_start or range_end:
+                    span_start, span_end = range_start, range_end
+                else:
+                    date_span = entry['query'].aggregate(min_date=Min('last_called_date'), max_date=Max('last_called_date'))
+                    span_start, span_end = date_span['min_date'], date_span['max_date']
+                try:
+                    call_counts = fetch_contact_call_counts(
+                        campaign.cd_campaign_id,
+                        start_dt=span_start, end_dt=span_end,
+                    )
+                except Exception as e:
+                    print(f"⚠️  Call Count Breakdown skipped for '{campaign.display_name}': {e}")
+                    continue
+                contact_lookup = entry.get('contact_lookup', {})
+                for customer_id, count in sorted(call_counts.items(), key=lambda kv: kv[1], reverse=True):
+                    looked_up = contact_lookup.get(customer_id)
+                    contact_id, name, phone = looked_up if looked_up else (customer_id, '', '')
+                    ccb_ws.write(r, 0, campaign.display_name, fmts['cell'])
+                    ccb_ws.write(r, 1, contact_id, fmts['cell'])
+                    ccb_ws.write(r, 2, name or '—', fmts['cell'])
+                    ccb_ws.write(r, 3, phone or '—', fmts['cell'])
+                    ccb_ws.write(r, 4, count, fmts['number'])
+                    r += 1
+            print(f"✅ Combined Call Count Breakdown: {r - 1} rows")
+
+        workbook.close()
+        output.seek(0)
+        file_bytes = output.getvalue()
+
+        # ── Save to disk + GeneratedReport ───────────────────────────
+        reports_dir = os.path.join(settings.MEDIA_ROOT, 'reports')
+        os.makedirs(reports_dir, exist_ok=True)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        names_slug = '_'.join(e['campaign'].name for e in entries)[:80]
+        filename = f"combined_report_{names_slug}_{timestamp}.xlsx"
+        filepath = os.path.join(reports_dir, filename)
+        with open(filepath, 'wb') as f:
+            f.write(file_bytes)
+
+        total_leads_all = sum(e['total_leads'] for e in entries)
+        total_dispositions_all = sum(e['total_dispositions'] for e in entries)
+        report = GeneratedReport.objects.create(
+            user=user,
+            campaign=None,
+            report_type='campaign_data',
+            file=f"reports/{filename}",
+            parameters={
+                'combined': True,
+                'campaign_ids': [e['campaign'].id for e in entries],
+                'campaign_names': [e['campaign'].display_name for e in entries],
+                'skipped': skipped,
+                'sheets': sorted(wanted),
+                'file_ids': list(file_ids) if file_ids else None,
+                'date_range': {'start': start_date, 'end': end_date,
+                                'start_time': start_time, 'end_time': end_time},
+                'record_count': total_leads_all,
+                'metrics': {
+                    'total_leads': total_leads_all,
+                    'total_dispositions': total_dispositions_all,
+                    'successful_contacts': sum(e['successful_contacts'] for e in entries),
+                    'true_contacts': sum(e['true_contacts'] for e in entries),
+                    'true_sales': sum(e['true_sales'] for e in entries),
+                },
+            }
+        )
+        print(f"Combined report saved: {filename} (ID: {report.id})")
+        print(f"{'='*60}\n")
+        return report, skipped
+
+    @action(detail=False, methods=['post'])
+    def generate_combined(self, request):
+        """
+        Generate one report combining several campaigns at once — see
+        ReportViewSet._generate_combined_report for the sheet layout and
+        why it differs from the single-campaign report.
+
+        Required POST body field: campaign_ids (non-empty list).
+        Optional: sheets (list of keys from ReportViewSet.COMBINED_REPORT_SHEETS;
+        'template' is not valid for a combined report — there's no single
+        template to clone across campaigns that may each have their own).
+        Optional: file_ids (list of CallDataFile ids — which upload/sync
+        batch(es) to pull from per campaign; a campaign with none of its
+        files listed here falls back to its single latest processed file).
+        Optional: start_date/end_date ('YYYY-MM-DD') and start_time/end_time
+        ('HH:MM' or 'HH:MM:SS') — scopes every sheet to records whose
+        last_called_date falls in that range.
+        Optional: full_outcome_history (bool, default False) — see
+        _generate_combined_report's docstring; opt-in since it's a full
+        external-DB scan per campaign that can take several minutes each.
+        Optional: sync_missing (bool, default True) — see
+        _generate_combined_report's docstring; auto-syncs any selected
+        campaign with no processed data yet from the external database,
+        same as the single-campaign Upload page's "Sync from Database".
+        Pass False to skip such campaigns instead, as this used to always do.
+        """
+        try:
+            campaign_ids = request.data.get('campaign_ids')
+            if not campaign_ids or not isinstance(campaign_ids, list):
+                return Response(
+                    {'success': False, 'error': 'campaign_ids (a non-empty list) is required.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            sheets = request.data.get('sheets')
+            if sheets is not None:
+                invalid = set(sheets) - ReportViewSet.COMBINED_REPORT_SHEETS
+                if invalid:
+                    return Response(
+                        {'success': False,
+                         'error': f'Unknown sheet(s) for a combined report: {", ".join(sorted(invalid))}. '
+                                  f'Valid values: {", ".join(sorted(ReportViewSet.COMBINED_REPORT_SHEETS))}.'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+
+            file_ids = request.data.get('file_ids') or None
+            start_date = request.data.get('start_date') or None
+            end_date = request.data.get('end_date') or None
+            start_time = request.data.get('start_time') or None
+            end_time = request.data.get('end_time') or None
+            full_outcome_history = bool(request.data.get('full_outcome_history', False))
+            sync_missing = bool(request.data.get('sync_missing', True))
+
+            campaigns = list(Campaign.objects.filter(id__in=campaign_ids, is_active=True))
+            if not campaigns:
+                return Response(
+                    {'success': False, 'error': 'None of the given campaign_ids matched an active campaign.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            user = request.user if request.user.is_authenticated else None
+            report, skipped = ReportViewSet._generate_combined_report(
+                campaigns, file_ids=file_ids, sheets=sheets, user=user,
+                start_date=start_date, end_date=end_date,
+                start_time=start_time, end_time=end_time,
+                full_outcome_history=full_outcome_history, sync_missing=sync_missing,
+            )
+
+            if report is None:
+                return Response(
+                    {'success': False,
+                     'error': 'None of the selected campaigns have processed data yet.',
+                     'skipped': skipped},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            return Response({
+                'success': True,
+                'data': {
+                    'report_id':    report.id,
+                    'download_url': f'/api/reports/{report.id}/download/',
+                    'campaigns':    report.parameters.get('campaign_names', []),
+                    'skipped':      skipped,
+                    'metrics':      report.parameters.get('metrics', {}),
+                    'message':      f'Combined report generated for {len(campaigns) - len(skipped)} of '
+                                     f'{len(campaigns)} selected campaign(s).',
+                }
+            })
+
+        except Exception as e:
+            print(f"❌ COMBINED REPORT ERROR: {e}")
             traceback.print_exc()
             return Response(
                 {'success': False, 'error': f'Generation failed: {e}'},
@@ -2469,11 +3743,16 @@ class TemplateBasedReportGenerator:
             print(f"✅ Added 'Pivot_Data' sheet with {pivot_sheet.max_row-1} rows "
                   f"of reference data")
 
-            # STEP 8b: Also copy "Processed Data" and "Campaign Analysis" sheets
-            # from the campaign report, so the final download has the full
-            # 4-sheet set: Processed Data, Pivot_Data, Campaign Analysis,
-            # and the populated template sheet.
-            for extra_sheet_name in ['Processed Data', 'Campaign Analysis']:
+            # STEP 8b: Also copy "Processed Data", "Lead Count" and
+            # "Campaign Analysis" sheets from the campaign report, so the
+            # final download has the full sheet set: Processed Data,
+            # Pivot_Data, Lead Count, Campaign Analysis, and the populated
+            # template sheet. Lead Count must be included — Campaign
+            # Analysis's %-of-total-leads formulas reference
+            # 'Lead Count'!$B$3 directly, so omitting it here would leave
+            # those formulas pointing at a sheet that doesn't exist in
+            # this derived workbook.
+            for extra_sheet_name in ['Processed Data', 'Lead Count', 'Campaign Analysis']:
                 if extra_sheet_name in campaign_wb.sheetnames and extra_sheet_name not in new_wb.sheetnames:
                     src_extra = campaign_wb[extra_sheet_name]
                     dst_extra = new_wb.create_sheet(title=extra_sheet_name)
@@ -2745,7 +4024,13 @@ class DashboardStatsView(generics.GenericAPIView):
 # why: no supporting index for date-filtered live queries on that schema).
 
 class QASyncView(generics.GenericAPIView):
-    """Trigger an on-demand refresh of the local QA cache for one or more campaigns."""
+    """
+    Trigger an on-demand refresh of the local QA cache for one or more
+    campaigns. Optional POST body fields: start_date/end_date ('YYYY-MM-DD')
+    and start_time/end_time ('HH:MM' or 'HH:MM:SS') scope the sync to
+    interactions in that range — omitted entirely, sync_campaign_qa_cache
+    falls back to a bounded default (see external_source.default_campaign_date_range).
+    """
     permission_classes = [AllowAny]
 
     def post(self, request):
@@ -2754,10 +4039,18 @@ class QASyncView(generics.GenericAPIView):
         local_campaign_ids = request.data.get('campaign_ids') or []
         campaigns = Campaign.objects.filter(id__in=local_campaign_ids)
 
+        start_date = request.data.get('start_date') or None
+        end_date = request.data.get('end_date') or None
+        start_time = request.data.get('start_time') or None
+        end_time = request.data.get('end_time') or None
+
         results = []
         for campaign in campaigns:
             try:
-                count, synced_at = sync_campaign_qa_cache(campaign)
+                count, synced_at = sync_campaign_qa_cache(
+                    campaign, start_date=start_date, end_date=end_date,
+                    start_time=start_time, end_time=end_time,
+                )
                 results.append({
                     'campaign_id': campaign.id,
                     'campaign': campaign.display_name,
@@ -2772,6 +4065,41 @@ class QASyncView(generics.GenericAPIView):
         return Response({'results': results})
 
 
+def _build_qa_queryset(request):
+    """
+    Shared QACallRecord filtering for QARecordsView and QADownloadView —
+    campaign_ids (required, comma-separated local Campaign ids), optional
+    start_date/end_date/start_time/end_time, outcomes (comma-separated),
+    and search. Returns QACallRecord.objects.none() if no campaign_ids are
+    given, same as QARecordsView's own empty-state handling used to.
+    """
+    local_campaign_ids = [c for c in request.query_params.get('campaign_ids', '').split(',') if c]
+    if not local_campaign_ids:
+        return QACallRecord.objects.none()
+
+    qs = QACallRecord.objects.filter(campaign_id__in=local_campaign_ids)
+
+    start_date = request.query_params.get('start_date')
+    end_date = request.query_params.get('end_date')
+    start_time = request.query_params.get('start_time')
+    end_time = request.query_params.get('end_time')
+    if start_date:
+        qs = qs.filter(call_date__gte=f"{start_date} {start_time or '00:00:00'}")
+    if end_date:
+        qs = qs.filter(call_date__lte=f"{end_date} {end_time or '23:59:59'}")
+
+    outcomes = [o for o in request.query_params.get('outcomes', '').split(',') if o]
+    if outcomes:
+        qs = qs.filter(outcome__in=outcomes)
+
+    search = request.query_params.get('search')
+    if search:
+        qs = qs.filter(
+            Q(customer__icontains=search) | Q(phone_number__icontains=search) | Q(agent_name__icontains=search)
+        )
+    return qs
+
+
 class QARecordsView(generics.GenericAPIView):
     """
     Paginated, filterable call-record listing for QA review, across one or
@@ -2781,32 +4109,11 @@ class QARecordsView(generics.GenericAPIView):
     permission_classes = [AllowAny]
 
     def get(self, request):
-        local_campaign_ids = [c for c in request.query_params.get('campaign_ids', '').split(',') if c]
         empty = {'count': 0, 'results': [], 'page': 1, 'num_pages': 1, 'last_synced': None}
-        if not local_campaign_ids:
+        if not request.query_params.get('campaign_ids'):
             return Response(empty)
 
-        qs = QACallRecord.objects.filter(campaign_id__in=local_campaign_ids)
-
-        start_date = request.query_params.get('start_date')
-        end_date = request.query_params.get('end_date')
-        start_time = request.query_params.get('start_time')
-        end_time = request.query_params.get('end_time')
-        if start_date:
-            qs = qs.filter(call_date__gte=f"{start_date} {start_time or '00:00:00'}")
-        if end_date:
-            qs = qs.filter(call_date__lte=f"{end_date} {end_time or '23:59:59'}")
-
-        outcomes = [o for o in request.query_params.get('outcomes', '').split(',') if o]
-        if outcomes:
-            qs = qs.filter(outcome__in=outcomes)
-
-        search = request.query_params.get('search')
-        if search:
-            qs = qs.filter(
-                Q(customer__icontains=search) | Q(phone_number__icontains=search) | Q(agent_name__icontains=search)
-            )
-
+        qs = _build_qa_queryset(request)
         last_synced = qs.aggregate(Max('synced_at'))['synced_at__max']
 
         try:
@@ -2860,6 +4167,89 @@ class QAOutcomesView(generics.GenericAPIView):
             .distinct()
         )
         return Response(list(outcomes))
+
+
+class QADownloadView(generics.GenericAPIView):
+    """
+    Download every QA record matching the current filters as one .xlsx file
+    — the same filters QARecordsView takes (campaign_ids, start_date/
+    end_date/start_time/end_time, outcomes, search), but every matching
+    record instead of one page of them, since the on-screen table only ever
+    shows 50 rows at a time.
+    """
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        import xlsxwriter
+        from io import BytesIO
+        from datetime import datetime
+
+        qs = _build_qa_queryset(request)
+        if not qs.exists():
+            return Response({'error': 'No records match these filters.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        qs = qs.order_by('-call_date').values(
+            'call_date', 'customer', 'phone_number', 'agent_name',
+            'campaign__display_name', 'outcome', 'recording_key', 'recording_duration_seconds',
+        )
+
+        output = BytesIO()
+        workbook = xlsxwriter.Workbook(output, {'nan_inf_to_errors': True})
+        header_fmt = workbook.add_format({
+            'bold': True, 'bg_color': '#366092', 'font_color': 'white',
+            'border': 1, 'align': 'center', 'valign': 'vcenter'
+        })
+        headers = ['Date', 'Customer', 'Phone Number', 'Agent Name', 'Campaign', 'Outcome',
+                   'Recording Key', 'Recording Duration (seconds)']
+
+        # Same XLSX row ceiling as everywhere else in this codebase
+        # (1,048,576 rows/sheet) — QA exports are normally far smaller than
+        # a campaign's full processed data, but split the same way rather
+        # than risk it for a very wide date range across many campaigns.
+        MAX_SHEET_DATA_ROWS = 1_000_000
+
+        def _new_sheet(idx):
+            sheet_name = 'QA Records' if idx == 1 else f'QA Records ({idx})'
+            ws = workbook.add_worksheet(sheet_name)
+            for col, h in enumerate(headers):
+                ws.write(0, col, h, header_fmt)
+            ws.set_column(0, 0, 20)
+            ws.set_column(1, 3, 22)
+            ws.set_column(4, 5, 22)
+            ws.set_column(6, 6, 32)
+            return ws
+
+        ws = _new_sheet(1)
+        sheet_index = 1
+        row_num = 1
+        for r in qs.iterator(chunk_size=5000):
+            if row_num > MAX_SHEET_DATA_ROWS:
+                sheet_index += 1
+                ws = _new_sheet(sheet_index)
+                row_num = 1
+            ws.write_row(row_num, 0, [
+                r['call_date'].strftime('%Y-%m-%d %H:%M:%S') if r['call_date'] else '',
+                r['customer'] or '',
+                r['phone_number'] or '',
+                r['agent_name'] or '',
+                r['campaign__display_name'] or '',
+                r['outcome'] or '',
+                r['recording_key'] or '',
+                r['recording_duration_seconds'],
+            ])
+            row_num += 1
+
+        workbook.close()
+        output.seek(0)
+
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"qa_records_{timestamp}.xlsx"
+        response = HttpResponse(
+            output.getvalue(),
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        return response
 
 
 # ===========================================================
@@ -2948,7 +4338,27 @@ class CampaignViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'])
     def sync_from_database(self, request, pk=None):
-        """Pull this campaign's call data from the external source database."""
+        """
+        Pull this campaign's call data from the external source database.
+        Optional POST body field: auto_generate_report (bool, default
+        True) — when True (the historical default, kept for callers like
+        AgentReports.js's bulk sync-then-download-report flow that rely on
+        it), the full report is built as part of this same request, same
+        as a CSV/Excel upload. Pass False to have this return as soon as
+        the data itself is pulled and saved, without also waiting on the
+        report's own Agent Performance/Call Count Breakdown sheets (each
+        re-queries the external DB across the campaign's full history —
+        verified live at 25+ minutes on a large campaign); build the
+        report afterward via generate_campaign instead. The
+        CampaignUpload.js "Sync from Database" panel does this.
+        Optional POST body field: sheets — a list of keys from
+        ReportViewSet.ALL_REPORT_SHEETS limiting which sheets the report
+        builds (only relevant when auto_generate_report is True).
+        Omitted/empty means all sheets.
+        Optional POST body field: full_outcome_history (bool, default
+        False) — see ReportViewSet._auto_generate_full_report's docstring
+        (only relevant when auto_generate_report is True).
+        """
         from .external_source import sync_campaign_from_database, ExternalSourceError
 
         campaign = self.get_object()
@@ -2958,15 +4368,40 @@ class CampaignViewSet(viewsets.ModelViewSet):
         start_time = request.data.get('start_time') or None
         end_time = request.data.get('end_time') or None
         list_ids = request.data.get('list_ids') or None
+        auto_generate_report = bool(request.data.get('auto_generate_report', True))
+        full_outcome_history = bool(request.data.get('full_outcome_history', False))
+
+        sheets = request.data.get('sheets')
+        if sheets is not None:
+            invalid = set(sheets) - ReportViewSet.ALL_REPORT_SHEETS
+            if invalid:
+                return Response(
+                    {'error': f'Unknown sheet(s): {", ".join(sorted(invalid))}. '
+                              f'Valid values: {", ".join(sorted(ReportViewSet.ALL_REPORT_SHEETS))}.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
         try:
             instance = sync_campaign_from_database(
                 campaign, user=user, start_date=start_date, end_date=end_date,
-                start_time=start_time, end_time=end_time, list_ids=list_ids
+                start_time=start_time, end_time=end_time, list_ids=list_ids, sheets=sheets,
+                full_outcome_history=full_outcome_history, auto_generate_report=auto_generate_report,
             )
         except ExternalSourceError as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
-            return Response({'error': f'Database sync failed: {e}'}, status=status.HTTP_502_BAD_GATEWAY)
+            # Anything landing here is, by definition, a failure mode
+            # ExternalSourceError didn't anticipate — print the full
+            # traceback (previously silent: nothing was logged server-side
+            # for this branch, so a report like "Database sync failed: "
+            # with nothing after the colon was undiagnosable after the
+            # fact). str(e) can legitimately be empty (e.g. a bare
+            # Exception()/AssertionError() with no message) — fall back to
+            # the exception's type name so the user-facing message is
+            # never just a trailing colon.
+            traceback.print_exc()
+            detail = str(e) or type(e).__name__
+            return Response({'error': f'Database sync failed: {detail}'}, status=status.HTTP_502_BAD_GATEWAY)
 
         return Response(CallDataFileSerializer(instance).data)
 

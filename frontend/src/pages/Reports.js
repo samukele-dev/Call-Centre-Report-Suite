@@ -7,6 +7,7 @@ import {
 } from 'react-bootstrap';
 import DashboardService from '../api/dashboardService';
 import { saveAs } from 'file-saver';
+import ReportPreviewModal from '../components/ReportPreviewModal';
 
 const Reports = () => {
   const [reports, setReports] = useState([]);
@@ -14,7 +15,8 @@ const Reports = () => {
   const [loading, setLoading] = useState(true);
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState(null);
-  
+  const [previewReportId, setPreviewReportId] = useState(null);
+
   // Modals
   const [showGenerateModal, setShowGenerateModal] = useState(false);
   const [showUploadModal, setShowUploadModal] = useState(false);
@@ -487,10 +489,19 @@ const Reports = () => {
                       </td>
                       <td>
                         <Button
+                          variant="outline-secondary"
+                          size="sm"
+                          className="me-2"
+                          onClick={() => setPreviewReportId(report.id)}
+                        >
+                          <i className="bi bi-eye me-1"></i>
+                          Preview
+                        </Button>
+                        <Button
                           variant="outline-success"
                           size="sm"
-                          onClick={() => handleDownloadReport(report.id, 
-                            report.parameters?.campaign_name || 
+                          onClick={() => handleDownloadReport(report.id,
+                            report.parameters?.campaign_name ||
                             (report.report_type === 'campaign_analysis' ? 'Campaign_Report' : 'Report'))}
                         >
                           <i className="bi bi-download me-1"></i>
@@ -726,6 +737,12 @@ const Reports = () => {
           </Button>
         </Modal.Footer>
       </Modal>
+
+      <ReportPreviewModal
+        show={!!previewReportId}
+        onHide={() => setPreviewReportId(null)}
+        reportId={previewReportId}
+      />
     </div>
   );
 };

@@ -18,15 +18,43 @@ from dotenv import load_dotenv
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# Loads backend/.env if present (gitignored). Real credentials never live in
-# this file — see backend/.env.example for the variables it can set.
+# Loads backend/.env if present (gitignored) for LOCAL dev only — on Render
+# there is no .env file (never committed — see .gitignore), so every value
+# below comes from real environment variables set in the Render dashboard/
+# render.yaml instead. load_dotenv() is a no-op when the file is absent, so
+# this line is safe to leave in for both environments.
 load_dotenv(BASE_DIR / '.env')
 
-SECRET_KEY = 'django-insecure-your-secret-key-change-in-production'
 
-DEBUG = True
+def _env_bool(name, default=False):
+    return os.environ.get(name, str(default)).strip().lower() in ('1', 'true', 'yes', 'on')
 
-ALLOWED_HOSTS = ['localhost', '127.0.0.1', '192.168.1.*']
+
+# Falls back to an insecure placeholder ONLY so `manage.py runserver` keeps
+# working out of the box for local dev without an .env file. Render's
+# render.yaml generates a real random SECRET_KEY at deploy time (see
+# `generateValue: true` there) — production never actually uses this
+# fallback as long as that env var is set, but there's no hard check
+# enforcing that, so double-check SECRET_KEY is actually set on any real
+# deployment rather than trusting this silently.
+SECRET_KEY = os.environ.get('SECRET_KEY', 'django-insecure-your-secret-key-change-in-production')
+
+# Defaults True (unchanged local-dev behaviour) — Render's render.yaml sets
+# DEBUG=False explicitly for the deployed service. Also gates a couple of
+# other prod-only settings below (media serving, HTTPS proxy header).
+DEBUG = _env_bool('DEBUG', True)
+
+# Comma-separated in the env var, e.g. "myapp.onrender.com,www.example.com" —
+# falls back to the original local-dev-only list when unset. Render also
+# auto-injects RENDER_EXTERNAL_HOSTNAME (this service's own *.onrender.com
+# domain) as a real env var at runtime; appended automatically below so it
+# doesn't also need to be duplicated into ALLOWED_HOSTS by hand.
+_allowed_hosts_env = os.environ.get('ALLOWED_HOSTS', '')
+ALLOWED_HOSTS = [h.strip() for h in _allowed_hosts_env.split(',') if h.strip()] \
+    or ['localhost', '127.0.0.1', '192.168.1.*']
+_render_host = os.environ.get('RENDER_EXTERNAL_HOSTNAME')
+if _render_host and _render_host not in ALLOWED_HOSTS:
+    ALLOWED_HOSTS.append(_render_host)
 
 # Application definition
 INSTALLED_APPS = [
@@ -49,6 +77,12 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
+    # Serves STATIC_ROOT (admin CSS, DRF browsable-API assets) directly from
+    # the Django process — Render's Python web service has no separate
+    # static file server in front of it, so without this, admin/DRF pages
+    # would come back unstyled in production. Harmless locally too (DEBUG
+    # mode's staticfiles app already serves static files a different way).
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -56,6 +90,11 @@ MIDDLEWARE = [
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
+
+# Render terminates TLS at its edge proxy and forwards plain HTTP internally
+# — without this, Django can't tell the original request was HTTPS, which
+# breaks secure-cookie/CSRF-origin checks and can cause redirect loops.
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
 ROOT_URLCONF = 'backend.urls'
 
@@ -78,20 +117,53 @@ TEMPLATES = [
 WSGI_APPLICATION = 'backend.wsgi.application'
 
 # Database
-# 'timeout' is a safety net for writer-vs-writer contention (e.g. two syncs
-# at once) — SQLite's default is 5s, too short for a QA cache sync that can
-# run 60-90s. WAL mode (enabled once on the db file, see qa_source.py /
-# manage.py note) means plain reads don't block on a writer at all, so this
-# timeout should rarely if ever actually be hit.
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
-        'OPTIONS': {
-            'timeout': 30,
-        },
+# On Render, DATABASE_URL is set automatically once a Postgres instance is
+# attached (see render.yaml's `fromDatabase` reference) and takes over
+# entirely — this app's OWN data (ProcessedData, GeneratedReport, etc., NOT
+# the external call-centre source DB, which is separate — see EXTERNAL_DB
+# below) then lives in that Postgres instance instead of SQLite.
+#
+# This matters more than it might look: Render's web services have an
+# EPHEMERAL filesystem — anything written to disk (including a SQLite file)
+# is wiped on every deploy/restart. Running this app against SQLite on
+# Render would silently lose every synced campaign and generated report the
+# moment the service restarts. Postgres (a separate managed instance,
+# unaffected by the web service's own restarts) is the only one of the two
+# that actually persists in that environment.
+#
+# Falls back to SQLite when DATABASE_URL is unset (unchanged local-dev
+# behaviour — nobody needs a local Postgres just to run this app). 'timeout'
+# there is a safety net for writer-vs-writer contention (e.g. two syncs at
+# once) — SQLite's default is 5s, too short for a QA cache sync that can run
+# 60-90s. WAL mode (enabled once on the db file, see qa_source.py / manage.py
+# note) means plain reads don't block on a writer at all, so this timeout
+# should rarely if ever actually be hit. conn_max_age on the Postgres side
+# is a related but separate concern (persistent connections instead of one
+# per request) — 0 to match Django's traditional per-request default, since
+# this app hasn't been verified safe with long-lived pooled connections
+# (e.g. the external-DB sync code path holds its own separate psycopg2
+# connections for long stretches; untested whether Django's own ORM
+# connection needs to do the same).
+_database_url = os.environ.get('DATABASE_URL')
+if _database_url:
+    import dj_database_url
+    DATABASES = {
+        'default': dj_database_url.config(
+            default=_database_url,
+            conn_max_age=0,
+            ssl_require=not DEBUG,
+        )
     }
-}
+else:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
+            'OPTIONS': {
+                'timeout': 30,
+            },
+        }
+    }
 
 # Password validation
 AUTH_PASSWORD_VALIDATORS = [
@@ -119,7 +191,28 @@ USE_TZ = True
 STATIC_URL = 'static/'
 STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
 
-# Media files
+# Django 6 dropped the old STATICFILES_STORAGE setting in favour of this
+# STORAGES dict (STATICFILES_STORAGE alone is silently ignored on this
+# version, not just deprecated). CompressedManifestStaticFilesStorage is
+# WhiteNoise's variant — content-hashed, gzip'd filenames for cache-busting
+# — paired with the WhiteNoiseMiddleware above. `collectstatic` (part of
+# build.sh) must run for this to have anything to serve.
+STORAGES = {
+    'default': {
+        'BACKEND': 'django.core.files.storage.FileSystemStorage',
+    },
+    'staticfiles': {
+        'BACKEND': 'whitenoise.storage.CompressedManifestStaticFilesStorage',
+    },
+}
+
+# Media files (uploaded CSVs, generated report .xlsx files — see
+# CallDataFile.file / GeneratedReport.file). MEDIA_ROOT is only served at
+# all when DEBUG (below in urls.py) unless a persistent disk is mounted
+# here on Render — see render.yaml's `disk:` block on the backend service
+# and that file's own comment for why this needs a disk specifically (the
+# same ephemeral-filesystem problem DATABASES' comment above describes,
+# but for report/upload files instead of the database).
 MEDIA_URL = '/media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 
@@ -143,7 +236,11 @@ REST_FRAMEWORK = {
 }
 
 # CORS settings
-CORS_ALLOWED_ORIGINS = [
+# Comma-separated in the env var, e.g.
+# "https://call-centre-frontend.onrender.com,https://reports.example.com" —
+# falls back to the original local-dev CRA origins when unset.
+_cors_origins_env = os.environ.get('CORS_ALLOWED_ORIGINS', '')
+CORS_ALLOWED_ORIGINS = [o.strip() for o in _cors_origins_env.split(',') if o.strip()] or [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
 ]
@@ -156,6 +253,14 @@ CORS_ALLOW_ALL_ORIGINS = DEBUG  # Allow all in development
 # comes from this header, so without it every export falls back to the
 # generic default name instead of the campaign-specific one.
 CORS_EXPOSE_HEADERS = ['Content-Disposition']
+
+# Django's own cross-origin POST protection (separate from, and in addition
+# to, CORS above) — required from Django 4+ for the frontend's own POSTs
+# (login, sync, uploads, ...) to be accepted at all once served from a real
+# https:// domain instead of localhost. Reuses the same origin list rather
+# than a second env var, since in practice this app's CSRF-trusted origins
+# and CORS-allowed origins are the same frontend domain(s).
+CSRF_TRUSTED_ORIGINS = [o for o in CORS_ALLOWED_ORIGINS if o.startswith('http')]
 
 # File upload settings
 DATA_UPLOAD_MAX_MEMORY_SIZE = 10485760  # 10MB
@@ -172,3 +277,19 @@ EXTERNAL_DB = {
     'USER': os.environ.get('SOURCE_DB_USER', ''),
     'PASSWORD': os.environ.get('SOURCE_DB_PASSWORD', ''),
 }
+
+# Production-only hardening (`manage.py check --deploy` flags all of these
+# when unset) — gated behind `not DEBUG` rather than applied unconditionally
+# so local http://localhost:8000 dev still works without a certificate.
+# This app handles real PII (contact ID numbers, names, phone numbers — see
+# ProcessedData.id_number) end to end, so these aren't just checklist
+# items: an intercepted session/CSRF cookie or a downgraded HTTP connection
+# here is a real exposure of that data, not an abstract risk.
+if not DEBUG:
+    SECURE_SSL_REDIRECT = True
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    # 1 year, the conventional starting point once a site is HTTPS-only —
+    # not enabled with includeSubDomains/preload since this app doesn't
+    # control every subdomain of its deployed domain.
+    SECURE_HSTS_SECONDS = 31536000

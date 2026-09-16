@@ -5,8 +5,11 @@ import axios from 'axios';
 // Create the context
 const AuthContext = createContext({});
 
-// API Base URL
-const API_BASE_URL = 'http://localhost:8000';
+// API Base URL — see apiConfig.js's identical fallback for why: CRA bakes
+// REACT_APP_* env vars in at build time, Render's render.yaml sets this to
+// the deployed backend's URL for the frontend build step, and it falls
+// back to localhost so local `npm start` needs no env var at all.
+const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
 
 export const useAuth = () => useContext(AuthContext);
 
@@ -117,7 +120,7 @@ export const AuthProvider = ({ children }) => {
       '1. Backend is not running\n' +
       '2. URL endpoint is incorrect\n' +
       '3. Test user does not exist\n\n' +
-      'Try: http://localhost:8000/setup-test-user/ to create test user';
+      `Try: ${API_BASE_URL}/setup-test-user/ to create test user`;
     
     setAuthError(errorMessage);
     setIsLoading(false);

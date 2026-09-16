@@ -1,8 +1,12 @@
 // src/services/apiConfig.js - COMPLETE UPDATED VERSION
 import axios from 'axios';
 
-// Base URL for your Django API
-const API_BASE_URL = 'http://localhost:8000';
+// Base URL for your Django API. CRA bakes REACT_APP_* env vars into the
+// build at BUILD time (not read at runtime) — Render's render.yaml sets
+// REACT_APP_API_URL to the deployed backend's URL for the frontend's build
+// step. Falls back to localhost so local `npm start` keeps working
+// unchanged with no env var needed.
+const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
 
 // Create axios instance
 const api = axios.create({

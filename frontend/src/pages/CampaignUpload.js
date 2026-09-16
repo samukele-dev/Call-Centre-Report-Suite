@@ -1,22 +1,19 @@
 // src/pages/CampaignUpload.js - COMPLETE WORKING VERSION
 import React, { useState, useEffect } from 'react';
 import {
-  Card, Button, Alert, Spinner, ProgressBar,
-  Form, Row, Col, Badge, Accordion, Table, Dropdown
+  Card, Button, Alert, Spinner,
+  Form, Row, Col, Dropdown
 } from 'react-bootstrap';
 import { useParams, Link } from 'react-router-dom';
 import { saveAs } from 'file-saver';
 import DashboardService from '../api/dashboardService';
+import { REPORT_SHEETS, ALL_REPORT_SHEET_KEYS, toggleReportSheet, FULL_OUTCOME_HISTORY_OPTION } from '../utils/reportSheets';
+import ReportPreviewModal from '../components/ReportPreviewModal';
 
 const CampaignUpload = () => {
   const { id } = useParams();
   const [campaign, setCampaign] = useState(null);
-  const [file, setFile] = useState(null);
-  const [uploading, setUploading] = useState(false);
-  const [uploadProgress, setUploadProgress] = useState(0);
   const [message, setMessage] = useState(null);
-  const [delimiter, setDelimiter] = useState(',');
-  const [hasHeaders, setHasHeaders] = useState(true);
   const [debugInfo, setDebugInfo] = useState(null);
   const [syncing, setSyncing] = useState(false);
   const [syncStartDate, setSyncStartDate] = useState('');
@@ -24,11 +21,15 @@ const CampaignUpload = () => {
   const [syncStartTime, setSyncStartTime] = useState('');
   const [syncEndTime, setSyncEndTime] = useState('');
   const [latestReport, setLatestReport] = useState(null);
+  const [reportGenerationMissing, setReportGenerationMissing] = useState(false);
   const [downloadingReport, setDownloadingReport] = useState(false);
   const [sourceLists, setSourceLists] = useState([]);
   const [loadingLists, setLoadingLists] = useState(false);
   const [listsError, setListsError] = useState(null);
   const [selectedListIds, setSelectedListIds] = useState([]);
+  const [syncSheets, setSyncSheets] = useState(ALL_REPORT_SHEET_KEYS);
+  const [syncFullOutcomeHistory, setSyncFullOutcomeHistory] = useState(false);
+  const [showPreview, setShowPreview] = useState(false);
 
   useEffect(() => {
     fetchCampaign();
@@ -73,6 +74,10 @@ const CampaignUpload = () => {
     setSelectedListIds(allListsSelected ? [] : sourceLists.map(l => l.id));
   };
 
+  const toggleSyncSheet = (key) => {
+    setSyncSheets(prev => toggleReportSheet(prev, key));
+  };
+
   const fetchCampaign = async () => {
     try {
       const result = await DashboardService.getCampaign(id);
@@ -92,80 +97,6 @@ const CampaignUpload = () => {
     }
   };
 
-  const handleFileUpload = async (e) => {
-    e.preventDefault();
-    if (!file) {
-      alert('Please select a file');
-      return;
-    }
-
-    setUploading(true);
-    setUploadProgress(10);
-    setMessage(null);
-    setDebugInfo(null);
-
-    const interval = setInterval(() => {
-      setUploadProgress(prev => {
-        if (prev >= 90) {
-          clearInterval(interval);
-          return prev;
-        }
-        return prev + 10;
-      });
-    }, 300);
-
-    try {
-      const result = await DashboardService.uploadCallDataFile(
-        file,
-        campaign.id,
-        delimiter,
-        hasHeaders
-      );
-
-      clearInterval(interval);
-      setUploadProgress(100);
-
-      if (result.success) {
-        setMessage({
-          type: 'success',
-          text: `File uploaded successfully for ${campaign.display_name}! Processing has started.`
-        });
-
-        setDebugInfo({
-          fileName: file.name,
-          fileSize: file.size,
-          totalRecords: result.data.total_records || 0,
-          processedRecords: result.data.processed_records || 0,
-          message: result.data.message || 'Processing completed'
-        });
-        
-        setTimeout(() => {
-          setUploading(false);
-          setUploadProgress(0);
-          setFile(null);
-          const fileInput = document.getElementById('campaignFile');
-          if (fileInput) fileInput.value = '';
-        }, 2000);
-      } else {
-        setMessage({
-          type: 'danger',
-          text: `Upload failed: ${typeof result.error === 'object' ? JSON.stringify(result.error) : result.error}`
-        });
-        setUploading(false);
-        setUploadProgress(0);
-      }
-    } catch (error) {
-      clearInterval(interval);
-      setMessage({
-        type: 'danger',
-        text: `Upload error: ${error.message}`
-      });
-      console.error('❌ Upload error details:', error);
-      setUploading(false);
-      setUploadProgress(0);
-    }
-  };
-
   const handleSyncFromDatabase = async () => {
     if (syncStartDate && syncEndDate) {
       const from = `${syncStartDate} ${syncStartTime || '00:00'}`;
@@ -180,6 +111,7 @@ const CampaignUpload = () => {
     setMessage(null);
     setDebugInfo(null);
     setLatestReport(null);
+    setReportGenerationMissing(false);
 
     try {
       const result = await DashboardService.syncCampaignFromDatabase(
@@ -188,7 +120,9 @@ const CampaignUpload = () => {
         syncEndDate || null,
         selectedListIds,
         syncStartTime || null,
-        syncEndTime || null
+        syncEndTime || null,
+        syncSheets,
+        syncFullOutcomeHistory
       );
 
       if (result.success) {
@@ -214,15 +148,32 @@ const CampaignUpload = () => {
           // The auto-report is generated synchronously as part of the sync
           // itself, so it already exists by the time we get here — surface
           // it right away instead of making the user go find it on Reports.
+          // But generation can still silently fail/not run (e.g. the dev
+          // server restarting mid-build) while the sync itself still shows
+          // as successful, so don't just grab whatever report happens to be
+          // newest for this campaign — confirm it was actually built from
+          // *this* sync's file (parameters.source_file, set in
+          // ReportViewSet._auto_generate_full_report) before offering it.
+          // Otherwise a stale report from an earlier sync would silently be
+          // shown as if it reflected this one.
           const reportsResult = await DashboardService.getReports(campaign.id);
-          if (reportsResult.success && reportsResult.data?.length > 0) {
-            setLatestReport(reportsResult.data[0]);
+          const candidate = reportsResult.success ? reportsResult.data?.[0] : null;
+          if (candidate && candidate.parameters?.source_file === file.original_name) {
+            setLatestReport(candidate);
+          } else {
+            setReportGenerationMissing(true);
           }
         }
       } else {
+        // result.error already comes fully worded from the backend (either
+        // the raw ExternalSourceError message, or "Database sync failed:
+        // <detail>" for an unexpected error — see sync_from_database's
+        // except Exception branch) — prefixing it again here is what
+        // produced the doubled "Database sync failed: Database sync
+        // failed: ..." text.
         setMessage({
           type: 'danger',
-          text: `Database sync failed: ${typeof result.error === 'object' ? JSON.stringify(result.error) : result.error}`
+          text: typeof result.error === 'object' ? JSON.stringify(result.error) : result.error
         });
       }
     } catch (error) {
@@ -260,10 +211,6 @@ const CampaignUpload = () => {
     const sizes = ['Bytes', 'KB', 'MB', 'GB'];
     const i = Math.floor(Math.log(bytes) / Math.log(k));
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-  };
-
-  const isCSVFile = (fileName) => {
-    return fileName?.toLowerCase().endsWith('.csv');
   };
 
   if (!campaign) {
@@ -327,24 +274,42 @@ const CampaignUpload = () => {
               )}
 
               {latestReport && (
-                <Button
-                  variant="primary"
-                  className="mt-3"
-                  onClick={handleDownloadLatestReport}
-                  disabled={downloadingReport}
-                >
-                  {downloadingReport ? (
-                    <>
-                      <span className="spinner-border spinner-border-sm me-2"></span>
-                      Downloading...
-                    </>
-                  ) : (
-                    <>
-                      <i className="bi bi-file-earmark-arrow-down me-2"></i>
-                      Download Report
-                    </>
-                  )}
-                </Button>
+                <>
+                  <Button
+                    variant="outline-secondary"
+                    className="mt-3 me-2"
+                    onClick={() => setShowPreview(true)}
+                  >
+                    <i className="bi bi-eye me-2"></i>
+                    Preview
+                  </Button>
+                  <Button
+                    variant="primary"
+                    className="mt-3"
+                    onClick={handleDownloadLatestReport}
+                    disabled={downloadingReport}
+                  >
+                    {downloadingReport ? (
+                      <>
+                        <span className="spinner-border spinner-border-sm me-2"></span>
+                        Downloading...
+                      </>
+                    ) : (
+                      <>
+                        <i className="bi bi-file-earmark-arrow-down me-2"></i>
+                        Download Report
+                      </>
+                    )}
+                  </Button>
+                </>
+              )}
+
+              {reportGenerationMissing && (
+                <Alert variant="warning" className="mt-3 mb-0 py-2">
+                  <i className="bi bi-exclamation-triangle me-2"></i>
+                  Data synced, but the report didn't finish generating. Go to{' '}
+                  <Link to={`/campaigns/${id}/reports`}>Reports</Link> to build it.
+                </Alert>
               )}
             </>
           )}
@@ -367,7 +332,7 @@ const CampaignUpload = () => {
               <p className="text-muted mb-3">
                 Pulls call data straight from the call-centre database
                 (campaign <code>{campaign.cd_campaign_id}</code>, across every list it has ever
-                had) and processes it the same way an uploaded file would be.
+                had) and processes it into this campaign's report.
               </p>
 
               <Form.Group className="mb-3">
@@ -503,11 +468,60 @@ const CampaignUpload = () => {
                 Filters by interaction date (when the call happened), on top of the batch selection above. Time is optional and narrows the from/to date to a specific moment. Leave everything blank for no date limit.
               </Form.Text>
 
+              <div className="modal-section">
+                <div className="modal-section-title">Sheets to include in the report</div>
+                <p className="text-muted small mb-3">
+                  The full report is generated automatically once the sync finishes — pick which
+                  sheets it should build. Skipping Agent Performance/Call Count Breakdown also
+                  skips their (slower) database queries.
+                </p>
+                <Row>
+                  {REPORT_SHEETS.map(sheet => {
+                    const dbUnavailable = sheet.dbOnly && !campaign?.cd_campaign_id;
+                    const locked = (sheet.key === 'pivot' || sheet.key === 'lead_count') &&
+                      (syncSheets.includes('campaign_analysis') || syncSheets.includes('template'));
+                    return (
+                      <Col md={6} key={sheet.key}>
+                        <Form.Check
+                          type="checkbox"
+                          id={`sync-sheet-${sheet.key}`}
+                          className="mb-2"
+                          disabled={syncing || dbUnavailable || locked}
+                          checked={syncSheets.includes(sheet.key)}
+                          onChange={() => toggleSyncSheet(sheet.key)}
+                          label={
+                            <span>
+                              <strong>{sheet.label}</strong> – {sheet.description}
+                              {locked && <span className="text-muted"> (required by Campaign Analysis/Template)</span>}
+                              {dbUnavailable && <span className="text-muted"> (requires a Source Database Campaign ID)</span>}
+                            </span>
+                          }
+                        />
+                      </Col>
+                    );
+                  })}
+                </Row>
+                <hr className="my-2" />
+                <Form.Check
+                  type="checkbox"
+                  id="sync-full-outcome-history"
+                  disabled={syncing || !campaign?.cd_campaign_id}
+                  checked={syncFullOutcomeHistory}
+                  onChange={(e) => setSyncFullOutcomeHistory(e.target.checked)}
+                  label={
+                    <span>
+                      <strong>{FULL_OUTCOME_HISTORY_OPTION.label}</strong> – {FULL_OUTCOME_HISTORY_OPTION.description}
+                      <span className="text-muted"> (slower — a full database scan)</span>
+                    </span>
+                  }
+                />
+              </div>
+
               <Button
                 variant="primary"
                 size="lg"
                 onClick={handleSyncFromDatabase}
-                disabled={syncing || uploading}
+                disabled={syncing || syncSheets.length === 0}
               >
                 {syncing ? (
                   <>
@@ -532,167 +546,11 @@ const CampaignUpload = () => {
         </Card.Body>
       </Card>
 
-      <Card className="section-card">
-        <Card.Header>
-          <div className="section-card-title">
-            <span className="section-card-icon section-card-icon-neutral"><i className="bi bi-upload"></i></span>
-            <div>
-              <h5 className="mb-0">Upload a File</h5>
-              <span className="section-card-subtitle">CSV or Excel, processed the same way as a database sync</span>
-            </div>
-          </div>
-        </Card.Header>
-        <Card.Body>
-          <div className="upload-steps mb-4">
-            <div className="upload-step">
-              <span className="upload-step-num">1</span>
-              <span>Upload your file</span>
-            </div>
-            <div className="upload-step">
-              <span className="upload-step-num">2</span>
-              <span>Match outcomes to descriptions</span>
-            </div>
-            <div className="upload-step">
-              <span className="upload-step-num">3</span>
-              <span>Add a Description column</span>
-            </div>
-            <div className="upload-step">
-              <span className="upload-step-num">4</span>
-              <span>Save &amp; generate report</span>
-            </div>
-          </div>
-
-          <form onSubmit={handleFileUpload}>
-            <Form.Group className="mb-3">
-              <Form.Label>Select File for {campaign.display_name}</Form.Label>
-              <Form.Control
-                type="file"
-                id="campaignFile"
-                accept=".csv,.xlsx,.xls"
-                onChange={(e) => {
-                  const selectedFile = e.target.files[0];
-                  setFile(selectedFile);
-                  if (selectedFile && isCSVFile(selectedFile.name)) {
-                    setDelimiter(',');
-                  }
-                }}
-                disabled={uploading}
-              />
-              <Form.Text className="text-muted">
-                Upload CSV or Excel files for this campaign
-              </Form.Text>
-            </Form.Group>
-
-            <Accordion className="mb-3">
-              <Accordion.Item eventKey="0">
-                <Accordion.Header>
-                  <i className="bi bi-list-columns me-2"></i>
-                  Expected File Format
-                </Accordion.Header>
-                <Accordion.Body>
-                  <p>Your file must have a <code>last_outcome</code> column:</p>
-                  <div className="table-responsive">
-                    <Table striped bordered size="sm">
-                      <thead>
-                        <tr>
-                          <th>Column Name</th>
-                          <th>Required</th>
-                          <th>Description</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        <tr>
-                          <td><code>contact_id</code></td>
-                          <td><Badge bg="danger">Required</Badge></td>
-                          <td>Unique identifier for each contact</td>
-                        </tr>
-                        <tr>
-                          <td><code>last_outcome</code></td>
-                          <td><Badge bg="danger">Required</Badge></td>
-                          <td>Abbreviations like "CB", "SALE", "AM"</td>
-                        </tr>
-                        <tr>
-                          <td><code>Description</code></td>
-                          <td><Badge bg="info">Auto-added</Badge></td>
-                          <td>Will be added automatically after processing</td>
-                        </tr>
-                      </tbody>
-                    </Table>
-                  </div>
-                </Accordion.Body>
-              </Accordion.Item>
-            </Accordion>
-
-            <Row>
-              <Col md={6}>
-                <Form.Group className="mb-3">
-                  <Form.Label>Delimiter (for CSV)</Form.Label>
-                  <Form.Select
-                    value={delimiter}
-                    onChange={(e) => setDelimiter(e.target.value)}
-                    disabled={uploading}
-                  >
-                    <option value=",">Comma (,) - Standard CSV</option>
-                    <option value=";">Semicolon (;)</option>
-                    <option value="\t">Tab (\t) - TSV files</option>
-                    <option value="|">Pipe (|)</option>
-                  </Form.Select>
-                </Form.Group>
-              </Col>
-              <Col md={6}>
-                <Form.Group className="mb-3">
-                  <Form.Label>First Row Headers</Form.Label>
-                  <Form.Check
-                    type="switch"
-                    id="headers-switch"
-                    label={hasHeaders ? "Yes, first row has column names" : "No, first row is data"}
-                    checked={hasHeaders}
-                    onChange={(e) => setHasHeaders(e.target.checked)}
-                    disabled={uploading}
-                  />
-                </Form.Group>
-              </Col>
-            </Row>
-
-            {uploading && (
-              <div className="mb-3">
-                <div className="d-flex justify-content-between mb-1">
-                  <small>
-                    <i className="bi bi-hourglass-split me-1"></i>
-                    Uploading and processing...
-                  </small>
-                  <small>{uploadProgress}%</small>
-                </div>
-                <ProgressBar
-                  now={uploadProgress}
-                  animated
-                  variant="primary"
-                />
-              </div>
-            )}
-
-            <Button
-              type="submit"
-              variant="primary"
-              size="lg"
-              disabled={uploading || !file}
-              className="w-100"
-            >
-              {uploading ? (
-                <>
-                  <span className="spinner-border spinner-border-sm me-2"></span>
-                  Processing File...
-                </>
-              ) : (
-                <>
-                  <i className="bi bi-upload me-2"></i>
-                  Upload & Process File
-                </>
-              )}
-            </Button>
-          </form>
-        </Card.Body>
-      </Card>
+      <ReportPreviewModal
+        show={showPreview}
+        onHide={() => setShowPreview(false)}
+        reportId={latestReport?.id}
+      />
     </div>
   );
 };

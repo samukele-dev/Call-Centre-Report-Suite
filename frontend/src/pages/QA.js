@@ -1,6 +1,7 @@
 // src/pages/QA.js
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Form, Dropdown, Spinner, Alert } from 'react-bootstrap';
+import { saveAs } from 'file-saver';
 import DashboardService from '../api/dashboardService';
 
 const PAGE_SIZE = 50;
@@ -28,6 +29,7 @@ const QA = () => {
   const [stopping, setStopping] = useState(false);
   const [syncMessage, setSyncMessage] = useState(null);
   const [error, setError] = useState(null);
+  const [downloading, setDownloading] = useState(false);
   const syncAbortRef = useRef(null);
   const stopRequestedRef = useRef(false);
   const syncInFlightRef = useRef(false);
@@ -140,7 +142,13 @@ const QA = () => {
 
       const controller = new AbortController();
       syncAbortRef.current = controller;
-      const result = await DashboardService.syncQACache([campaignId], controller.signal);
+      // Sync scope matches whatever the page's own date filter is
+      // currently set to (defaults to the last 7 days on load) — reporting.
+      // interaction_voice has no campaign index, so an unbounded sync would
+      // be slow; widening the filter and re-syncing pulls more history.
+      const result = await DashboardService.syncQACache([campaignId], controller.signal, {
+        startDate, endDate, startTime, endTime,
+      });
       syncAbortRef.current = null;
 
       if (result.aborted) break;
@@ -182,6 +190,35 @@ const QA = () => {
     setStopping(true);
     if (syncAbortRef.current) {
       syncAbortRef.current.abort();
+    }
+  };
+
+  // Downloads every record matching the current filters (campaigns,
+  // outcomes, date range) as one .xlsx file — not just the current 50-row
+  // page shown on screen.
+  const handleDownload = async () => {
+    if (selectedCampaignIds.length === 0 || downloading) return;
+    setDownloading(true);
+    setError(null);
+    try {
+      const result = await DashboardService.downloadQARecords({
+        campaignIds: selectedCampaignIds,
+        startDate: startDate || null,
+        endDate: endDate || null,
+        startTime: startTime || null,
+        endTime: endTime || null,
+        outcomes: selectedOutcomes,
+      });
+      if (result.success) {
+        const timestamp = new Date().toISOString().slice(0, 10);
+        saveAs(result.data, `QA_Records_${timestamp}.xlsx`);
+      } else {
+        setError(typeof result.error === 'object' ? JSON.stringify(result.error) : result.error);
+      }
+    } catch (err) {
+      setError('Error downloading QA records');
+    } finally {
+      setDownloading(false);
     }
   };
 
@@ -443,6 +480,18 @@ const QA = () => {
               <i className="bi bi-arrow-repeat me-1"></i>Sync Now
             </button>
           )}
+          <button
+            className="btn btn-sm btn-primary"
+            onClick={handleDownload}
+            disabled={downloading || totalCount === 0}
+            title={totalCount === 0 ? 'No records match the current filters' : 'Download every matching record as .xlsx'}
+          >
+            {downloading ? (
+              <><span className="spinner-border spinner-border-sm me-1"></span>Downloading...</>
+            ) : (
+              <><i className="bi bi-download me-1"></i>Download ({totalCount.toLocaleString()})</>
+            )}
+          </button>
         </div>
       )}
 

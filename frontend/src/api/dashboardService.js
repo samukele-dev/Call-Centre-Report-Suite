@@ -150,6 +150,35 @@ class DashboardService {
     }
   }
 
+  static async downloadQARecords({ campaignIds = [], startDate = null, endDate = null, startTime = null, endTime = null, outcomes = [], search = null } = {}) {
+    try {
+      const api = await DashboardService._api();
+      const params = { campaign_ids: campaignIds.join(',') };
+      if (startDate) params.start_date = startDate;
+      if (endDate) params.end_date = endDate;
+      if (startDate && startTime) params.start_time = startTime;
+      if (endDate && endTime) params.end_time = endTime;
+      if (outcomes.length > 0) params.outcomes = outcomes.join(',');
+      if (search) params.search = search;
+
+      const response = await api.get('/api/qa/download/', { params, responseType: 'blob' });
+
+      if (response.data instanceof Blob && response.data.type === 'application/json') {
+        const text = await response.data.text();
+        try {
+          const errorData = JSON.parse(text);
+          return { success: false, error: errorData.error || 'No records match these filters.' };
+        } catch {
+          return { success: false, error: 'Error downloading QA records' };
+        }
+      }
+
+      return { success: true, data: response.data };
+    } catch (error) {
+      return { success: false, error: error.response?.data?.error || error.response?.data || 'Failed to download QA records' };
+    }
+  }
+
   static async getQAOutcomes(campaignIds = []) {
     try {
       const api = await DashboardService._api();
@@ -160,12 +189,19 @@ class DashboardService {
     }
   }
 
-  static async syncQACache(campaignIds = [], signal = null) {
+  static async syncQACache(campaignIds = [], signal = null, dateRange = {}) {
     try {
+      const { startDate = null, endDate = null, startTime = null, endTime = null } = dateRange;
       const api = await DashboardService._api();
       const response = await api.post(
         '/api/qa/sync/',
-        { campaign_ids: campaignIds },
+        {
+          campaign_ids: campaignIds,
+          start_date: startDate || undefined,
+          end_date: endDate || undefined,
+          start_time: startDate && startTime ? startTime : undefined,
+          end_time: endDate && endTime ? endTime : undefined,
+        },
         signal ? { signal } : undefined
       );
       return { success: true, data: response.data };
@@ -271,7 +307,7 @@ class DashboardService {
     }
   }
 
-  static async syncCampaignFromDatabase(campaignId, startDate = null, endDate = null, listIds = null, startTime = null, endTime = null) {
+  static async syncCampaignFromDatabase(campaignId, startDate = null, endDate = null, listIds = null, startTime = null, endTime = null, sheets = null, fullOutcomeHistory = false, autoGenerateReport = true) {
     try {
       const api = await DashboardService._api();
       const response = await api.post(`/api/campaigns/${campaignId}/sync_from_database/`, {
@@ -280,6 +316,14 @@ class DashboardService {
         start_time: startDate && startTime ? startTime : undefined,
         end_time: endDate && endTime ? endTime : undefined,
         list_ids: listIds && listIds.length > 0 ? listIds : undefined,
+        sheets: sheets && sheets.length > 0 ? sheets : undefined,
+        full_outcome_history: fullOutcomeHistory || undefined,
+        // Default True on the backend too — only sent when a caller wants
+        // the fast, report-skipping sync (see external_source.
+        // sync_campaign_from_database's docstring). Omitted rather than
+        // sent as `true` so existing callers that don't pass this at all
+        // are unaffected.
+        auto_generate_report: autoGenerateReport === false ? false : undefined,
       });
       return { success: true, data: response.data };
     } catch (error) {
@@ -488,7 +532,7 @@ class DashboardService {
 
   // ========== REPORTS ==========
 
-  static async generateCampaignReport(campaignId) {
+  static async generateCampaignReport(campaignId, sheets = null, fullOutcomeHistory = false) {
     try {
       if (!campaignId) {
         return { success: false, error: 'campaign_id is required to generate a report.' };
@@ -496,7 +540,9 @@ class DashboardService {
       console.log(`🚀 Generating campaign report for campaign ${campaignId}...`);
       const api = await DashboardService._api();
       const response = await api.post('/api/reports/generate_campaign/', {
-        campaign_id: campaignId
+        campaign_id: campaignId,
+        sheets: sheets && sheets.length > 0 ? sheets : undefined,
+        full_outcome_history: fullOutcomeHistory || undefined,
       });
       return { success: true, data: response.data };
     } catch (error) {
@@ -505,6 +551,41 @@ class DashboardService {
       return {
         success: false,
         error: errorData?.error || (typeof errorData === 'object' ? JSON.stringify(errorData) : errorData) || 'Failed to generate report',
+        status: error.response?.status,
+        details: errorData
+      };
+    }
+  }
+
+  static async generateCombinedReport(campaignIds, sheets = null, options = {}) {
+    try {
+      if (!campaignIds || campaignIds.length === 0) {
+        return { success: false, error: 'At least one campaign_id is required to generate a combined report.' };
+      }
+      const {
+        fileIds = null, startDate = null, endDate = null, startTime = null, endTime = null,
+        fullOutcomeHistory = false, syncMissing = true,
+      } = options;
+      console.log(`🚀 Generating combined report for ${campaignIds.length} campaigns...`);
+      const api = await DashboardService._api();
+      const response = await api.post('/api/reports/generate_combined/', {
+        campaign_ids: campaignIds,
+        sheets: sheets && sheets.length > 0 ? sheets : undefined,
+        file_ids: fileIds && fileIds.length > 0 ? fileIds : undefined,
+        start_date: startDate || undefined,
+        end_date: endDate || undefined,
+        start_time: startDate && startTime ? startTime : undefined,
+        end_time: endDate && endTime ? endTime : undefined,
+        full_outcome_history: fullOutcomeHistory || undefined,
+        sync_missing: syncMissing,
+      });
+      return { success: true, data: response.data };
+    } catch (error) {
+      console.error('generateCombinedReport error:', error);
+      const errorData = error.response?.data;
+      return {
+        success: false,
+        error: errorData?.error || (typeof errorData === 'object' ? JSON.stringify(errorData) : errorData) || 'Failed to generate combined report',
         status: error.response?.status,
         details: errorData
       };
@@ -573,6 +654,22 @@ class DashboardService {
       return {
         success: false,
         error: error.response?.data?.error || error.message || 'Failed to download report'
+      };
+    }
+  }
+
+  static async previewReport(reportId, sheet = null) {
+    try {
+      const api = await DashboardService._api();
+      const response = await api.get(`/api/reports/${reportId}/preview/`, {
+        params: sheet ? { sheet } : undefined
+      });
+      return { success: true, data: response.data.data };
+    } catch (error) {
+      console.error('Preview report error:', error);
+      return {
+        success: false,
+        error: error.response?.data?.error || error.message || 'Failed to preview report'
       };
     }
   }

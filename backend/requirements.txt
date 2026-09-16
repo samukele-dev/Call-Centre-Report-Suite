@@ -1,0 +1,32 @@
+# Generated from the actual working local environment (pip freeze), not
+# hand-maintained — the old backend/requirement.txt (note: misspelled,
+# never actually read by any tooling here) had drifted badly out of date
+# (Django 4.2.7 listed vs. 6.0.1 actually installed/running, django-rest-
+# knox installed but unused, etc.). Render's Python runtime looks for this
+# exact filename by default.
+asgiref==3.11.0
+Django==6.0.1
+django-cors-headers==4.9.0
+djangorestframework==3.16.1
+djangorestframework_simplejwt==5.5.1
+et_xmlfile==2.0.0
+numpy==2.4.1
+openpyxl==3.1.5
+pandas==3.0.0
+psycopg2-binary==2.9.12
+PyJWT==2.10.1
+python-dateutil==2.9.0.post0
+python-dotenv==1.0.1
+six==1.17.0
+sqlparse==0.5.5
+tzdata==2025.3
+xlsxwriter==3.2.9
+
+# Deployment-only additions (not needed for local `manage.py runserver`,
+# but harmless there too) — see backend/backend/settings.py and build.sh
+# for where each is used. gunicorn is POSIX-only (needs fcntl) — it won't
+# run on Windows, which is fine, since it's only ever invoked by Render's
+# Linux containers, never by a local `manage.py runserver`.
+gunicorn==26.2.0
+whitenoise==6.12.0
+dj-database-url==3.1.2

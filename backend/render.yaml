@@ -1,0 +1,107 @@
+# Render Blueprint for the BACKEND ONLY — deployed independently from
+# frontend/render.yaml (two separate Blueprints, two separate deploy
+# lifecycles, per your call). In the Render dashboard: New + > Blueprint,
+# point it at this repo, and set the Blueprint's YAML path to
+# "backend/render.yaml" (Render defaults to a root-level render.yaml —
+# this repo intentionally has none, so this path must be set explicitly).
+#
+# rootDir below is still "backend" even though this file already lives
+# inside backend/ — Render's docs describe rootDir as root-of-repo-relative
+# for path fields in general, and this file's own location doesn't appear
+# to implicitly change that, so this follows the same convention as before
+# rather than assuming otherwise. Not exhaustively confirmed against
+# Render's actual behavior for a non-root-level render.yaml specifically —
+# the dashboard shows a preview of what it resolved (service name, build
+# command, etc.) before you confirm the Blueprint, so double check the
+# build actually runs from backend/ there before finishing setup.
+#
+# Because this deploys independently from frontend/render.yaml, the two
+# can't reliably reference each other's resources the way a single
+# combined Blueprint could (e.g. `fromService`) — Render's docs don't
+# confirm cross-Blueprint references work at all, so this doesn't rely on
+# that: CORS_ALLOWED_ORIGINS below is `sync: false`, meaning you paste in
+# the frontend's real deployed URL by hand once you know it, rather than
+# this file guessing it.
+
+services:
+  - type: web
+    name: call-centre-backend
+    runtime: python
+    # "free" has no persistent disk — see the disk: block below for why
+    # that matters here. 0.5c-512mb is Render's smallest paid compute tier
+    # (current plan-naming scheme — the old "starter"/"standard" names are
+    # no longer valid); bump this if the app needs more than 512MB (a
+    # multi-hundred-thousand-row campaign sync loads its full DataFrame
+    # into memory — see external_source.py — so this may need raising for
+    # your largest real campaigns).
+    plan: 0.5c-512mb
+    rootDir: backend
+    buildCommand: "./build.sh"
+    startCommand: "gunicorn backend.wsgi:application --bind 0.0.0.0:$PORT"
+    healthCheckPath: /admin/login/
+    disk:
+      # Persists CallDataFile/GeneratedReport uploads across deploys and
+      # restarts — Render's web services otherwise have an EPHEMERAL
+      # filesystem, so without this, every generated report and uploaded
+      # file would vanish on the next deploy (see settings.py's MEDIA_ROOT
+      # comment). Not available on the free plan, which is why this
+      # Blueprint uses a paid plan above instead.
+      #
+      # mountPath: Render checks out the repo at /opt/render/project/src
+      # regardless of rootDir (rootDir only changes where build/start
+      # commands run FROM) — so this should line up with Django's actual
+      # MEDIA_ROOT (BASE_DIR/media, where BASE_DIR is backend/) once
+      # deployed. After the first deploy, confirm this path matches what's
+      # shown for this disk in the Render dashboard, and adjust if not.
+      name: call-centre-media
+      mountPath: /opt/render/project/src/backend/media
+      sizeGB: 1
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+      - key: DEBUG
+        value: "False"
+      - key: PYTHON_VERSION
+        value: "3.13.4"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: call-centre-db
+          property: connectionString
+      # Set this by hand in the Render dashboard once you know the
+      # frontend's real deployed URL (e.g.
+      # https://call-centre-frontend.onrender.com) — left unset here
+      # rather than guessed, since this Blueprint deploys independently of
+      # frontend/render.yaml and can't rely on referencing it directly.
+      # Without this set correctly, the browser will block every API call
+      # the deployed frontend makes to this backend (CORS).
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false
+      # The external call-centre source database this app pulls campaign
+      # data from (see backend/dashboard/external_source.py) — a real,
+      # separate, pre-existing system, NOT something this Blueprint
+      # creates. `sync: false` = Render prompts for each of these once in
+      # the dashboard rather than expecting a value here; nothing to fill
+      # in in this file itself.
+      - key: SOURCE_DB_HOST
+        sync: false
+      - key: SOURCE_DB_PORT
+        value: "5432"
+      - key: SOURCE_DB_NAME
+        sync: false
+      - key: SOURCE_DB_USER
+        sync: false
+      - key: SOURCE_DB_PASSWORD
+        sync: false
+
+databases:
+  # This app's OWN database (Campaign, ProcessedData, GeneratedReport,
+  # etc.) — NOT the external call-centre source DB (SOURCE_DB_* above),
+  # which is a completely separate, pre-existing system this app only
+  # reads from. See backend/backend/settings.py's DATABASES comment for
+  # why this needs to be Postgres rather than the SQLite this app uses
+  # locally (Render's web service filesystem is ephemeral; a managed
+  # Postgres instance like this one is not).
+  - name: call-centre-db
+    plan: free
+    databaseName: call_centre
+    user: call_centre_user

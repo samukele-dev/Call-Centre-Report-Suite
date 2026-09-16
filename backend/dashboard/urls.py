@@ -26,12 +26,14 @@ urlpatterns = [
     path('qa/records/', views.QARecordsView.as_view(), name='qa_records'),
     path('qa/outcomes/', views.QAOutcomesView.as_view(), name='qa_outcomes'),
     path('qa/sync/', views.QASyncView.as_view(), name='qa_sync'),
+    path('qa/download/', views.QADownloadView.as_view(), name='qa_download'),
 
     # REMOVE these custom report endpoints - they conflict with the router
     # The router already creates these endpoints automatically:
     # - /api/reports/ (GET) - list reports
     # - /api/reports/{pk}/ (GET) - retrieve report
     # - /api/reports/{pk}/download/ (GET) - download report (from @action)
+    # - /api/reports/{pk}/preview/ (GET) - preview report data (from @action)
     # - /api/reports/generate_main/ (POST) - generate main report (from @action)
     
     # Additional custom endpoints

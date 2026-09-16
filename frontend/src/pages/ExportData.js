@@ -153,7 +153,10 @@ const ExportData = () => {
         endDate || null,
         listIds.length > 0 ? listIds : null,
         startDate ? startTime : null,
-        endDate ? endTime : null
+        endDate ? endTime : null,
+        undefined,
+        undefined,
+        false // this page only needs the synced data for export, not a full report
       );
 
       if (result.success) {
