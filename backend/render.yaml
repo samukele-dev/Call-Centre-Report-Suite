@@ -72,7 +72,7 @@ services:
       # blocks every API call the deployed frontend makes to this backend
       # (CORS). Update this if the frontend ever moves to a different URL.
       - key: CORS_ALLOWED_ORIGINS
-        value: https://call-centre-report-suite.onrender.com
+        value: https://call-centre-frontend-qebf.onrender.com
       # The external call-centre source database this app pulls campaign
       # data from (see backend/dashboard/external_source.py) — a real,
       # separate, pre-existing system, NOT something this Blueprint
