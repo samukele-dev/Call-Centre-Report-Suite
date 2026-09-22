@@ -233,6 +233,26 @@ REST_FRAMEWORK = {
         'rest_framework.parsers.FormParser',
         'rest_framework.parsers.MultiPartParser',
     ],
+    # No rate limiting existed anywhere in this app before — every endpoint
+    # (including login) could be hit as fast as a script could send
+    # requests, with nothing to slow down a password-guessing attempt
+    # against a system that handles real PII. anon/user here are DRF's
+    # global default rates, applied automatically to every view; 'login' is
+    # a separate, tighter, IP-keyed rate applied explicitly to
+    # CustomAuthToken (see its throttle_classes) — DRF's ObtainAuthToken,
+    # which it subclasses, sets throttle_classes = () on itself, so the
+    # global defaults below do NOT reach it on their own; it has to opt
+    # back in individually, which is exactly why login needed its own
+    # explicit throttle_classes rather than relying on this dict alone.
+    'DEFAULT_THROTTLE_CLASSES': [
+        'rest_framework.throttling.AnonRateThrottle',
+        'rest_framework.throttling.UserRateThrottle',
+    ],
+    'DEFAULT_THROTTLE_RATES': {
+        'anon': '100/hour',
+        'user': '1000/hour',
+        'login': '10/minute',
+    },
 }
 
 # CORS settings

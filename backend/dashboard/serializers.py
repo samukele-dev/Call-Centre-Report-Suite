@@ -140,20 +140,23 @@ class CallDataFileSerializer(serializers.ModelSerializer):
         self._start_processing(instance)
         return instance
 
-    def _start_processing(self, instance, sheets=None, full_outcome_history=False, auto_generate_report=True):
+    def _start_processing(self, instance, sheets=None, full_outcome_history=False, auto_generate_report=True,
+                           template_sheet=None, requested_start_dt=None, requested_end_dt=None):
         try:
             instance.status = 'processing'
             instance.save()
             self._process_file_sync(
                 instance, sheets=sheets, full_outcome_history=full_outcome_history,
-                auto_generate_report=auto_generate_report
+                auto_generate_report=auto_generate_report, template_sheet=template_sheet,
+                requested_start_dt=requested_start_dt, requested_end_dt=requested_end_dt
             )
         except Exception as e:
             instance.status = 'failed'
             instance.processing_errors = str(e)
             instance.save()
 
-    def _process_file_sync(self, instance, sheets=None, full_outcome_history=False, auto_generate_report=True):
+    def _process_file_sync(self, instance, sheets=None, full_outcome_history=False, auto_generate_report=True,
+                            template_sheet=None, requested_start_dt=None, requested_end_dt=None):
         try:
             from .views import SimpleDataProcessor
             from django.utils import timezone
@@ -223,7 +226,11 @@ class CallDataFileSerializer(serializers.ModelSerializer):
                     from .views import ReportViewSet
                     print(f"🚀 Auto-generating full report for campaign "
                           f"{instance.campaign_id}...")
-                    ReportViewSet._auto_generate_full_report(instance, sheets=sheets, full_outcome_history=full_outcome_history)
+                    ReportViewSet._auto_generate_full_report(
+                        instance, sheets=sheets, full_outcome_history=full_outcome_history,
+                        template_sheet=template_sheet,
+                        requested_start_dt=requested_start_dt, requested_end_dt=requested_end_dt
+                    )
                     print(f"✅ Auto-report generation complete.")
                 except Exception as auto_err:
                     # Never fail the upload just because report generation failed

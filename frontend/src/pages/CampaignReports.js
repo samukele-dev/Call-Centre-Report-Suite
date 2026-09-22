@@ -21,8 +21,12 @@ const CampaignReports = () => {
   const [showGenerateModal, setShowGenerateModal] = useState(false);
   const [selectedSheets, setSelectedSheets] = useState(REPORT_SHEETS.map(s => s.key));
   const [fullOutcomeHistory, setFullOutcomeHistory] = useState(false);
+  const [templateSheetOptions, setTemplateSheetOptions] = useState([]);
+  const [templateSheet, setTemplateSheet] = useState('');
+  const [templateSheetsError, setTemplateSheetsError] = useState(null);
 
   const pivotLocked = selectedSheets.includes('campaign_analysis') || selectedSheets.includes('template');
+  const templateSelected = selectedSheets.includes('template');
 
   const toggleSheet = (key) => {
     setSelectedSheets(prev => toggleReportSheet(prev, key));
@@ -32,6 +36,17 @@ const CampaignReports = () => {
     fetchCampaign();
     fetchReports();
   }, [id]);
+
+  useEffect(() => {
+    if (!showGenerateModal || templateSheetOptions.length > 0) return;
+    DashboardService.getMasterTemplateSheets().then(result => {
+      if (result.success) {
+        setTemplateSheetOptions(result.data.sheets || []);
+      } else {
+        setTemplateSheetsError(result.error || 'Failed to load template sheet list.');
+      }
+    });
+  }, [showGenerateModal, templateSheetOptions.length]);
 
   const fetchCampaign = async () => {
     try {
@@ -65,7 +80,9 @@ const CampaignReports = () => {
     setGenerating(true);
     try {
       // FIX: pass campaign id so the report is generated for THIS campaign
-      const result = await DashboardService.generateCampaignReport(id, selectedSheets, fullOutcomeHistory);
+      const result = await DashboardService.generateCampaignReport(
+        id, selectedSheets, fullOutcomeHistory, templateSelected ? templateSheet : null
+      );
       
       if (result.success) {
         alert(`Campaign report for "${campaign?.display_name}" generated successfully!`);
@@ -291,7 +308,9 @@ const CampaignReports = () => {
             <div className="fw-semibold mb-2">Sheets to include</div>
             {REPORT_SHEETS.map(sheet => {
               const dbUnavailable = sheet.dbOnly && !campaign?.cd_campaign_id;
-              const locked = (sheet.key === 'pivot' || sheet.key === 'lead_count') && pivotLocked;
+              const locked = sheet.key === 'campaign_analysis'
+                ? templateSelected
+                : (sheet.key === 'pivot' || sheet.key === 'lead_count') && pivotLocked;
               return (
                 <Form.Check
                   key={sheet.key}
@@ -312,6 +331,33 @@ const CampaignReports = () => {
               );
             })}
           </div>
+          {templateSelected && (
+            <div className="mb-3">
+              <div className="fw-semibold mb-2">Template sheet</div>
+              {templateSheetsError ? (
+                <Alert variant="warning" className="py-2 mb-0">{templateSheetsError}</Alert>
+              ) : (
+                <>
+                  <Form.Select
+                    size="sm"
+                    disabled={generating || templateSheetOptions.length === 0}
+                    value={templateSheet}
+                    onChange={(e) => setTemplateSheet(e.target.value)}
+                  >
+                    <option value="">
+                      {templateSheetOptions.length === 0 ? 'Loading sheets…' : 'Select a sheet…'}
+                    </option>
+                    {templateSheetOptions.map(name => (
+                      <option key={name} value={name}>{name}</option>
+                    ))}
+                  </Form.Select>
+                  <div className="form-text">
+                    Which sheet of the Call Centre Report Template matches this campaign.
+                  </div>
+                </>
+              )}
+            </div>
+          )}
           <div className="mb-3">
             <div className="fw-semibold mb-2">Accuracy</div>
             <Form.Check
@@ -343,7 +389,7 @@ const CampaignReports = () => {
           <Button
             variant="primary"
             onClick={handleGenerateCampaignReport}
-            disabled={generating || selectedSheets.length === 0}
+            disabled={generating || selectedSheets.length === 0 || (templateSelected && !templateSheet)}
           >
             {generating ? (
               <>

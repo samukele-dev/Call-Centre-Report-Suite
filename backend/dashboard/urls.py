@@ -39,11 +39,7 @@ urlpatterns = [
     # Additional custom endpoints
     path('outcomes/bulk_upload/', views.bulk_upload_outcomes, name='bulk_upload_outcomes'),
     path('outcomes/export/', views.export_outcomes, name='export_outcomes'),
-    
-    # Test endpoints
-    path('test-upload/', views.test_upload, name='test_upload'),
-    path('setup-test-user/', views.setup_test_user, name='setup_test_user'),
-    
+
     # Auth endpoints
     path('api-token-auth/', views.CustomAuthToken.as_view(), name='api_token_auth'),
     path('register/', views.register_user, name='register_user'),

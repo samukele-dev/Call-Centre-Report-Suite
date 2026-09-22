@@ -170,20 +170,49 @@ def _get_connection():
         raise ExternalSourceError(error_msg)
 
 
+def _get_outbound_ip():
+    """
+    This process's own current outbound IP, as seen by the public internet
+    — i.e. exactly what a remote firewall/allowlist sees when this app
+    connects out to somewhere like the external call-centre DB. Useful
+    specifically for confirming a just-added IP allowlist entry actually
+    covers Render's real current egress IP, without needing Shell access
+    (not available on Render's free plan) to run `curl ifconfig.me`
+    manually. Returns None (never raises) if the lookup itself fails —
+    this is a diagnostic nicety, not something that should ever break the
+    connection test it's attached to.
+    """
+    import urllib.request
+    try:
+        # Plain HTTP, deliberately — this is a public IP address, nothing
+        # sensitive, and avoiding TLS here sidesteps cert-chain
+        # verification quirks entirely (hit one testing this locally on
+        # Windows: OpenSSL 3.x rejecting a CA cert over "Basic Constraints
+        # ... not marked critical" — a local trust-store issue unrelated to
+        # this app, but no reason to risk the same class of failure
+        # wherever this actually runs).
+        with urllib.request.urlopen('http://api.ipify.org', timeout=5) as resp:
+            return resp.read().decode().strip()
+    except Exception:
+        return None
+
+
 def test_connection():
     """
     Test the connection to the external database without making any queries.
     Returns (success, message, details).
     """
     cfg = settings.EXTERNAL_DB
-    
+    outbound_ip = _get_outbound_ip()
+
     # Check configuration
     if not cfg.get('HOST') or not cfg.get('NAME') or not cfg.get('USER'):
         return False, "External database is not configured", {
             'configured': False,
-            'missing': [k for k in ['HOST', 'NAME', 'USER'] if not cfg.get(k)]
+            'missing': [k for k in ['HOST', 'NAME', 'USER'] if not cfg.get(k)],
+            'outbound_ip': outbound_ip,
         }
-    
+
     # Test network connectivity first
     try:
         socket.create_connection(
@@ -194,11 +223,17 @@ def test_connection():
     except Exception as e:
         network_ok = False
         network_error = str(e)
-    
+
     if not network_ok:
         return False, f"Cannot reach database server: {network_error}", {
             'network_ok': False,
-            'error': network_error
+            'error': network_error,
+            # The actual IP this specific request left from — compare this
+            # against whatever was allowlisted on the external DB's side.
+            # A mismatch (e.g. this falls outside the whitelisted CIDR
+            # range(s), or is a different IP than expected) is the single
+            # most common reason a "we whitelisted it" fix doesn't work.
+            'outbound_ip': outbound_ip,
         }
     
     # Test database connection
@@ -211,19 +246,22 @@ def test_connection():
             'host': cfg['HOST'],
             'port': cfg.get('PORT', 5432),
             'database': cfg['NAME'],
-            'user': cfg['USER']
+            'user': cfg['USER'],
+            'outbound_ip': outbound_ip,
         }
     except ExternalSourceError as e:
         return False, str(e), {
             'network_ok': True,
             'connected': False,
-            'error': str(e)
+            'error': str(e),
+            'outbound_ip': outbound_ip,
         }
     except Exception as e:
         return False, f"Unexpected error: {e}", {
             'network_ok': True,
             'connected': False,
-            'error': str(e)
+            'error': str(e),
+            'outbound_ip': outbound_ip,
         }
 
 
@@ -266,21 +304,114 @@ def fetch_source_lists(cd_campaign_id):
     ]
 
 
+def _parse_source_dt(date_val, time_val, default_time):
+    """date_val ('YYYY-MM-DD' string or date/datetime object, or None) +
+    time_val ('HH:MM' or 'HH:MM:SS' string, or None) -> a real datetime, or
+    None if date_val is falsy. Needed because _run_windowed does date
+    arithmetic (timedelta) on its bounds, which a SQL-literal string can't
+    support — this used to be built as a plain f-string handed straight to
+    psycopg2 as a comparison value, which never needed to be a real
+    datetime since nothing did arithmetic on it."""
+    if not date_val:
+        return None
+    date_part = date_val if isinstance(date_val, str) else date_val.strftime('%Y-%m-%d')
+    time_part = time_val or default_time
+    if time_part.count(':') == 1:
+        time_part += ':00'
+    return datetime.strptime(f"{date_part} {time_part}", '%Y-%m-%d %H:%M:%S')
+
+
+def _fetch_customer_ids_called_in_range(cd_campaign_id, start_dt, end_dt):
+    """
+    Every contact with at least one real call attempt (a
+    reporting.interaction_voice row) within [start_dt, end_dt] for this
+    campaign — used by fetch_call_data_from_source to scope a date-ranged
+    sync to contacts ACTUALLY called in that window. Deliberately not
+    cxm.cd_voice_meta.last_called (each contact's single latest-call
+    snapshot, which moves forward every time the contact is called again —
+    see fetch_call_data_from_source's docstring for why that silently
+    undercounts a specific day once contacts in it get re-dialled later).
+
+    Same windowing/retry approach as fetch_contact_call_counts, for the
+    same reason (reporting.interaction_voice has no campaign_id index —
+    only a date-bounded query is fast). Raises ExternalSourceError on any
+    failure, same as the sibling fetch_* functions in this file.
+
+    Returns a list of customer_id strings (cxm.contact_data.id, matching
+    cd.id in the main query), suitable for cd.id::text = ANY(%s).
+    """
+    customer_ids = set()
+
+    def run_window(cur, w_start, w_end, is_last):
+        end_op = "<=" if is_last else "<"
+        where = ["campaign_id = %s", "customer_id IS NOT NULL"]
+        params = [cd_campaign_id]
+        if w_start:
+            where.append("start_time >= %s")
+            params.append(w_start)
+        if w_end:
+            where.append(f"start_time {end_op} %s")
+            params.append(w_end)
+
+        cur.execute(
+            f"""
+            SELECT DISTINCT customer_id
+            FROM reporting.interaction_voice
+            WHERE {" AND ".join(where)}
+            """,
+            params,
+        )
+        for (customer_id,) in cur.fetchall():
+            customer_ids.add(str(customer_id))
+
+    conn = _get_connection()
+    try:
+        try:
+            _run_windowed(conn, start_dt, end_dt, run_window)
+        except Exception:
+            # Retry the whole scan once on a fresh connection — see
+            # fetch_agent_performance's identical retry for why (a dropped
+            # connection mid-scan, not just a per-window statement
+            # timeout).
+            customer_ids.clear()
+            conn.close()
+            conn = _get_connection()
+            _run_windowed(conn, start_dt, end_dt, run_window)
+        return list(customer_ids)
+    except Exception as e:
+        raise ExternalSourceError(f"Date-range interaction lookup against external database failed: {e}")
+    finally:
+        conn.close()
+
+
 def fetch_call_data_from_source(cd_campaign_id, start_date=None, end_date=None, start_time=None, end_time=None, list_ids=None):
     """
     Run the source query for one campaign UUID (cxm.campaigns.id) and return
-    a DataFrame ready for the upload pipeline, covering every list that
-    campaign has ever had — unless list_ids is given, in which case only
-    those specific lists (batches) are pulled. start_date/end_date (each
+    a DataFrame ready for the upload pipeline, covering every ACTIVE list
+    (cl.rstatus = 'active' — the same "Active" toggle shown in the source
+    system's Manage Data Lists screen; the other statuses seen there are
+    'inactive' and 'deleted') that campaign currently has — unless list_ids
+    is given, in which case exactly those specific lists (batches) are
+    pulled instead, regardless of their status. That's a deliberate
+    escape hatch: picking a batch by hand in the "Batch(es)" dropdown is an
+    explicit choice that should work even for one since deactivated, so
+    only the *default* (no batches picked) is scoped to active-only —
+    previously this pulled literally every list ever created for the
+    campaign, active or not, silently mixing in superseded/retired batches.
+    start_date/end_date (each
     'YYYY-MM-DD' strings or date/datetime objects) optionally scope results
-    to cvm.last_called (the contact's most recent call — cvm.created_at is
-    set once, when the contact's voice_meta row is first created on its
-    very first-ever call, and never moves after that, so filtering on it
-    silently drops every later recall of an already-dialled contact;
-    verified live on Vodacom Retentions: a same-day window matched 13 rows
-    on created_at vs. 806 on last_called) within that range, inclusive on
-    both ends. Either or both may be omitted to leave that side of the
-    range open. start_time/end_time (each 'HH:MM' strings) optionally
+    to contacts with at least one real call attempt in that range — see
+    _fetch_customer_ids_called_in_range for why that, and not
+    cvm.last_called (each contact's single most-recent-call snapshot), is
+    what actually answers "who was called in this window": verified live on
+    this same campaign, a single day inside an active batch showed only 42
+    contacts by last_called vs. 554 by this method (matching the source
+    system's own count) — the missing ~512 had already been re-dialled on a
+    LATER day by the time this ran, which moves last_called forward and
+    drops them from a last_called-based range filter even though the
+    original call is exactly what the requested day should return.
+    Range is inclusive on both ends; either date may be omitted to leave
+    that side open. start_time/end_time (each 'HH:MM' strings) optionally
     narrow the start/end date to a specific time instead of the full day.
     """
     if not cd_campaign_id:
@@ -296,12 +427,16 @@ def fetch_call_data_from_source(cd_campaign_id, start_date=None, end_date=None, 
         # comparison), so cast the column side explicitly.
         where_clauses.append("cl.id::text = ANY(%s)")
         params.append([str(x) for x in list_ids])
-    if start_date:
-        where_clauses.append("cvm.last_called >= %s")
-        params.append(f"{start_date} {start_time or '00:00:00'}")
-    if end_date:
-        where_clauses.append("cvm.last_called <= %s")
-        params.append(f"{end_date} {end_time or '23:59:59'}")
+    else:
+        # No specific batches picked — default to active lists only (see
+        # docstring) rather than every list the campaign has ever had.
+        where_clauses.append("cl.rstatus = 'active'")
+    if start_date or end_date:
+        start_dt = _parse_source_dt(start_date, start_time, '00:00:00')
+        end_dt = _parse_source_dt(end_date, end_time, '23:59:59')
+        called_ids = _fetch_customer_ids_called_in_range(cd_campaign_id, start_dt, end_dt)
+        where_clauses.append("cd.id::text = ANY(%s)")
+        params.append(called_ids)
 
     sql = SOURCE_QUERY_TEMPLATE.format(where_clause=" AND ".join(where_clauses))
 
@@ -744,7 +879,7 @@ def fetch_contact_call_counts(cd_campaign_id, start_dt=None, end_dt=None):
         conn.close()
 
 
-def fetch_outcome_history_counts(cd_campaign_id, start_dt=None, end_dt=None):
+def fetch_outcome_history_counts(cd_campaign_id, start_dt=None, end_dt=None, customer_ids=None):
     """
     Full outcome-disposition history for a campaign — every interaction's
     outcome, not just each contact's current/latest one. ProcessedData.
@@ -755,6 +890,18 @@ def fetch_outcome_history_counts(cd_campaign_id, start_dt=None, end_dt=None):
     table, permanently, since re-syncing only refreshes current state. This
     function counts every logged interaction instead, so that contact still
     counts under both outcomes.
+
+    customer_ids (optional): restrict to interactions for exactly these
+    contacts (cxm.contact_data.id / ProcessedData.customer_id strings) —
+    this function only ever knew campaign_id + a date range until a
+    specific-list picker existed for syncs; without this, calling it for a
+    report scoped to one list (e.g. "September 26", 554 contacts on a given
+    day) still counted every OTHER list's interactions for the campaign on
+    that same day too (verified live: 8,911 campaign-wide vs. the 554
+    actually in that list/day). Callers building a report for one specific
+    file/sync should always pass the file's own ProcessedData customer_ids
+    here so the disposition breakdown can't silently include contacts the
+    report isn't about.
 
     Returns (counts, skipped_ranges). counts is {outcome_name: count},
     summed across every interaction in range — can legitimately exceed the
@@ -797,6 +944,12 @@ def fetch_outcome_history_counts(cd_campaign_id, start_dt=None, end_dt=None):
         if w_end:
             where.append(f"iv.start_time {end_op} %s")
             params.append(w_end)
+        if customer_ids is not None:
+            # iv.customer_id is uuid; customer_ids is a list of strings
+            # (ProcessedData.customer_id) — cast the column side, same
+            # pattern as list_ids elsewhere in this file.
+            where.append("iv.customer_id::text = ANY(%s)")
+            params.append([str(x) for x in customer_ids])
 
         cur.execute(
             f"""
@@ -940,14 +1093,15 @@ def _default_user():
 
 
 def sync_campaign_from_database(campaign, user=None, start_date=None, end_date=None, start_time=None, end_time=None,
-                                 list_ids=None, sheets=None, full_outcome_history=False, auto_generate_report=True):
+                                 list_ids=None, sheets=None, full_outcome_history=False, auto_generate_report=True,
+                                 template_sheet=None):
     """
     Pull this campaign's data from the external DB and run it through the
     same processing pipeline a CSV upload uses. Returns the resulting
     CallDataFile instance. start_date/end_date optionally scope the pull to
     interactions within that range, further narrowed by start_time/end_time
     ('HH:MM', optional); list_ids optionally scopes it to specific upload
-    batches instead of the campaign's full history (see
+    batches instead of the campaign's active lists, the default (see
     fetch_call_data_from_source).
 
     auto_generate_report (default True, for backward compatibility — see
@@ -1038,7 +1192,19 @@ def sync_campaign_from_database(campaign, user=None, start_date=None, end_date=N
     from .serializers import CallDataFileSerializer
     CallDataFileSerializer()._start_processing(
         instance, sheets=sheets, full_outcome_history=full_outcome_history,
-        auto_generate_report=auto_generate_report
+        auto_generate_report=auto_generate_report, template_sheet=template_sheet,
+        # The exact window this sync itself was asked to pull (None/None
+        # for an unscoped "active lists" pull) — passed through so the
+        # auto-generated report's Pivot/Campaign Analysis/template sheets
+        # can count dispositions per-interaction-within-this-window
+        # automatically (see ReportViewSet._auto_generate_full_report),
+        # instead of only when the separate, opt-in full_outcome_history
+        # flag is set. A caller-specified window is cheap to scan exactly
+        # because it's caller-specified (usually narrow) — that's the
+        # whole reason full_outcome_history's own unbounded default scan
+        # is the slow, opt-in path; a bounded one isn't and shouldn't be.
+        requested_start_dt=_parse_source_dt(start_date, start_time, '00:00:00'),
+        requested_end_dt=_parse_source_dt(end_date, end_time, '23:59:59'),
     )
     instance.refresh_from_db()
 

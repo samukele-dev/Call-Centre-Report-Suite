@@ -254,40 +254,13 @@ export const dashboardAPI = {
     }
   },
 
-  // Setup test user
-  setupTestUser: async () => {
-    try {
-      const response = await api.get('/api/setup-test-user/');
-      return { success: true, data: response.data };
-    } catch (error) {
-      console.error('Setup test user error:', error);
-      return {
-        success: false,
-        error: error.response?.data?.error || error.response?.data || 'Failed to setup test user'
-      };
-    }
-  },
-
-  // Test upload
-  testUpload: async (file) => {
-    const formData = new FormData();
-    formData.append('file', file);
-
-    try {
-      const response = await api.post('/api/test-upload/', formData, {
-        headers: {
-          'Content-Type': 'multipart/form-data',
-        },
-      });
-      return { success: true, data: response.data };
-    } catch (error) {
-      console.error('Test upload error:', error);
-      return {
-        success: false,
-        error: error.response?.data?.error || error.response?.data || 'Test upload failed'
-      };
-    }
-  },
+  // setupTestUser/testUpload removed — dead code (never called from any
+  // page) that pointed at /api/setup-test-user/ and /api/test-upload/,
+  // both since removed from the backend as part of a security pass: the
+  // former was a fully unauthenticated GET endpoint that created (or
+  // revealed) a working login and returned its password in the response
+  // body — a live, unauthenticated backdoor into a system that handles
+  // real PII, not just dev-convenience cruft.
 
   // Bulk upload outcomes
   bulkUploadOutcomes: async (file) => {

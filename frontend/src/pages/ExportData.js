@@ -407,7 +407,7 @@ const ExportData = () => {
       </Card>
 
       <Row>
-        <Col md={6}>
+        <Col md={12}>
           {/* Sync from Database */}
           <Card className="h-100">
             <Card.Header>
@@ -522,8 +522,11 @@ const ExportData = () => {
           </Card>
         </Col>
 
+        {/*
         <Col md={6}>
+        */}
           {/* Upload File */}
+          {/*
           <Card className="h-100">
             <Card.Header>
               <Card.Title>Upload a File</Card.Title>
@@ -569,7 +572,10 @@ const ExportData = () => {
               </Button>
             </Card.Body>
           </Card>
+          */}
+        {/*
         </Col>
+        */}
       </Row>
 
       {/* Files List & Export */}

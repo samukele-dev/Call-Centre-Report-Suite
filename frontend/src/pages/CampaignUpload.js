@@ -2,7 +2,7 @@
 import React, { useState, useEffect } from 'react';
 import {
   Card, Button, Alert, Spinner,
-  Form, Row, Col, Dropdown
+  Form, Row, Col, Dropdown, Badge
 } from 'react-bootstrap';
 import { useParams, Link } from 'react-router-dom';
 import { saveAs } from 'file-saver';
@@ -30,10 +30,26 @@ const CampaignUpload = () => {
   const [syncSheets, setSyncSheets] = useState(ALL_REPORT_SHEET_KEYS);
   const [syncFullOutcomeHistory, setSyncFullOutcomeHistory] = useState(false);
   const [showPreview, setShowPreview] = useState(false);
+  const [templateSheetOptions, setTemplateSheetOptions] = useState([]);
+  const [syncTemplateSheet, setSyncTemplateSheet] = useState('');
+  const [templateSheetsError, setTemplateSheetsError] = useState(null);
+
+  const syncTemplateSelected = syncSheets.includes('template');
 
   useEffect(() => {
     fetchCampaign();
   }, [id]);
+
+  useEffect(() => {
+    if (!syncTemplateSelected || templateSheetOptions.length > 0) return;
+    DashboardService.getMasterTemplateSheets().then(result => {
+      if (result.success) {
+        setTemplateSheetOptions(result.data.sheets || []);
+      } else {
+        setTemplateSheetsError(result.error || 'Failed to load template sheet list.');
+      }
+    });
+  }, [syncTemplateSelected, templateSheetOptions.length]);
 
   useEffect(() => {
     if (campaign?.cd_campaign_id) {
@@ -122,7 +138,9 @@ const CampaignUpload = () => {
         syncStartTime || null,
         syncEndTime || null,
         syncSheets,
-        syncFullOutcomeHistory
+        syncFullOutcomeHistory,
+        true,
+        syncTemplateSelected ? syncTemplateSheet : null
       );
 
       if (result.success) {
@@ -374,7 +392,7 @@ const CampaignUpload = () => {
                             />
                           </Dropdown.Item>
                           <Dropdown.Item as="button" onClick={() => setSelectedListIds([])}>
-                            <i className="bi bi-asterisk me-2"></i>Clear (use campaign's full history)
+                            <i className="bi bi-asterisk me-2"></i>Clear (use all Active batches)
                           </Dropdown.Item>
                           <Dropdown.Divider />
                           {sourceLists.map(list => (
@@ -391,6 +409,14 @@ const CampaignUpload = () => {
                                 label={
                                   <>
                                     {list.name}
+                                    {list.status && (
+                                      <Badge
+                                        bg={list.status === 'active' ? 'success' : 'secondary'}
+                                        className="ms-2"
+                                      >
+                                        {list.status}
+                                      </Badge>
+                                    )}
                                     {list.created_at && (
                                       <span className="text-muted small ms-2">
                                         {new Date(list.created_at).toLocaleDateString()}
@@ -407,8 +433,10 @@ const CampaignUpload = () => {
                   </Dropdown>
                 )}
                 <Form.Text className="text-muted d-block mt-1">
-                  Pick specific upload batches (e.g. "Absa Insurance 20260618") pulled live from the database,
-                  use "Select all" to check every one individually, or leave it cleared for the campaign's full history.
+                  Pick specific upload batches (e.g. "Absa Insurance 20260618") pulled live from the database —
+                  works even for an Inactive one — use "Select all" to check every one individually, or leave it
+                  cleared to pull every batch currently marked Active (matching Manage Data Lists on the source
+                  system), same as before this campaign had any batches manually picked.
                 </Form.Text>
               </Form.Group>
 
@@ -478,8 +506,10 @@ const CampaignUpload = () => {
                 <Row>
                   {REPORT_SHEETS.map(sheet => {
                     const dbUnavailable = sheet.dbOnly && !campaign?.cd_campaign_id;
-                    const locked = (sheet.key === 'pivot' || sheet.key === 'lead_count') &&
-                      (syncSheets.includes('campaign_analysis') || syncSheets.includes('template'));
+                    const locked = sheet.key === 'campaign_analysis'
+                      ? syncTemplateSelected
+                      : (sheet.key === 'pivot' || sheet.key === 'lead_count') &&
+                        (syncSheets.includes('campaign_analysis') || syncSheets.includes('template'));
                     return (
                       <Col md={6} key={sheet.key}>
                         <Form.Check
@@ -501,6 +531,33 @@ const CampaignUpload = () => {
                     );
                   })}
                 </Row>
+                {syncTemplateSelected && (
+                  <div className="mb-3 mt-2">
+                    <div className="fw-semibold mb-2">Template sheet</div>
+                    {templateSheetsError ? (
+                      <Alert variant="warning" className="py-2 mb-0">{templateSheetsError}</Alert>
+                    ) : (
+                      <>
+                        <Form.Select
+                          size="sm"
+                          disabled={syncing || templateSheetOptions.length === 0}
+                          value={syncTemplateSheet}
+                          onChange={(e) => setSyncTemplateSheet(e.target.value)}
+                        >
+                          <option value="">
+                            {templateSheetOptions.length === 0 ? 'Loading sheets…' : 'Select a sheet…'}
+                          </option>
+                          {templateSheetOptions.map(name => (
+                            <option key={name} value={name}>{name}</option>
+                          ))}
+                        </Form.Select>
+                        <div className="form-text">
+                          Which sheet of the Call Centre Report Template matches this campaign.
+                        </div>
+                      </>
+                    )}
+                  </div>
+                )}
                 <hr className="my-2" />
                 <Form.Check
                   type="checkbox"
@@ -521,7 +578,7 @@ const CampaignUpload = () => {
                 variant="primary"
                 size="lg"
                 onClick={handleSyncFromDatabase}
-                disabled={syncing || syncSheets.length === 0}
+                disabled={syncing || syncSheets.length === 0 || (syncTemplateSelected && !syncTemplateSheet)}
               >
                 {syncing ? (
                   <>

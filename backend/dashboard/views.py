@@ -8,6 +8,7 @@ from rest_framework import viewsets, status, generics, mixins
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, AllowAny
+from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.parsers import MultiPartParser, FormParser
 from django.shortcuts import get_object_or_404
 from django.http import HttpResponse, JsonResponse, HttpRequest
@@ -45,6 +46,17 @@ from .serializers import (
 # ===========================================================
 
 class CustomAuthToken(ObtainAuthToken):
+    # ObtainAuthToken (the DRF base class) sets throttle_classes = ()
+    # directly on itself, which overrides — not adds to — the project-wide
+    # DEFAULT_THROTTLE_CLASSES in settings.py, so login would otherwise be
+    # the one endpoint in the whole app exempt from any rate limit at all.
+    # ScopedRateThrottle + throttle_scope below opts it back in under its
+    # own tighter, IP-keyed 'login' rate (see DEFAULT_THROTTLE_RATES) —
+    # this is the actual brute-force guard for a password-guessing attempt
+    # against a system with no other lockout mechanism.
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'login'
+
     def post(self, request, *args, **kwargs):
         serializer = self.serializer_class(
             data=request.data, context={'request': request}
@@ -61,7 +73,15 @@ class CustomAuthToken(ObtainAuthToken):
 
 
 @api_view(['POST'])
-@permission_classes([AllowAny])
+# No permission_classes override — inherits the global IsAuthenticated
+# default. This used to be AllowAny, meaning literally anyone on the
+# internet could self-register a fully active account (is_active=True,
+# valid token returned in the same response — instant access) into a
+# system that handles real PII, with zero approval step, defeating the
+# point of every other endpoint requiring auth at all. There is no
+# frontend page that calls this (verified — App.js has no registration
+# route), so this closes it without touching any UI: it now only works
+# for someone already logged in provisioning a new teammate's account.
 def register_user(request):
     """Register a new user"""
     username = request.data.get('username')
@@ -253,7 +273,7 @@ DataProcessor = SimpleDataProcessor
 class CallDataFileViewSet(viewsets.ModelViewSet):
     """Manage call data file uploads"""
     serializer_class = CallDataFileSerializer
-    permission_classes = [AllowAny]
+    # No permission_classes override here -- inherits the global IsAuthenticated default (see settings.py REST_FRAMEWORK). This used to be AllowAny; flipped as part of a security pass since this endpoint handles real data/PII and has no reason to be reachable unauthenticated.
     parser_classes = [MultiPartParser, FormParser]
 
     def get_queryset(self):
@@ -500,7 +520,7 @@ class OutcomeSetViewSet(viewsets.ModelViewSet):
     """Manage named outcome sets (e.g. 'Outcomes 1', 'Outcomes 2')."""
     queryset = OutcomeSet.objects.all().order_by('name')
     serializer_class = OutcomeSetSerializer
-    permission_classes = [AllowAny]
+    # No permission_classes override here -- inherits the global IsAuthenticated default (see settings.py REST_FRAMEWORK). This used to be AllowAny; flipped as part of a security pass since this endpoint handles real data/PII and has no reason to be reachable unauthenticated.
 
     def perform_create(self, serializer):
         user = self.request.user if self.request.user.is_authenticated else None
@@ -515,7 +535,7 @@ class OutcomeDescriptionViewSet(viewsets.ModelViewSet):
     """Manage outcome descriptions"""
     queryset = OutcomeDescription.objects.all()
     serializer_class = OutcomeDescriptionSerializer
-    permission_classes = [AllowAny]
+    # No permission_classes override here -- inherits the global IsAuthenticated default (see settings.py REST_FRAMEWORK). This used to be AllowAny; flipped as part of a security pass since this endpoint handles real data/PII and has no reason to be reachable unauthenticated.
     parser_classes = [MultiPartParser, FormParser]
 
     def get_queryset(self):
@@ -677,7 +697,6 @@ class OutcomeDescriptionViewSet(viewsets.ModelViewSet):
 
 
 @api_view(['POST'])
-@permission_classes([AllowAny])
 def bulk_upload_outcomes(request):
     """Standalone bulk upload outcomes endpoint"""
     if 'file' not in request.FILES:
@@ -772,7 +791,6 @@ def bulk_upload_outcomes(request):
 
 
 @api_view(['GET'])
-@permission_classes([AllowAny])
 def export_outcomes(request):
     """Export outcomes to Excel"""
     try:
@@ -812,7 +830,7 @@ class ReportViewSet(
     """Generate and manage reports — campaign-scoped."""
     queryset = GeneratedReport.objects.all().order_by('-generated_at')
     serializer_class = GeneratedReportSerializer
-    permission_classes = [AllowAny]
+    # No permission_classes override here -- inherits the global IsAuthenticated default (see settings.py REST_FRAMEWORK). This used to be AllowAny; flipped as part of a security pass since this endpoint handles real data/PII and has no reason to be reachable unauthenticated.
 
     def get_queryset(self):
         queryset = GeneratedReport.objects.all().order_by('-generated_at')
@@ -1001,8 +1019,72 @@ class ReportViewSet(
         'call_count_breakdown', 'agent_performance', 'template',
     }
 
+    # The master "Call Centre Report Template.xlsx" — one workbook with a
+    # sheet per campaign format (Funeral, BOB, Device Prepaid, etc.). There's
+    # no reliable way to auto-match a campaign to "its" sheet (many
+    # campaigns share a product name but not a disposition list, and vice
+    # versa), so instead of guessing, the user picks the sheet by name right
+    # before generating — see `master_template_sheets` and the `template_sheet`
+    # field on `generate_campaign`. Tracked in git (unlike backend/media/,
+    # which is gitignored/deploy-local) so it's always present on a fresh
+    # deploy without needing a manual upload first.
+    MASTER_TEMPLATE_PATH = os.path.join(
+        os.path.dirname(__file__), 'report_templates', 'Call Centre Report Template.xlsx'
+    )
+
+    @action(detail=False, methods=['get'])
+    def master_template_sheets(self, request):
+        """GET /api/reports/master_template_sheets/ — sheet names available
+        for the `template_sheet` field on generate_campaign, read straight
+        from the master template workbook."""
+        if not os.path.exists(ReportViewSet.MASTER_TEMPLATE_PATH):
+            return Response(
+                {'success': False, 'error': 'Master report template is missing on the server.'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        try:
+            wb = load_workbook(ReportViewSet.MASTER_TEMPLATE_PATH, read_only=True)
+            try:
+                sheet_names = wb.sheetnames
+            finally:
+                wb.close()
+            return Response({'success': True, 'data': {'sheets': sheet_names}})
+        except Exception as e:
+            traceback.print_exc()
+            return Response({'success': False, 'error': str(e)},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
     @staticmethod
-    def _auto_generate_full_report(file_instance, sheets=None, full_outcome_history=False):
+    def _validate_template_sheet(template_sheet):
+        """Shared by every endpoint that accepts a `template_sheet` field
+        (generate_campaign, sync_from_database) — returns an error Response
+        if it's set but doesn't name a real sheet in the master template,
+        else None. Blank/omitted is always valid (means: no master-template
+        sheet requested)."""
+        if not template_sheet:
+            return None
+        if not os.path.exists(ReportViewSet.MASTER_TEMPLATE_PATH):
+            return Response(
+                {'success': False, 'error': 'Master report template is missing on the server.'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        wb = load_workbook(ReportViewSet.MASTER_TEMPLATE_PATH, read_only=True)
+        try:
+            valid_sheets = wb.sheetnames
+        finally:
+            wb.close()
+        if template_sheet not in valid_sheets:
+            return Response(
+                {'success': False,
+                 'error': f'Unknown template_sheet "{template_sheet}". '
+                          f'Valid values: {", ".join(valid_sheets)}.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        return None
+
+    @staticmethod
+    def _auto_generate_full_report(file_instance, sheets=None, full_outcome_history=False, template_sheet=None,
+                                    requested_start_dt=None, requested_end_dt=None):
         """
         Automatically called after a data file is processed.
         Generates ONE workbook with up to 7 sheets and saves it as a GeneratedReport:
@@ -1064,6 +1146,27 @@ class ReportViewSet(
         cells, not from the Python dict). Requesting one without the other
         silently includes Pivot rather than producing a broken workbook.
 
+        template_sheet (default None): a sheet name from the master
+        "Call Centre Report Template.xlsx" (see ReportViewSet.
+        master_template_sheets) to use as Sheet1, picked by the caller
+        rather than auto-matched — see the comment above the template
+        population block for why. Falls back to this campaign's legacy
+        ReportTemplate upload (if any) when omitted; if neither is
+        available, the report is built without a Sheet1 at all.
+
+        requested_start_dt/requested_end_dt (default None): the exact
+        window a database sync was asked to pull (see
+        external_source.sync_campaign_from_database), NOT derived from
+        this file's own data. When either is set, description_counts
+        (Pivot/Campaign Analysis/true_sales/template) automatically counts
+        dispositions per-interaction-within-this-window, matching Agent
+        Performance's counting exactly — regardless of full_outcome_history
+        — since a caller-specified window is cheap to scan precisely
+        because it's caller-specified (see full_outcome_history's own
+        docstring for why an *unbounded* scan is the slow, opt-in path).
+        None for a plain CSV/Excel upload or an unscoped sync, where this
+        behaves exactly as before.
+
         full_outcome_history (default False, opt-in): when True, Pivot/
         Campaign Analysis count every historical disposition for the
         campaign (via external_source.fetch_outcome_history_counts) instead
@@ -1097,6 +1200,12 @@ class ReportViewSet(
             # it no longer shows that number itself, so it can't work
             # without Lead Count also existing in the same workbook.
             wanted.add('lead_count')
+            # Template population reads its per-disposition category lists
+            # out of `categories`, a dict only built while constructing the
+            # Campaign Analysis sheet — requesting 'template' without it
+            # crashes with a bare NameError instead of a useful message, so
+            # it's forced on here exactly like pivot/lead_count above.
+            wanted.add('campaign_analysis')
 
         campaign = file_instance.campaign
         if not campaign:
@@ -1156,30 +1265,50 @@ class ReportViewSet(
         total_leads = total_count
         description_counts = None
         outcome_history_skipped_ranges = []
-        if full_outcome_history and campaign.cd_campaign_id:
+        # Per-interaction counting runs whenever EITHER full_outcome_history
+        # is explicitly on, OR this file came from a sync that itself asked
+        # for a specific window (requested_start_dt/end_dt) — the latter is
+        # what makes Pivot/Campaign Analysis/true_sales/template match
+        # Agent Performance's per-interaction-in-range counting by default,
+        # without anyone needing to know the Full Outcome History checkbox
+        # exists. Both conditions need cd_campaign_id (the external query
+        # can't run without it).
+        if (full_outcome_history or requested_start_dt or requested_end_dt) and campaign.cd_campaign_id:
             try:
                 from .external_source import fetch_outcome_history_counts, default_campaign_date_range
-                # Scope the scan to this file's own date_span (see above) —
-                # i.e. whatever range the sync/upload that produced this
-                # file was itself scoped to — rather than always the
-                # campaign's entire lifetime. Previously this always called
-                # default_campaign_date_range(campaign) unconditionally,
-                # which ignored any date range the sync panel was given
-                # entirely: picking "yesterday" and checking Full Outcome
-                # History still scanned the campaign's full history (back
-                # to 2015 — see default_campaign_date_range's docstring),
-                # which is both the slow "full database scan" this option
-                # is warned for and not what "yesterday" implied. Falls
-                # back to default_campaign_date_range only when this file's
-                # rows have no last_called_date at all to derive a range
-                # from (both None) — same "never silently miss data" reasoning
-                # as everywhere else this fallback is used.
-                if date_span['min_date'] and date_span['max_date']:
+                if requested_start_dt or requested_end_dt:
+                    # An explicit window was requested by the sync that
+                    # produced this file — use EXACTLY those bounds rather
+                    # than this file's own derived date_span. date_span's
+                    # max_date can drift past the requested end_dt once
+                    # last_called_date is fixed to mean "the contact's
+                    # current latest call" (see fetch_call_data_from_source):
+                    # a contact called inside the window and again after it
+                    # still belongs in this file (their call inside the
+                    # window happened), but their last_called_date now
+                    # reads later than end_dt.
+                    hist_start, hist_end = requested_start_dt, requested_end_dt
+                elif date_span['min_date'] and date_span['max_date']:
+                    # No specific window was requested (e.g. a plain
+                    # upload) — fall back to this file's own data span,
+                    # i.e. whatever range the upload happens to cover.
                     hist_start, hist_end = date_span['min_date'], date_span['max_date']
                 else:
                     hist_start, hist_end = default_campaign_date_range(campaign)
+                # Restrict to exactly this file's own contacts — without
+                # this, a report scoped to one specific batch/list still
+                # counted every OTHER list's interactions for the campaign
+                # in the same window too (see fetch_outcome_history_counts'
+                # customer_ids docstring).
+                file_customer_ids = list(
+                    processed_data_query.exclude(customer_id__isnull=True)
+                    .exclude(customer_id='')
+                    .values_list('customer_id', flat=True)
+                    .distinct()
+                )
                 raw_history_counts, outcome_history_skipped_ranges = fetch_outcome_history_counts(
-                    campaign.cd_campaign_id, start_dt=hist_start, end_dt=hist_end
+                    campaign.cd_campaign_id, start_dt=hist_start, end_dt=hist_end,
+                    customer_ids=file_customer_ids
                 )
                 description_counts = {}
                 for key, count in raw_history_counts.items():
@@ -2038,13 +2167,39 @@ class ReportViewSet(
             print(f"⚠️  Agent Performance sheet shows an error placeholder: {agent_performance_error}")
 
         # ── SHEET 4: TEMPLATE (Sheet1) populated from Pivot ────────────
-        # Find the newest template for this campaign
-        template_obj = ReportTemplate.objects.filter(
-            campaign=campaign, is_active=True
-        ).order_by('-uploaded_at').first()
+        # Two sources for the template, checked in this order:
+        #   1. `template_sheet` — a sheet name the caller picked from the
+        #      master "Call Centre Report Template.xlsx" (see
+        #      master_template_sheets/generate_campaign's template_sheet
+        #      field). Preferred: explicit, per-generation, no guessing.
+        #   2. The legacy per-campaign ReportTemplate upload (CampaignTemplates
+        #      page) — kept for campaigns that already have one configured.
+        use_master_template = False
+        if 'template' in wanted and template_sheet and os.path.exists(ReportViewSet.MASTER_TEMPLATE_PATH):
+            try:
+                _check_wb = load_workbook(ReportViewSet.MASTER_TEMPLATE_PATH, read_only=True)
+                try:
+                    use_master_template = template_sheet in _check_wb.sheetnames
+                finally:
+                    _check_wb.close()
+            except Exception:
+                use_master_template = False
 
-        if 'template' in wanted and template_obj and os.path.exists(template_obj.template_file.path):
-            print(f"Populating template: {template_obj.name}")
+        template_obj = None
+        if 'template' in wanted and not use_master_template:
+            template_obj = ReportTemplate.objects.filter(
+                campaign=campaign, is_active=True
+            ).order_by('-uploaded_at').first()
+        use_legacy_template = bool(
+            'template' in wanted and not use_master_template
+            and template_obj and os.path.exists(template_obj.template_file.path)
+        )
+
+        if use_master_template or use_legacy_template:
+            if use_master_template:
+                print(f"Populating template: master template sheet '{template_sheet}'")
+            else:
+                print(f"Populating template: {template_obj.name}")
 
             # Save and re-open the workbook so Pivot data is readable
             # by openpyxl (xlsxwriter can't be read while open)
@@ -2137,12 +2292,22 @@ class ReportViewSet(
             for label, row_data in summary_entries.items():
                 pivot_data_by_description[label] = list(row_data)
 
-            # Load template and recreate with values
-            src_wb    = load_workbook(template_obj.template_file.path)
+            # Load template and recreate with values. Master-template path
+            # copies ONLY the one sheet the caller picked (the workbook has
+            # 23 campaign-format sheets — copying all of them into every
+            # report would bloat the file with 22 irrelevant, unpopulated
+            # sheets). The legacy per-campaign upload keeps its original
+            # behaviour of copying every sheet it contains.
+            if use_master_template:
+                src_wb = load_workbook(ReportViewSet.MASTER_TEMPLATE_PATH)
+                sheet_names_to_copy = [template_sheet]
+            else:
+                src_wb = load_workbook(template_obj.template_file.path)
+                sheet_names_to_copy = src_wb.sheetnames
             new_wb    = openpyxl.Workbook()
             new_wb.remove(new_wb.active)
 
-            for sheet_name in src_wb.sheetnames:
+            for sheet_name in sheet_names_to_copy:
                 src_sheet = src_wb[sheet_name]
                 new_sheet = new_wb.create_sheet(title=sheet_name)
 
@@ -2188,7 +2353,7 @@ class ReportViewSet(
             #   - If the target cell is inside another merge, redirect the
             #     write to that merge's master (top-left) cell.
             #   - Formula cells are never overwritten.
-            target_sheet_name = src_wb.sheetnames[0]
+            target_sheet_name = template_sheet if use_master_template else src_wb.sheetnames[0]
             tws = new_wb[target_sheet_name]
             rows_populated = 0
 
@@ -2310,9 +2475,12 @@ class ReportViewSet(
             file_bytes = final_output.getvalue()
 
         else:
-            # No template — save the 3-sheet workbook (no Sheet1)
-            print(f"⚠️  No template found for campaign '{campaign.display_name}' "
-                  f"— saving 3-sheet report (no Sheet1)")
+            # No template — save the 3-sheet workbook (no Sheet1). Either
+            # 'template' wasn't requested, no template_sheet was picked and
+            # the campaign has no legacy upload, or template_sheet named a
+            # sheet that doesn't exist in the master workbook.
+            print(f"⚠️  No template for campaign '{campaign.display_name}' "
+                  f"— saving report without a populated template sheet")
             workbook.close()
             output.seek(0)
             file_bytes = output.getvalue()
@@ -2339,9 +2507,9 @@ class ReportViewSet(
                 'source_file':     file_instance.original_name,
                 'record_count':    total_leads,
                 'auto_generated':  True,
-                'has_sheet1':      'template' in wanted and template_obj is not None,
-                'template_name':   template_obj.name if ('template' in wanted and template_obj) else None,
-                'rows_populated':  rows_populated if ('template' in wanted and template_obj) else 0,
+                'has_sheet1':      use_master_template or use_legacy_template,
+                'template_name':   template_sheet if use_master_template else (template_obj.name if use_legacy_template else None),
+                'rows_populated':  rows_populated if (use_master_template or use_legacy_template) else 0,
                 'has_agent_performance': agent_rows is not None,
                 'agent_count':     len(agent_rows) if agent_rows else 0,
                 'agent_performance_error': agent_performance_error,
@@ -2388,6 +2556,14 @@ class ReportViewSet(
         disposition instead of each contact's latest only. Opt-in because
         it's a full external-DB scan that can take several minutes on a
         busy campaign (see _auto_generate_full_report's docstring).
+        Optional POST body field: template_sheet — the sheet name to use
+        from the master "Call Centre Report Template.xlsx" (see
+        GET /api/reports/master_template_sheets/ for the valid list).
+        Required whenever 'template' is in `sheets` (or `sheets` is
+        omitted, since that defaults to "all"), unless this campaign
+        already has a template uploaded via the Campaign Templates page —
+        that legacy upload is used as a fallback when template_sheet isn't
+        given.
         """
         try:
             print("=" * 50)
@@ -2413,6 +2589,11 @@ class ReportViewSet(
                     )
 
             full_outcome_history = bool(request.data.get('full_outcome_history', False))
+
+            template_sheet = request.data.get('template_sheet') or None
+            template_sheet_error = ReportViewSet._validate_template_sheet(template_sheet)
+            if template_sheet_error:
+                return template_sheet_error
 
             try:
                 campaign_obj = Campaign.objects.get(id=campaign_id, is_active=True)
@@ -2449,7 +2630,8 @@ class ReportViewSet(
             # Delegate to the SAME generator used by auto-generation,
             # so manual and automatic reports are always identical.
             report = ReportViewSet._auto_generate_full_report(
-                latest_file, sheets=sheets, full_outcome_history=full_outcome_history
+                latest_file, sheets=sheets, full_outcome_history=full_outcome_history,
+                template_sheet=template_sheet
             )
 
             if report is None:
@@ -2651,10 +2833,36 @@ class ReportViewSet(
                     continue
                 query = ProcessedData.objects.filter(call_data_file=latest_file)
 
-            if range_start:
-                query = query.filter(last_called_date__gte=range_start)
-            if range_end:
-                query = query.filter(last_called_date__lte=range_end)
+            if range_start or range_end:
+                # Scope to contacts with a REAL interaction in this window
+                # (reporting.interaction_voice), not last_called_date —
+                # same fix, same reason as fetch_call_data_from_source: a
+                # contact called inside the window and recalled after it
+                # has last_called_date sitting past range_end, and a
+                # last_called_date__lte filter would silently drop them
+                # even though their in-window call is exactly what was
+                # asked for. Only possible when this campaign is
+                # DB-connected (interaction log lives in the source DB,
+                # not locally) — falls back to the old last_called_date
+                # filter otherwise/on any query failure, same as before
+                # this existed, rather than failing the whole campaign.
+                scoped = False
+                if campaign.cd_campaign_id:
+                    try:
+                        from .external_source import _fetch_customer_ids_called_in_range
+                        called_ids = _fetch_customer_ids_called_in_range(
+                            campaign.cd_campaign_id, range_start, range_end
+                        )
+                        query = query.filter(customer_id__in=called_ids)
+                        scoped = True
+                    except Exception as e:
+                        print(f"⚠️  Interaction-range lookup failed for '{campaign.display_name}', "
+                              f"falling back to last_called_date filtering: {e}")
+                if not scoped:
+                    if range_start:
+                        query = query.filter(last_called_date__gte=range_start)
+                    if range_end:
+                        query = query.filter(last_called_date__lte=range_end)
 
             if not query.exists():
                 reason = ('No processed records in the selected date range.' if (range_start or range_end)
@@ -2669,21 +2877,34 @@ class ReportViewSet(
             # description_counts reflects every historical disposition for
             # this campaign, not just each contact's current/latest outcome
             # — same reasoning as _auto_generate_full_report's identical
-            # fallback chain (see its comments). Reuses the combined
-            # report's own date range when one was given (range_start/
-            # range_end, from the modal's Date & Time Range fields) so the
-            # outcome history matches whatever scope the caller asked for;
-            # falls back to default_campaign_date_range otherwise.
+            # fallback chain (see its comments). Runs whenever EITHER
+            # full_outcome_history is on OR the modal's own Date & Time
+            # Range was set (range_start/range_end) — the latter is what
+            # makes this match Agent Performance's per-interaction-in-range
+            # counting by default for a date-scoped combined report,
+            # without needing the separate opt-in checkbox. Falls back to
+            # default_campaign_date_range only when neither is given.
             description_counts = None
-            if full_outcome_history and campaign.cd_campaign_id:
+            if (full_outcome_history or range_start or range_end) and campaign.cd_campaign_id:
                 try:
                     from .external_source import fetch_outcome_history_counts, default_campaign_date_range
                     if range_start or range_end:
                         hist_start, hist_end = range_start, range_end
                     else:
                         hist_start, hist_end = default_campaign_date_range(campaign)
+                    # Restrict to exactly this campaign's own resolved
+                    # contacts (query, already scoped by file(s)/list(s)/
+                    # date range above) — same reasoning as the
+                    # single-campaign path's identical file_customer_ids.
+                    campaign_customer_ids = list(
+                        query.exclude(customer_id__isnull=True)
+                        .exclude(customer_id='')
+                        .values_list('customer_id', flat=True)
+                        .distinct()
+                    )
                     raw_history_counts, campaign_skipped_ranges = fetch_outcome_history_counts(
-                        campaign.cd_campaign_id, start_dt=hist_start, end_dt=hist_end
+                        campaign.cd_campaign_id, start_dt=hist_start, end_dt=hist_end,
+                        customer_ids=campaign_customer_ids
                     )
                     description_counts = {}
                     for key, count in raw_history_counts.items():
@@ -3236,7 +3457,7 @@ class ReportViewSet(
 class ReportTemplateViewSet(viewsets.ModelViewSet):
     """Manage report templates — campaign-scoped."""
     serializer_class = ReportTemplateSerializer
-    permission_classes = [AllowAny]
+    # No permission_classes override here -- inherits the global IsAuthenticated default (see settings.py REST_FRAMEWORK). This used to be AllowAny; flipped as part of a security pass since this endpoint handles real data/PII and has no reason to be reachable unauthenticated.
     parser_classes = [MultiPartParser, FormParser]
 
     def get_queryset(self):
@@ -3349,7 +3570,6 @@ class ReportTemplateViewSet(viewsets.ModelViewSet):
 
 
 @api_view(['POST'])
-@permission_classes([AllowAny])
 def upload_report_template(request):
     """Standalone endpoint to upload a report template."""
     if 'file' not in request.FILES:
@@ -3963,7 +4183,7 @@ class TemplateBasedReportGenerator:
 
 class DashboardStatsView(generics.GenericAPIView):
     """Get dashboard statistics, optionally scoped to a campaign."""
-    permission_classes = [AllowAny]
+    # No permission_classes override here -- inherits the global IsAuthenticated default (see settings.py REST_FRAMEWORK). This used to be AllowAny; flipped as part of a security pass since this endpoint handles real data/PII and has no reason to be reachable unauthenticated.
 
     def get(self, request):
         user = request.user
@@ -4031,7 +4251,7 @@ class QASyncView(generics.GenericAPIView):
     interactions in that range — omitted entirely, sync_campaign_qa_cache
     falls back to a bounded default (see external_source.default_campaign_date_range).
     """
-    permission_classes = [AllowAny]
+    # No permission_classes override here -- inherits the global IsAuthenticated default (see settings.py REST_FRAMEWORK). This used to be AllowAny; flipped as part of a security pass since this endpoint handles real data/PII and has no reason to be reachable unauthenticated.
 
     def post(self, request):
         from .qa_source import sync_campaign_qa_cache, ExternalSourceError
@@ -4106,7 +4326,7 @@ class QARecordsView(generics.GenericAPIView):
     more campaigns at once, unlike everything else in this app which is
     scoped to a single campaign — reads the local QACallRecord cache.
     """
-    permission_classes = [AllowAny]
+    # No permission_classes override here -- inherits the global IsAuthenticated default (see settings.py REST_FRAMEWORK). This used to be AllowAny; flipped as part of a security pass since this endpoint handles real data/PII and has no reason to be reachable unauthenticated.
 
     def get(self, request):
         empty = {'count': 0, 'results': [], 'page': 1, 'num_pages': 1, 'last_synced': None}
@@ -4152,7 +4372,7 @@ class QARecordsView(generics.GenericAPIView):
 
 class QAOutcomesView(generics.GenericAPIView):
     """Distinct full outcome names actually present in the local QA cache for the given campaign(s)."""
-    permission_classes = [AllowAny]
+    # No permission_classes override here -- inherits the global IsAuthenticated default (see settings.py REST_FRAMEWORK). This used to be AllowAny; flipped as part of a security pass since this endpoint handles real data/PII and has no reason to be reachable unauthenticated.
 
     def get(self, request):
         local_campaign_ids = [c for c in request.query_params.get('campaign_ids', '').split(',') if c]
@@ -4177,7 +4397,7 @@ class QADownloadView(generics.GenericAPIView):
     record instead of one page of them, since the on-screen table only ever
     shows 50 rows at a time.
     """
-    permission_classes = [AllowAny]
+    # No permission_classes override here -- inherits the global IsAuthenticated default (see settings.py REST_FRAMEWORK). This used to be AllowAny; flipped as part of a security pass since this endpoint handles real data/PII and has no reason to be reachable unauthenticated.
 
     def get(self, request):
         import xlsxwriter
@@ -4263,7 +4483,7 @@ class CampaignViewSet(viewsets.ModelViewSet):
     guard, so this doesn't loosen anything for them."""
     queryset = Campaign.objects.all().order_by('name')
     serializer_class = CampaignSerializer
-    permission_classes = [AllowAny]
+    # No permission_classes override here -- inherits the global IsAuthenticated default (see settings.py REST_FRAMEWORK). This used to be AllowAny; flipped as part of a security pass since this endpoint handles real data/PII and has no reason to be reachable unauthenticated.
 
     def perform_create(self, serializer):
         serializer.save(
@@ -4351,6 +4571,11 @@ class CampaignViewSet(viewsets.ModelViewSet):
         verified live at 25+ minutes on a large campaign); build the
         report afterward via generate_campaign instead. The
         CampaignUpload.js "Sync from Database" panel does this.
+        Optional POST body field: list_ids — specific upload batches to
+        pull instead of the default (every list currently marked Active in
+        the source system's Manage Data Lists screen; see
+        external_source.fetch_call_data_from_source). Picking a batch here
+        by id works even if it's since been deactivated.
         Optional POST body field: sheets — a list of keys from
         ReportViewSet.ALL_REPORT_SHEETS limiting which sheets the report
         builds (only relevant when auto_generate_report is True).
@@ -4358,6 +4583,10 @@ class CampaignViewSet(viewsets.ModelViewSet):
         Optional POST body field: full_outcome_history (bool, default
         False) — see ReportViewSet._auto_generate_full_report's docstring
         (only relevant when auto_generate_report is True).
+        Optional POST body field: template_sheet — sheet name from the
+        master template (see GET /api/reports/master_template_sheets/),
+        only relevant when auto_generate_report is True and 'template' is
+        in `sheets` (or `sheets` is omitted). See generate_campaign.
         """
         from .external_source import sync_campaign_from_database, ExternalSourceError
 
@@ -4381,11 +4610,17 @@ class CampaignViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
+        template_sheet = request.data.get('template_sheet') or None
+        template_sheet_error = ReportViewSet._validate_template_sheet(template_sheet)
+        if template_sheet_error:
+            return template_sheet_error
+
         try:
             instance = sync_campaign_from_database(
                 campaign, user=user, start_date=start_date, end_date=end_date,
                 start_time=start_time, end_time=end_time, list_ids=list_ids, sheets=sheets,
                 full_outcome_history=full_outcome_history, auto_generate_report=auto_generate_report,
+                template_sheet=template_sheet,
             )
         except ExternalSourceError as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
@@ -4540,46 +4775,3 @@ class CampaignViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
-
-
-# ===========================================================
-# UTILITY VIEWS
-# ===========================================================
-
-@api_view(['POST'])
-@permission_classes([AllowAny])
-def test_upload(request):
-    """Test endpoint for file upload."""
-    if 'file' not in request.FILES:
-        return Response({'error': 'No file provided'}, status=400)
-    file_obj = request.FILES['file']
-    try:
-        df = pd.read_excel(file_obj)
-        return Response({
-            'success':   True,
-            'filename':  file_obj.name,
-            'columns':   list(df.columns),
-            'row_count': len(df)
-        })
-    except Exception as e:
-        return Response({'error': str(e)}, status=400)
-
-
-@api_view(['GET'])
-@permission_classes([AllowAny])
-def setup_test_user(request):
-    """Create a test user for quick setup."""
-    if not User.objects.filter(username='test').exists():
-        user = User.objects.create_user(
-            username='test', email='test@example.com', password='test123'
-        )
-        user.is_active = True
-        user.save()
-        return Response({
-            'message': 'Test user created successfully!',
-            'credentials': {'username': 'test', 'password': 'test123'}
-        })
-    return Response({
-        'message': 'Test user already exists',
-        'credentials': {'username': 'test', 'password': 'test123'}
-    })

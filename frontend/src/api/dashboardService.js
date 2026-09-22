@@ -307,7 +307,7 @@ class DashboardService {
     }
   }
 
-  static async syncCampaignFromDatabase(campaignId, startDate = null, endDate = null, listIds = null, startTime = null, endTime = null, sheets = null, fullOutcomeHistory = false, autoGenerateReport = true) {
+  static async syncCampaignFromDatabase(campaignId, startDate = null, endDate = null, listIds = null, startTime = null, endTime = null, sheets = null, fullOutcomeHistory = false, autoGenerateReport = true, templateSheet = null) {
     try {
       const api = await DashboardService._api();
       const response = await api.post(`/api/campaigns/${campaignId}/sync_from_database/`, {
@@ -324,6 +324,7 @@ class DashboardService {
         // sent as `true` so existing callers that don't pass this at all
         // are unaffected.
         auto_generate_report: autoGenerateReport === false ? false : undefined,
+        template_sheet: templateSheet || undefined,
       });
       return { success: true, data: response.data };
     } catch (error) {
@@ -532,7 +533,21 @@ class DashboardService {
 
   // ========== REPORTS ==========
 
-  static async generateCampaignReport(campaignId, sheets = null, fullOutcomeHistory = false) {
+  // Sheet names available in the master "Call Centre Report Template.xlsx" —
+  // used to let the user pick which one to populate as Sheet1 right before
+  // generating a report, instead of guessing a campaign->sheet mapping.
+  static async getMasterTemplateSheets() {
+    try {
+      const api = await DashboardService._api();
+      const response = await api.get('/api/reports/master_template_sheets/');
+      return response.data;
+    } catch (error) {
+      console.error('Error fetching master template sheets:', error);
+      return { success: false, error: error.response?.data?.error || error.message };
+    }
+  }
+
+  static async generateCampaignReport(campaignId, sheets = null, fullOutcomeHistory = false, templateSheet = null) {
     try {
       if (!campaignId) {
         return { success: false, error: 'campaign_id is required to generate a report.' };
@@ -543,6 +558,7 @@ class DashboardService {
         campaign_id: campaignId,
         sheets: sheets && sheets.length > 0 ? sheets : undefined,
         full_outcome_history: fullOutcomeHistory || undefined,
+        template_sheet: templateSheet || undefined,
       });
       return { success: true, data: response.data };
     } catch (error) {

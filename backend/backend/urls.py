@@ -1,9 +1,8 @@
 # backend/backend/urls.py
 from django.contrib import admin
-from django.urls import path, include, re_path
+from django.urls import path, include
 from django.conf import settings
 from django.conf.urls.static import static
-from django.views.static import serve as static_serve
 from dashboard.views import CustomAuthToken, register_user, verify_token
 
 urlpatterns = [
@@ -15,23 +14,19 @@ urlpatterns = [
     path('verify-token/', verify_token, name='verify_token'),
 ]
 
+# DEBUG-only, matching Django's own recommended default — and deliberately
+# NOT added back for production this time (an earlier version of this file
+# did, via django.views.static.serve, reasoning that report downloads
+# needed it). That reasoning turned out to be wrong: verified that every
+# real download already goes through an authenticated DRF action
+# (ReportViewSet.download, CallDataFileViewSet.download_processed) which
+# reads the file off disk and streams it through the response directly —
+# neither ever links to or redirects through MEDIA_URL. A raw, unauthenticated
+# static-file route here would have bypassed the auth those endpoints
+# enforce entirely: anyone who could guess or enumerate a filename (report/
+# upload names include the campaign name and a timestamp — not exactly
+# hard to guess) could pull real contact PII (names, phone numbers, ID
+# numbers) straight off disk with no login at all. Nothing in this app
+# needs MEDIA_URL to be browser-reachable outside local dev.
 if settings.DEBUG:
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
-else:
-    # static()'s helper above is a no-op outside DEBUG by design (Django
-    # expects a real web server/CDN to serve media in production) — but
-    # this app has no such thing in front of it on Render, and its whole
-    # purpose is serving generated report files back for download, so
-    # without a route here every "Download Report" click would 404 once
-    # deployed. django.views.static.serve isn't recommended for
-    # high-traffic production use (no caching headers, streams through the
-    # Python process itself), but is an accepted, simple fit for an
-    # internal/low-traffic tool like this one — the alternative (S3 +
-    # django-storages) is real infrastructure this app doesn't have set up.
-    # Files served this way must actually exist on disk at MEDIA_ROOT,
-    # which on Render means the backend service's persistent disk (see
-    # render.yaml) — without that disk, this route would just 404 for a
-    # different reason (nothing there to serve).
-    urlpatterns += [
-        re_path(r'^media/(?P<path>.*)$', static_serve, {'document_root': settings.MEDIA_ROOT}),
-    ]

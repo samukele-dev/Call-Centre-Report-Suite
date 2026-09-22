@@ -119,8 +119,9 @@ export const AuthProvider = ({ children }) => {
     const errorMessage = 'Login failed. Possible issues:\n' +
       '1. Backend is not running\n' +
       '2. URL endpoint is incorrect\n' +
-      '3. Test user does not exist\n\n' +
-      `Try: ${API_BASE_URL}/setup-test-user/ to create test user`;
+      '3. Your username/password is wrong, or that user does not exist yet ' +
+      '(see backend/create_test_user.py — TEST_USER_PASSWORD must be set ' +
+      'for it to create one)';
     
     setAuthError(errorMessage);
     setIsLoading(false);
