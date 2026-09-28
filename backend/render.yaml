@@ -37,7 +37,24 @@ services:
     plan: 0.5c-512mb
     rootDir: backend
     buildCommand: "./build.sh"
-    startCommand: "gunicorn backend.wsgi:application --bind 0.0.0.0:$PORT"
+    # Long-running syncs (external_source.py — a single DB pull or windowed
+    # report scan can run for many minutes, verified at 25+ on large
+    # campaigns) were being SIGKILLed by gunicorn's default 30s worker
+    # timeout ("WORKER TIMEOUT ... Worker was sent SIGKILL"). Three parts:
+    #   --timeout 5400      90 min, deliberately just under Render's own
+    #                       ~100 min HTTP request limit, so gunicorn never
+    #                       kills a request Render itself would still allow.
+    #   --worker-class gthread --threads 4
+    #                       a long sync now occupies one thread, not the
+    #                       whole worker — health checks (/admin/login/) and
+    #                       other requests keep being served meanwhile,
+    #                       instead of Render seeing an unresponsive service.
+    #   --workers 1         must stay 1: qa_source.py's duplicate-sync guard
+    #                       (_syncing_campaign_ids) is process-local memory,
+    #                       so a second worker process would silently defeat
+    #                       it. Threads share that memory; processes don't.
+    # --graceful-timeout/--keep-alive left at defaults.
+    startCommand: "gunicorn backend.wsgi:application --bind 0.0.0.0:$PORT --workers 1 --worker-class gthread --threads 4 --timeout 5400"
     healthCheckPath: /admin/login/
     disk:
       # Persists CallDataFile/GeneratedReport uploads across deploys and

@@ -384,6 +384,36 @@ def _fetch_customer_ids_called_in_range(cd_campaign_id, start_dt, end_dt):
         conn.close()
 
 
+def _read_sql_chunked(conn, sql, params, chunksize=50000):
+    """
+    Run sql on a raw psycopg2 connection and return one DataFrame, streaming
+    the rows through a server-side (named) cursor chunksize at a time instead
+    of pd.read_sql's fetchall(). A plain client-side cursor pulls the entire
+    result into a list of Python tuples before pandas even starts copying it
+    into columns, so a multi-hundred-thousand-row campaign briefly holds two
+    full copies in memory — on the 512MB Render plan that's what gets the
+    worker killed. Here only one chunk of tuples exists at a time. Going
+    through the cursor directly also avoids pandas' "only supports SQLAlchemy
+    connectable" UserWarning (pd.read_sql with a raw DBAPI2 connection) without
+    adding SQLAlchemy as a dependency for this one call.
+    """
+    frames = []
+    columns = None
+    with conn.cursor(name='call_data_sync') as cur:
+        cur.itersize = chunksize
+        cur.execute(sql, params)
+        while True:
+            rows = cur.fetchmany(chunksize)
+            if columns is None and cur.description:
+                columns = [d[0] for d in cur.description]
+            if not rows:
+                break
+            frames.append(pd.DataFrame(rows, columns=columns))
+    if not frames:
+        return pd.DataFrame(columns=columns or [])
+    return pd.concat(frames, ignore_index=True)
+
+
 def fetch_call_data_from_source(cd_campaign_id, start_date=None, end_date=None, start_time=None, end_time=None, list_ids=None):
     """
     Run the source query for one campaign UUID (cxm.campaigns.id) and return
@@ -442,7 +472,7 @@ def fetch_call_data_from_source(cd_campaign_id, start_date=None, end_date=None, 
 
     conn = _get_connection()
     try:
-        df = pd.read_sql(sql, conn, params=tuple(params))
+        df = _read_sql_chunked(conn, sql, tuple(params))
     except Exception as e:
         raise ExternalSourceError(f"Query against external database failed: {e}")
     finally:

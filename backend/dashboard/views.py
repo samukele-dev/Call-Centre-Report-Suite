@@ -450,7 +450,17 @@ class CallDataFileViewSet(viewsets.ModelViewSet):
                     'firstname': record.firstname or '',
                     'lastname': record.lastname or '',
                     'contact_id': record.contact_id or '',
-                    'Client ID number': record.customer_id or '',
+                    # record.id_number — the contact's real ID/passport
+                    # number (pulled from the source DB's per-campaign
+                    # custom jsonb field; see external_source.
+                    # SOURCE_QUERY_TEMPLATE's comment for the id_num/idn/
+                    # idno/id_no/idnumber/id_number variants it's COALESCEd
+                    # from). This used to read record.customer_id instead —
+                    # that's the source DB's own internal UUID for the
+                    # contact row, not an ID number at all, and was wrong
+                    # for exactly the reason id_number was added to this
+                    # app in the first place.
+                    'Client ID number': record.id_number or '',
                     'Contact': f"{record.firstname or ''} {record.lastname or ''}".strip() or '',
                     'Right party contact': '',
                     'Presentation': '',
@@ -471,13 +481,16 @@ class CallDataFileViewSet(viewsets.ModelViewSet):
             
             df = pd.DataFrame(data)
             
-            # Create Excel file
+            # Create Excel file — single sheet, named "Processed Data" (not
+            # "Export Data") per what this export is meant to represent:
+            # this campaign's processed data in the fixed column layout
+            # above, not a generic "export" of arbitrary shape.
             output = BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                df.to_excel(writer, sheet_name='Export Data', index=False)
-                
+                df.to_excel(writer, sheet_name='Processed Data', index=False)
+
                 # Auto-adjust column widths
-                worksheet = writer.sheets['Export Data']
+                worksheet = writer.sheets['Processed Data']
                 for idx, col in enumerate(df.columns):
                     max_length = max(
                         df[col].astype(str).map(len).max(),
