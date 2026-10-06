@@ -1,8 +1,10 @@
 // src/pages/QA.js
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { Form, Dropdown, Spinner, Alert } from 'react-bootstrap';
 import { saveAs } from 'file-saver';
 import DashboardService from '../api/dashboardService';
+import { useQASync } from '../context/QASyncContext';
+import { describeError, requireSelections, validateDateRange } from '../utils/errorMessages';
 
 const PAGE_SIZE = 50;
 
@@ -21,18 +23,19 @@ const QA = () => {
   const [totalCount, setTotalCount] = useState(0);
   const [numPages, setNumPages] = useState(1);
   const [lastSynced, setLastSynced] = useState(null);
+  // Per selected campaign: [{ campaign_id, campaign, gaps: [{start_date, start_time, end_date, end_time}] }]
+  // — the parts of the current date filter that were never synced.
+  const [coverage, setCoverage] = useState([]);
   const [currentPage, setCurrentPage] = useState(1);
   const [loading, setLoading] = useState(false);
   const [loadingOutcomes, setLoadingOutcomes] = useState(false);
-  const [syncing, setSyncing] = useState(false);
-  const [syncProgress, setSyncProgress] = useState(null); // { index, total, campaignName }
-  const [stopping, setStopping] = useState(false);
-  const [syncMessage, setSyncMessage] = useState(null);
   const [error, setError] = useState(null);
-  const [downloading, setDownloading] = useState(false);
-  const syncAbortRef = useRef(null);
-  const stopRequestedRef = useRef(false);
-  const syncInFlightRef = useRef(false);
+  // Syncs and downloads live in QASyncProvider (app level), not here, so they keep
+  // running — and their progress/Stop stays visible — when you open another page.
+  const {
+    syncing, downloading, progress: syncProgress, stopping, completedTick, activityTick,
+    runSync, runDownload, stopSync: handleStopSync,
+  } = useQASync();
 
   useEffect(() => {
     DashboardService.getCampaigns().then(result => {
@@ -74,6 +77,15 @@ const QA = () => {
       setTotalCount(0);
       setNumPages(1);
       setLastSynced(null);
+      setCoverage([]);
+      return;
+    }
+    const dateProblem = validateDateRange({ startDate, endDate, startTime, endTime });
+    if (dateProblem) {
+      setError(dateProblem);
+      setRecords([]);
+      setTotalCount(0);
+      setNumPages(1);
       return;
     }
     setLoading(true);
@@ -93,8 +105,9 @@ const QA = () => {
       setTotalCount(result.data.count || 0);
       setNumPages(result.data.num_pages || 1);
       setLastSynced(result.data.last_synced || null);
+      setCoverage(result.data.coverage || []);
     } else {
-      setError(typeof result.error === 'object' ? JSON.stringify(result.error) : result.error);
+      setError(describeError(result.error, 'Could not load QA records'));
       setRecords([]);
       setTotalCount(0);
       setNumPages(1);
@@ -110,117 +123,117 @@ const QA = () => {
     setCurrentPage(1);
   }, [selectedCampaignIds, startDate, endDate, startTime, endTime, selectedOutcomes]);
 
-  // Syncs one campaign per request, sequentially, instead of one giant
-  // request for every selected campaign — a single request covering many
-  // large campaigns can run for hours with zero feedback in between. This
-  // way each campaign's progress shows up as it happens, already-synced
-  // campaigns are visible in the results immediately, and the run can be
-  // stopped between campaigns without losing anything already synced.
-  const handleSync = async () => {
-    // Guards against a fast double-click firing this twice: React state
-    // updates are batched, so the `syncing` state alone isn't guaranteed to
-    // have re-rendered between two click events fired close together. This
-    // ref is set synchronously, before any await, so a second call in the
-    // same tick sees it immediately.
-    if (selectedCampaignIds.length === 0 || syncInFlightRef.current) return;
-    syncInFlightRef.current = true;
-    setSyncing(true);
-    setStopping(false);
-    setSyncMessage(null);
+  // Refetch whenever the shared sync finishes a job (it keeps running when
+  // this page isn't mounted, so this also catches up after coming back to it).
+  useEffect(() => {
+    if (completedTick > 0) {
+      fetchRecords();
+      fetchOutcomeOptions();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [completedTick]);
+
+  // Starts the sync in the shared provider: one request per job, sequentially,
+  // with progress, Stop and incremental refresh handled there. `plan`
+  // (optional) is a list of { campaignId, startDate, startTime, endDate,
+  // endTime } jobs — used by "Sync missing range" to pull just the uncovered
+  // gaps. Without it, each selected campaign is synced for the page's own
+  // date filter (defaults to the last 7 days on load; reporting.
+  // interaction_voice has no campaign index, so widening the filter and
+  // re-syncing is what pulls more history).
+  const handleSync = (plan = null) => {
+    const problem =
+      requireSelections([[selectedCampaignIds, 'at least one campaign (Campaigns dropdown)']]) ||
+      validateDateRange({ startDate, endDate, startTime, endTime });
+    if (problem) {
+      setError(problem);
+      return;
+    }
     setError(null);
-    stopRequestedRef.current = false;
-
-    const campaignIds = [...selectedCampaignIds];
-    const total = campaignIds.length;
     const campaignNameById = new Map(campaigns.map(c => [c.id, c.display_name]));
-    const results = [];
-
-    for (let i = 0; i < total; i++) {
-      if (stopRequestedRef.current) break;
-      const campaignId = campaignIds[i];
-      setSyncProgress({ index: i + 1, total, campaignName: campaignNameById.get(campaignId) || `Campaign ${campaignId}` });
-
-      const controller = new AbortController();
-      syncAbortRef.current = controller;
-      // Sync scope matches whatever the page's own date filter is
-      // currently set to (defaults to the last 7 days on load) — reporting.
-      // interaction_voice has no campaign index, so an unbounded sync would
-      // be slow; widening the filter and re-syncing pulls more history.
-      const result = await DashboardService.syncQACache([campaignId], controller.signal, {
-        startDate, endDate, startTime, endTime,
-      });
-      syncAbortRef.current = null;
-
-      if (result.aborted) break;
-
-      if (result.success) {
-        const entry = (result.data?.results || [])[0];
-        if (entry) results.push(entry);
-      } else {
-        results.push({ campaign_id: campaignId, campaign: campaignNameById.get(campaignId), error: result.error });
-      }
-
-      // Refresh incrementally so campaigns already synced show up right away
-      // instead of waiting for the whole run to finish.
-      await Promise.all([fetchRecords(), fetchOutcomeOptions()]);
-    }
-
-    const stoppedEarly = stopRequestedRef.current;
-    syncInFlightRef.current = false;
-    setSyncProgress(null);
-    setSyncing(false);
-    setStopping(false);
-
-    const failed = results.filter(r => r.error);
-    const okCount = results.filter(r => !r.error).reduce((sum, r) => sum + (r.records_synced || 0), 0);
-    const okCampaigns = results.filter(r => !r.error).length;
-
-    if (failed.length > 0) {
-      setError(`Sync failed for: ${failed.map(f => `${f.campaign} (${f.error})`).join('; ')}`);
-    }
-    if (results.length > 0) {
-      setSyncMessage(
-        `${stoppedEarly ? 'Stopped — s' : 'S'}ynced ${okCount.toLocaleString()} record${okCount === 1 ? '' : 's'} across ${okCampaigns} of ${total} campaign${total === 1 ? '' : 's'}.`
-      );
-    }
+    const jobs = (Array.isArray(plan)
+      ? plan
+      : selectedCampaignIds.map(campaignId => ({ campaignId, startDate, startTime, endDate, endTime }))
+    ).map(job => ({ ...job, campaignName: campaignNameById.get(job.campaignId) }));
+    runSync(jobs);
   };
-
-  const handleStopSync = () => {
-    stopRequestedRef.current = true;
-    setStopping(true);
-    if (syncAbortRef.current) {
-      syncAbortRef.current.abort();
-    }
-  };
-
   // Downloads every record matching the current filters (campaigns,
   // outcomes, date range) as one .xlsx file — not just the current 50-row
   // page shown on screen.
-  const handleDownload = async () => {
-    if (selectedCampaignIds.length === 0 || downloading) return;
-    setDownloading(true);
+  // The download itself runs in the shared provider, so it finishes (and
+  // notifies you) even if you switch to another page while it's preparing.
+  const handleDownload = () => {
+    if (downloading) return;
+    const problem =
+      requireSelections([[selectedCampaignIds, 'at least one campaign (Campaigns dropdown)']]) ||
+      validateDateRange({ startDate, endDate, startTime, endTime });
+    if (problem) {
+      setError(problem);
+      return;
+    }
     setError(null);
-    try {
-      const result = await DashboardService.downloadQARecords({
-        campaignIds: selectedCampaignIds,
-        startDate: startDate || null,
-        endDate: endDate || null,
-        startTime: startTime || null,
-        endTime: endTime || null,
-        outcomes: selectedOutcomes,
-      });
-      if (result.success) {
-        const timestamp = new Date().toISOString().slice(0, 10);
-        saveAs(result.data, `QA_Records_${timestamp}.xlsx`);
-      } else {
-        setError(typeof result.error === 'object' ? JSON.stringify(result.error) : result.error);
-      }
-    } catch (err) {
-      setError('Error downloading QA records');
-    } finally {
-      setDownloading(false);
+    runDownload({
+      campaignIds: selectedCampaignIds,
+      startDate: startDate || null,
+      endDate: endDate || null,
+      startTime: startTime || null,
+      endTime: endTime || null,
+      outcomes: selectedOutcomes,
+    });
+  };
+
+  // ----- Recent activity (the user's past syncs / downloads, kept server-side) -----
+  const [activity, setActivity] = useState([]);
+  const [activityOpen, setActivityOpen] = useState(true);
+
+  useEffect(() => {
+    DashboardService.getQAActivity().then(result => {
+      if (result.success) setActivity(result.data || []);
+    });
+  }, [activityTick]);
+
+  // Puts the filter bar back to exactly what a past sync/download used.
+  const applyActivityFilters = (a) => {
+    const f = a.filters || {};
+    const known = new Set(campaigns.map(c => c.id));
+    const ids = (f.campaign_ids || []).filter(id => known.has(id));
+    if (ids.length === 0) {
+      setError('The campaign(s) for that entry are no longer in the campaign list.');
+      return;
+    }
+    setError(null);
+    setSelectedCampaignIds(ids);
+    setStartDate(f.start_date || '');
+    setEndDate(f.end_date || '');
+    setStartTime(f.start_time ? f.start_time.slice(0, 5) : '');
+    setEndTime(f.end_time ? f.end_time.slice(0, 5) : '');
+    setSelectedOutcomes(f.outcomes || []);
+  };
+
+  const redownloadActivityFile = async (a) => {
+    setError(null);
+    const result = await DashboardService.downloadQAActivityFile(a.id);
+    if (result.success) {
+      saveAs(result.data, `QA_Records_${(a.created_at || '').slice(0, 10) || 'file'}.xlsx`);
+    } else {
+      setError(result.error);
     }
   };
+
+  const describeActivityFilters = (a) => {
+    const f = a.filters || {};
+    const parts = [];
+    if (f.start_date || f.end_date) parts.push(`${f.start_date || '…'} → ${f.end_date || '…'}`);
+    if (f.outcomes && f.outcomes.length > 0) parts.push(`${f.outcomes.length} outcome${f.outcomes.length === 1 ? '' : 's'}`);
+    return parts.join(' · ') || 'No date filter';
+  };
+
+  const activityStatusBadge = (s) => ({
+    running: <span className="badge bg-info text-dark">Running</span>,
+    done: <span className="badge bg-success">Done</span>,
+    stopped: <span className="badge bg-warning text-dark">Stopped</span>,
+    failed: <span className="badge bg-danger">Failed</span>,
+  }[s] || <span className="badge bg-secondary">{s}</span>);
 
   const toggleCampaign = (id) => {
     setSelectedCampaignIds(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
@@ -271,6 +284,28 @@ const QA = () => {
     const m = Math.floor(seconds / 60);
     const s = seconds % 60;
     return `${m}:${String(s).padStart(2, '0')}`;
+  };
+
+  // Uncovered parts of the current date filter, one sync job per gap.
+  const campaignsWithGaps = coverage.filter(c => c.gaps && c.gaps.length > 0);
+  const missingRangePlan = campaignsWithGaps.flatMap(c =>
+    c.gaps.map(g => ({
+      campaignId: c.campaign_id,
+      startDate: g.start_date, startTime: g.start_time,
+      endDate: g.end_date, endTime: g.end_time,
+    }))
+  );
+
+  const formatGapDate = (dateStr, timeStr, isEnd) => {
+    const d = new Date(`${dateStr}T00:00:00`);
+    const label = d.toLocaleDateString([], { day: 'numeric', month: 'short' });
+    const wholeDay = isEnd ? timeStr === '23:59:59' : timeStr === '00:00:00';
+    return wholeDay ? label : `${label} ${timeStr.slice(0, 5)}`;
+  };
+  const formatGap = (g) => {
+    const from = formatGapDate(g.start_date, g.start_time, false);
+    const to = formatGapDate(g.end_date, g.end_time, true);
+    return from === to ? from : `${from} – ${to}`;
   };
 
   const formatSyncedAt = (iso) => {
@@ -440,6 +475,30 @@ const QA = () => {
         </Form.Group>
       </div>
 
+      {selectedCampaignIds.length > 0 && !syncing && campaignsWithGaps.length > 0 && (
+        <Alert variant="warning" className="mb-3">
+          <div className="d-flex justify-content-between align-items-start gap-3">
+            <div>
+              <strong>These results are incomplete for the dates you picked.</strong> Some of the date range
+              has never been synced, so counts (including sales) can be lower than the real numbers:
+              <ul className="mb-1 mt-2">
+                {campaignsWithGaps.map(c => (
+                  <li key={c.campaign_id}>
+                    <strong>{c.campaign}</strong> — not synced for {c.gaps.map(formatGap).join(', ')}
+                  </li>
+                ))}
+              </ul>
+              <span className="small text-muted">
+                Data synced before this check existed also shows here — syncing the missing range confirms it.
+              </span>
+            </div>
+            <button className="btn btn-sm btn-warning flex-shrink-0" onClick={() => handleSync(missingRangePlan)}>
+              <i className="bi bi-arrow-repeat me-1"></i>Sync missing range
+            </button>
+          </div>
+        </Alert>
+      )}
+
       {selectedCampaignIds.length > 0 && (
         <div className="qa-sync-bar mb-3">
           <div className="qa-sync-status">
@@ -476,7 +535,7 @@ const QA = () => {
               </button>
             </>
           ) : (
-            <button className="btn btn-sm btn-outline-secondary" onClick={handleSync}>
+            <button className="btn btn-sm btn-outline-secondary" onClick={() => handleSync()}>
               <i className="bi bi-arrow-repeat me-1"></i>Sync Now
             </button>
           )}
@@ -495,8 +554,61 @@ const QA = () => {
         </div>
       )}
 
-      {syncMessage && <Alert variant="success" dismissible onClose={() => setSyncMessage(null)} className="mb-3">{syncMessage}</Alert>}
       {error && <Alert variant="danger" dismissible onClose={() => setError(null)} className="mb-3">{error}</Alert>}
+
+      {/* Recent activity — what you asked for, even if you left the page while it ran */}
+      <div className="qa-activity mb-3">
+        <button
+          type="button"
+          className="qa-activity-toggle"
+          onClick={() => setActivityOpen(o => !o)}
+          aria-expanded={activityOpen}
+        >
+          <span>
+            <i className={`bi ${activityOpen ? 'bi-chevron-down' : 'bi-chevron-right'} me-2`}></i>
+            <strong>Recent activity</strong>
+            <span className="text-muted small ms-2">your latest syncs and downloads</span>
+          </span>
+          <span className="text-muted small">{activity.length} item{activity.length === 1 ? '' : 's'}</span>
+        </button>
+        {activityOpen && (
+          activity.length === 0 ? (
+            <div className="text-muted small p-3">Nothing yet — syncs and downloads you run will be listed here.</div>
+          ) : (
+            <div className="table-responsive">
+              <table className="table table-sm align-middle mb-0 qa-activity-table">
+                <thead>
+                  <tr>
+                    <th>When</th><th>What</th><th>Campaign</th><th>Filters</th><th>Status</th><th className="text-end">Records</th><th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {activity.slice(0, 10).map(a => (
+                    <tr key={a.id}>
+                      <td className="text-nowrap">{formatDate(a.created_at)}</td>
+                      <td>{a.kind === 'download' ? 'Download' : 'Sync'}</td>
+                      <td>{a.campaign || '—'}</td>
+                      <td className="small text-muted">{describeActivityFilters(a)}</td>
+                      <td title={a.message || ''}>{activityStatusBadge(a.status)}</td>
+                      <td className="text-end">{a.records != null ? a.records.toLocaleString() : '—'}</td>
+                      <td className="text-end text-nowrap">
+                        <button className="btn btn-sm btn-outline-secondary me-1" onClick={() => applyActivityFilters(a)}>
+                          Use filters
+                        </button>
+                        {a.has_file && (
+                          <button className="btn btn-sm btn-outline-primary" onClick={() => redownloadActivityFile(a)}>
+                            <i className="bi bi-download me-1"></i>File
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )
+        )}
+      </div>
 
       {selectedCampaignIds.length === 0 ? (
         <div className="text-center py-5">

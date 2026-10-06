@@ -39,10 +39,20 @@ elif admin_user is None:
     Token.objects.get_or_create(user=admin_user)
     print(f"Created user '{TEST_USER_USERNAME}'.")
 else:
-    # Already exists — left untouched (password not reset on repeat runs,
-    # e.g. every deploy), but still ensure it has a token: a user created
-    # before this script managed tokens, or one whose token row was lost
-    # some other way, would otherwise be stuck without one forever, since
-    # this branch never used to run get_or_create on Token at all.
+    # Already exists. TEST_USER_PASSWORD, when set, is the source of truth:
+    # if the stored password differs (the user was first created with an
+    # older/different value, or the env var was changed afterward), it's
+    # updated to match — otherwise login keeps failing with "Unable to log in
+    # with provided credentials" no matter what the env var says. When
+    # TEST_USER_PASSWORD is unset the password is left alone. Also ensure it
+    # has a token: a user created before this script managed tokens, or one
+    # whose token row was lost some other way, would otherwise be stuck
+    # without one forever.
+    if TEST_USER_PASSWORD and not admin_user.check_password(TEST_USER_PASSWORD):
+        admin_user.set_password(TEST_USER_PASSWORD)
+        admin_user.is_active = True
+        admin_user.save()
+        print(f"User '{TEST_USER_USERNAME}' password updated to match TEST_USER_PASSWORD.")
+    else:
+        print(f"User '{TEST_USER_USERNAME}' already exists — password unchanged.")
     Token.objects.get_or_create(user=admin_user)
-    print(f"User '{TEST_USER_USERNAME}' already exists — left untouched.")

@@ -1,5 +1,6 @@
 // src/api/dashboardService.js - COMPLETE FIXED VERSION
 import { dashboardAPI } from './apiConfig';
+import { describeError } from '../utils/errorMessages';
 
 class DashboardService {
 
@@ -17,7 +18,7 @@ class DashboardService {
       const response = await api.get('/api/outcome-sets/');
       return { success: true, data: response.data };
     } catch (error) {
-      return { success: false, error: error.response?.data || 'Failed to fetch outcome sets', data: [] };
+      return { success: false, error: describeError(error, 'Failed to fetch outcome sets'), data: [] };
     }
   }
 
@@ -27,7 +28,7 @@ class DashboardService {
       const response = await api.post('/api/outcome-sets/', data);
       return { success: true, data: response.data };
     } catch (error) {
-      return { success: false, error: error.response?.data || 'Failed to create outcome set' };
+      return { success: false, error: describeError(error, 'Failed to create outcome set') };
     }
   }
 
@@ -37,7 +38,7 @@ class DashboardService {
       const response = await api.patch(`/api/outcome-sets/${id}/`, data);
       return { success: true, data: response.data };
     } catch (error) {
-      return { success: false, error: error.response?.data || 'Failed to update outcome set' };
+      return { success: false, error: describeError(error, 'Failed to update outcome set') };
     }
   }
 
@@ -47,7 +48,7 @@ class DashboardService {
       await api.delete(`/api/outcome-sets/${id}/`);
       return { success: true };
     } catch (error) {
-      return { success: false, error: error.response?.data || 'Failed to delete outcome set' };
+      return { success: false, error: describeError(error, 'Failed to delete outcome set') };
     }
   }
 
@@ -63,7 +64,7 @@ class DashboardService {
       return { success: true, data: response.data };
     } catch (error) {
       console.error('API Error:', error);
-      return { success: false, error: error.response?.data || 'API request failed' };
+      return { success: false, error: describeError(error, 'API request failed') };
     }
   }
 
@@ -73,7 +74,7 @@ class DashboardService {
       const response = await api.post('/api/outcomes/', data);
       return { success: true, data: response.data };
     } catch (error) {
-      return { success: false, error: error.response?.data || 'Failed to create outcome' };
+      return { success: false, error: describeError(error, 'Failed to create outcome') };
     }
   }
 
@@ -83,7 +84,7 @@ class DashboardService {
       const response = await api.put(`/api/outcomes/${id}/`, data);
       return { success: true, data: response.data };
     } catch (error) {
-      return { success: false, error: error.response?.data || 'Failed to update outcome' };
+      return { success: false, error: describeError(error, 'Failed to update outcome') };
     }
   }
 
@@ -93,7 +94,7 @@ class DashboardService {
       await api.delete(`/api/outcomes/${id}/`);
       return { success: true };
     } catch (error) {
-      return { success: false, error: error.response?.data || 'Failed to delete outcome' };
+      return { success: false, error: describeError(error, 'Failed to delete outcome') };
     }
   }
 
@@ -108,7 +109,7 @@ class DashboardService {
       });
       return { success: true, data: response.data };
     } catch (error) {
-      return { success: false, error: error.response?.data || 'Failed to upload file' };
+      return { success: false, error: describeError(error, 'Failed to upload file') };
     }
   }
 
@@ -144,7 +145,7 @@ class DashboardService {
     } catch (error) {
       return {
         success: false,
-        error: error.response?.data?.error || error.response?.data || 'Failed to fetch QA records',
+        error: describeError(error, 'Failed to fetch QA records'),
         data: { count: 0, results: [], page: 1, num_pages: 1, last_synced: null }
       };
     }
@@ -175,7 +176,32 @@ class DashboardService {
 
       return { success: true, data: response.data };
     } catch (error) {
-      return { success: false, error: error.response?.data?.error || error.response?.data || 'Failed to download QA records' };
+      return { success: false, error: describeError(error, 'Failed to download QA records') };
+    }
+  }
+
+  // The signed-in user's recent QA syncs and downloads (newest first).
+  static async getQAActivity() {
+    try {
+      const api = await DashboardService._api();
+      const response = await api.get('/api/qa/activity/');
+      return { success: true, data: response.data };
+    } catch (error) {
+      return { success: false, error: describeError(error, 'Failed to load recent activity'), data: [] };
+    }
+  }
+
+  // Re-download the file saved for a past QA download.
+  static async downloadQAActivityFile(activityId) {
+    try {
+      const api = await DashboardService._api();
+      const response = await api.get(`/api/qa/activity/${activityId}/file/`, { responseType: 'blob' });
+      return { success: true, data: response.data };
+    } catch (error) {
+      if (error.response?.status === 404) {
+        return { success: false, error: 'This file is no longer available — run the download again.' };
+      }
+      return { success: false, error: describeError(error, 'Failed to download the file') };
     }
   }
 
@@ -185,7 +211,7 @@ class DashboardService {
       const response = await api.get('/api/qa/outcomes/', { params: { campaign_ids: campaignIds.join(',') } });
       return { success: true, data: response.data };
     } catch (error) {
-      return { success: false, error: error.response?.data || 'Failed to fetch outcomes', data: [] };
+      return { success: false, error: describeError(error, 'Failed to fetch outcomes'), data: [] };
     }
   }
 
@@ -209,7 +235,20 @@ class DashboardService {
       if (error.code === 'ERR_CANCELED') {
         return { success: false, aborted: true };
       }
-      return { success: false, error: error.response?.data?.error || error.response?.data || 'Failed to sync QA data' };
+      return { success: false, error: describeError(error, 'Failed to sync QA data') };
+    }
+  }
+
+  // Asks the server to actually stop a running QA sync. Aborting the browser
+  // request alone only abandons the response — the server-side pull would keep
+  // running (and hold that campaign's sync lock) until it finished on its own.
+  static async cancelQASync(campaignIds = []) {
+    try {
+      const api = await DashboardService._api();
+      await api.post('/api/qa/sync/cancel/', { campaign_ids: campaignIds });
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: describeError(error, 'Failed to stop sync') };
     }
   }
 
@@ -222,7 +261,7 @@ class DashboardService {
       return { success: true, data: response.data };
     } catch (error) {
       console.error('Error fetching campaigns:', error);
-      return { success: false, error: error.response?.data || error.message, data: [] };
+      return { success: false, error: describeError(error), data: [] };
     }
   }
 
@@ -233,7 +272,7 @@ class DashboardService {
       return { success: true, data: response.data };
     } catch (error) {
       console.error('Error fetching campaign:', error);
-      return { success: false, error: error.response?.data || error.message };
+      return { success: false, error: describeError(error) };
     }
   }
 
@@ -244,7 +283,7 @@ class DashboardService {
       return { success: true, data: response.data };
     } catch (error) {
       console.error('Error creating campaign:', error);
-      return { success: false, error: error.response?.data || error.message };
+      return { success: false, error: describeError(error) };
     }
   }
 
@@ -255,7 +294,7 @@ class DashboardService {
       return { success: true, data: response.data };
     } catch (error) {
       console.error('Error updating campaign:', error);
-      return { success: false, error: error.response?.data || error.message };
+      return { success: false, error: describeError(error) };
     }
   }
 
@@ -266,7 +305,7 @@ class DashboardService {
       return { success: true };
     } catch (error) {
       console.error('Error deleting campaign:', error);
-      return { success: false, error: error.response?.data || error.message };
+      return { success: false, error: describeError(error) };
     }
   }
 
@@ -277,7 +316,7 @@ class DashboardService {
       return { success: true, data: response.data };
     } catch (error) {
       console.error('Error fetching campaign stats:', error);
-      return { success: false, error: error.response?.data || error.message };
+      return { success: false, error: describeError(error) };
     }
   }
 
@@ -288,7 +327,7 @@ class DashboardService {
       return { success: true, data: response.data };
     } catch (error) {
       console.error('Error fetching campaign activity:', error);
-      return { success: false, error: error.response?.data || error.message };
+      return { success: false, error: describeError(error) };
     }
   }
 
@@ -301,7 +340,7 @@ class DashboardService {
       console.error('Error fetching source lists:', error);
       return {
         success: false,
-        error: error.response?.data?.error || error.response?.data || 'Failed to fetch source lists',
+        error: describeError(error, 'Failed to fetch source lists'),
         data: []
       };
     }
@@ -331,7 +370,7 @@ class DashboardService {
       console.error('Database sync error:', error);
       return {
         success: false,
-        error: error.response?.data?.error || error.response?.data || 'Database sync failed'
+        error: describeError(error, 'Database sync failed')
       };
     }
   }
@@ -349,7 +388,7 @@ class DashboardService {
       console.error('Campaign sync error:', error);
       return {
         success: false,
-        error: error.response?.data?.error || error.response?.data || 'Campaign sync failed'
+        error: describeError(error, 'Campaign sync failed')
       };
     }
   }
@@ -363,7 +402,7 @@ class DashboardService {
       console.error('Connection test error:', error);
       return {
         success: false,
-        error: error.response?.data?.error || error.response?.data || 'Connection test failed'
+        error: describeError(error, 'Connection test failed')
       };
     }
   }
@@ -377,7 +416,7 @@ class DashboardService {
       console.error('Get source campaigns error:', error);
       return {
         success: false,
-        error: error.response?.data?.error || error.response?.data || 'Failed to fetch source campaigns'
+        error: describeError(error, 'Failed to fetch source campaigns')
       };
     }
   }
@@ -403,7 +442,7 @@ class DashboardService {
       console.error('Upload error:', error);
       return {
         success: false,
-        error: error.response?.data?.error || error.response?.data || 'Upload failed'
+        error: describeError(error, 'Upload failed')
       };
     }
   }
@@ -456,7 +495,7 @@ class DashboardService {
       console.error('Download processed file error:', error);
       return {
         success: false,
-        error: error.response?.data?.error || error.message || 'Failed to download file'
+        error: describeError(error, 'Failed to download file')
       };
     }
   }
@@ -471,7 +510,7 @@ class DashboardService {
       return { success: true, data: response.data };
     } catch (error) {
       console.error('Error fetching templates:', error);
-      return { success: false, error: error.response?.data || error.message, data: [] };
+      return { success: false, error: describeError(error), data: [] };
     }
   }
 
@@ -492,7 +531,7 @@ class DashboardService {
       return { success: true, ...response.data };
     } catch (error) {
       console.error('Error uploading template:', error);
-      return { success: false, error: error.response?.data || error.message };
+      return { success: false, error: describeError(error) };
     }
   }
 
@@ -503,7 +542,7 @@ class DashboardService {
       return response.data;
     } catch (error) {
       console.error('Error fetching template sheets:', error);
-      return { success: false, error: error.response?.data || error.message };
+      return { success: false, error: describeError(error) };
     }
   }
 
@@ -514,7 +553,7 @@ class DashboardService {
       return response.data;
     } catch (error) {
       console.error('Error extracting sheets:', error);
-      return { success: false, error: error.response?.data || error.message };
+      return { success: false, error: describeError(error) };
     }
   }
 
@@ -527,7 +566,7 @@ class DashboardService {
       return response.data;
     } catch (error) {
       console.error('Error configuring mapping:', error);
-      return { success: false, error: error.response?.data || error.message };
+      return { success: false, error: describeError(error) };
     }
   }
 
@@ -543,14 +582,18 @@ class DashboardService {
       return response.data;
     } catch (error) {
       console.error('Error fetching master template sheets:', error);
-      return { success: false, error: error.response?.data?.error || error.message };
+      return { success: false, error: describeError(error) };
     }
   }
 
-  static async generateCampaignReport(campaignId, sheets = null, fullOutcomeHistory = false, templateSheet = null) {
+  // dateWindow ({startDate, endDate, startTime, endTime}, all optional) is the
+  // window the source data was pulled for — pass it right after a db sync so
+  // the report counts per-interaction inside that window, same as the sync's
+  // own auto-report does. Omitted by every other caller (no change for them).
+  static async generateCampaignReport(campaignId, sheets = null, fullOutcomeHistory = false, templateSheet = null, dateWindow = null) {
     try {
       if (!campaignId) {
-        return { success: false, error: 'campaign_id is required to generate a report.' };
+        return { success: false, error: 'Please select a campaign before generating a report.' };
       }
       console.log(`🚀 Generating campaign report for campaign ${campaignId}...`);
       const api = await DashboardService._api();
@@ -559,6 +602,10 @@ class DashboardService {
         sheets: sheets && sheets.length > 0 ? sheets : undefined,
         full_outcome_history: fullOutcomeHistory || undefined,
         template_sheet: templateSheet || undefined,
+        start_date: dateWindow?.startDate || undefined,
+        end_date: dateWindow?.endDate || undefined,
+        start_time: dateWindow?.startDate && dateWindow?.startTime ? dateWindow.startTime : undefined,
+        end_time: dateWindow?.endDate && dateWindow?.endTime ? dateWindow.endTime : undefined,
       });
       return { success: true, data: response.data };
     } catch (error) {
@@ -566,7 +613,7 @@ class DashboardService {
       const errorData = error.response?.data;
       return {
         success: false,
-        error: errorData?.error || (typeof errorData === 'object' ? JSON.stringify(errorData) : errorData) || 'Failed to generate report',
+        error: describeError(error, 'Failed to generate report'),
         status: error.response?.status,
         details: errorData
       };
@@ -576,7 +623,7 @@ class DashboardService {
   static async generateCombinedReport(campaignIds, sheets = null, options = {}) {
     try {
       if (!campaignIds || campaignIds.length === 0) {
-        return { success: false, error: 'At least one campaign_id is required to generate a combined report.' };
+        return { success: false, error: 'Please select at least one campaign before generating a combined report.' };
       }
       const {
         fileIds = null, startDate = null, endDate = null, startTime = null, endTime = null,
@@ -601,7 +648,7 @@ class DashboardService {
       const errorData = error.response?.data;
       return {
         success: false,
-        error: errorData?.error || (typeof errorData === 'object' ? JSON.stringify(errorData) : errorData) || 'Failed to generate combined report',
+        error: describeError(error, 'Failed to generate combined report'),
         status: error.response?.status,
         details: errorData
       };
@@ -611,7 +658,7 @@ class DashboardService {
   static async generateCampaignAnalysis(templateId, campaignName, campaignId) {
     try {
       if (!campaignId) {
-        return { success: false, error: 'campaign_id is required to generate analysis.' };
+        return { success: false, error: 'Please select a campaign before generating the analysis.' };
       }
       const api = await DashboardService._api();
       const response = await api.post('/api/reports/generate_campaign_analysis/', {
@@ -622,7 +669,7 @@ class DashboardService {
       return { success: true, data: response.data };
     } catch (error) {
       console.error('Error generating campaign analysis:', error);
-      return { success: false, error: error.response?.data || error.message };
+      return { success: false, error: describeError(error) };
     }
   }
 
@@ -636,7 +683,7 @@ class DashboardService {
       console.error('Error fetching reports:', error);
       return {
         success: false,
-        error: error.response?.data?.error || 'Failed to fetch reports'
+        error: describeError(error, 'Failed to fetch reports')
       };
     }
   }
@@ -669,7 +716,7 @@ class DashboardService {
       console.error('Download report error:', error);
       return {
         success: false,
-        error: error.response?.data?.error || error.message || 'Failed to download report'
+        error: describeError(error, 'Failed to download report')
       };
     }
   }
@@ -685,7 +732,7 @@ class DashboardService {
       console.error('Preview report error:', error);
       return {
         success: false,
-        error: error.response?.data?.error || error.message || 'Failed to preview report'
+        error: describeError(error, 'Failed to preview report')
       };
     }
   }
@@ -702,7 +749,7 @@ class DashboardService {
       } else if (campaignId) {
         params.append('campaign_id', campaignId);
       } else {
-        return { success: false, error: 'Either campaign_id or file_id is required' };
+        return { success: false, error: 'Please select a campaign or a specific file to export.' };
       }
       
       const response = await api.get(`/api/files/export_formatted/?${params.toString()}`, {
@@ -753,7 +800,7 @@ class DashboardService {
       }
       return {
         success: false,
-        error: error.response?.data?.error || error.message || 'Export failed'
+        error: describeError(error, 'Export failed')
       };
     }
   }
@@ -765,7 +812,7 @@ class DashboardService {
       return response.data;
     } catch (error) {
       console.error('Error generating analysis report:', error);
-      return { success: false, error: error.response?.data?.error || 'Failed to generate analysis report' };
+      return { success: false, error: describeError(error, 'Failed to generate analysis report') };
     }
   }
 

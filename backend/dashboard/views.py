@@ -11,7 +11,8 @@ from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.parsers import MultiPartParser, FormParser
 from django.shortcuts import get_object_or_404
-from django.http import HttpResponse, JsonResponse, HttpRequest
+from django.core.files.base import ContentFile
+from django.http import HttpResponse, JsonResponse, HttpRequest, FileResponse
 from django.contrib.auth.models import User
 from django.db.models import Q, Count, Sum, Avg, Max
 from django.db import IntegrityError
@@ -32,7 +33,7 @@ from openpyxl import load_workbook
 
 from .models import (
     OutcomeDescription, OutcomeSet, CallDataFile, ProcessedData,
-    GeneratedReport, ReportTemplate, Campaign, QACallRecord
+    GeneratedReport, ReportTemplate, Campaign, QACallRecord, QAActivity, DashboardTeam
 )
 from .serializers import (
     OutcomeDescriptionSerializer, OutcomeSetSerializer, CallDataFileSerializer,
@@ -1100,7 +1101,8 @@ class ReportViewSet(
                                     requested_start_dt=None, requested_end_dt=None):
         """
         Automatically called after a data file is processed.
-        Generates ONE workbook with up to 7 sheets and saves it as a GeneratedReport:
+        Generates ONE workbook with up to 6 sheets and saves it as a
+        GeneratedReport (report_type='campaign_analysis'):
 
             Sheet 1: Processed Data       — every record from this upload
             Sheet 2: Pivot                — count per outcome description;
@@ -1138,7 +1140,18 @@ class ReportViewSet(
                                              sales descending (only if the
                                              campaign has a cd_campaign_id; see
                                              external_source.fetch_agent_performance)
-            Sheet 7: Sheet1               — the campaign's template, populated
+
+        'template' (the campaign's template, populated) is requestable via
+        `sheets` like any other key, but is NOT a sheet in this workbook —
+        when wanted, it's built as its own separate GeneratedReport right
+        after this one finishes (see _build_template_report below) and
+        linked via this report's parameters['template_report_id']. It used
+        to be merged in as "Sheet1" here, which meant reloading this
+        entire file through openpyxl afterwards — expensive on a big
+        Processed Data sheet — just to attach a template that never needed
+        anything from Processed Data in the first place. Splitting it out
+        keeps this report's generation time independent of whether a
+        template was requested at all.
 
         This replaces the old two-step flow (Generate Report → Run Analysis).
         Everything is ready to download as soon as the upload completes.
@@ -1154,18 +1167,20 @@ class ReportViewSet(
 
         Two dependencies are enforced regardless of what's requested:
         'campaign_analysis' needs 'pivot' (its cells are live VLOOKUPs against
-        the Pivot sheet), and 'template' needs 'pivot' too (Sheet1 population
-        reads its category counts back out of the actual Pivot worksheet
-        cells, not from the Python dict). Requesting one without the other
-        silently includes Pivot rather than producing a broken workbook.
+        the Pivot sheet), and 'template' needs 'pivot'/'lead_count'/
+        'campaign_analysis' too (the separate template report reads its
+        category counts and summary metrics from the same in-memory values
+        this function computes to build those three). Requesting one
+        without the other silently includes its dependencies rather than
+        producing a broken/inconsistent result.
 
         template_sheet (default None): a sheet name from the master
         "Call Centre Report Template.xlsx" (see ReportViewSet.
-        master_template_sheets) to use as Sheet1, picked by the caller
-        rather than auto-matched — see the comment above the template
-        population block for why. Falls back to this campaign's legacy
-        ReportTemplate upload (if any) when omitted; if neither is
-        available, the report is built without a Sheet1 at all.
+        master_template_sheets) to use, picked by the caller rather than
+        auto-matched — see _build_template_report for why. Falls back to
+        this campaign's legacy ReportTemplate upload (if any) when
+        omitted; if neither is available, no template report is built at
+        all (this report is unaffected either way).
 
         requested_start_dt/requested_end_dt (default None): the exact
         window a database sync was asked to pull (see
@@ -1509,16 +1524,36 @@ class ReportViewSet(
         agent_performance_error = None
         call_count_breakdown_error = None
         if campaign.cd_campaign_id and ('agent_performance' in wanted or 'call_count_breakdown' in wanted):
-            # date_span computed once, above, right after total_count is
-            # confirmed non-zero — shared with the Full Outcome History
-            # block for the same reason it's used here.
+            # When the sync asked for a specific window, scope both of these
+            # to EXACTLY that window (like the outcome-history block above and
+            # the combined report already do) — NOT to date_span. date_span is
+            # min/max last_called_date of this file's rows, i.e. each
+            # contact's *latest* call, which drifts far past the requested
+            # window whenever contacts are re-dialled later: a one-day sync
+            # (2026-05-02) had a date_span of Feb–Aug 2026, so these two
+            # scanned ~7 months of a 137M-row table in weekly windows —
+            # minutes of work (and the report never finished, leaving only
+            # Processed Data) to produce agent stats for the wrong period.
+            # Only with no requested window (plain upload / unscoped sync)
+            # does the file's own date_span apply, as before.
+            if requested_start_dt or requested_end_dt:
+                from .external_source import default_campaign_date_range
+                _dflt_start, _dflt_end = default_campaign_date_range(campaign)
+                # _run_windowed compares these; the requested bounds are naive
+                # and the defaults are aware, so normalise the defaults.
+                _naive = lambda d: d.replace(tzinfo=None) if getattr(d, 'tzinfo', None) else d
+                perf_start = requested_start_dt or _naive(_dflt_start)
+                perf_end = requested_end_dt or _naive(_dflt_end)
+            else:
+                perf_start, perf_end = date_span['min_date'], date_span['max_date']
+
             if 'agent_performance' in wanted:
                 try:
                     from .external_source import fetch_agent_performance
                     agent_rows = fetch_agent_performance(
                         campaign.cd_campaign_id,
-                        start_dt=date_span['min_date'],
-                        end_dt=date_span['max_date'],
+                        start_dt=perf_start,
+                        end_dt=perf_end,
                     )
                     print(f"👥 Agent Performance: {len(agent_rows)} agents")
                 except Exception as e:
@@ -1531,8 +1566,8 @@ class ReportViewSet(
                     from .external_source import fetch_contact_call_counts
                     call_counts = fetch_contact_call_counts(
                         campaign.cd_campaign_id,
-                        start_dt=date_span['min_date'],
-                        end_dt=date_span['max_date'],
+                        start_dt=perf_start,
+                        end_dt=perf_end,
                     )
                     print(f"📞 Call Count Breakdown: {len(call_counts)} contacts")
                 except Exception as e:
@@ -2179,14 +2214,27 @@ class ReportViewSet(
             )
             print(f"⚠️  Agent Performance sheet shows an error placeholder: {agent_performance_error}")
 
-        # ── SHEET 4: TEMPLATE (Sheet1) populated from Pivot ────────────
-        # Two sources for the template, checked in this order:
-        #   1. `template_sheet` — a sheet name the caller picked from the
-        #      master "Call Centre Report Template.xlsx" (see
-        #      master_template_sheets/generate_campaign's template_sheet
-        #      field). Preferred: explicit, per-generation, no guessing.
-        #   2. The legacy per-campaign ReportTemplate upload (CampaignTemplates
-        #      page) — kept for campaigns that already have one configured.
+        # ── SHEET 4 — TEMPLATE — now built as its OWN separate report ───
+        # Template used to be merged into this same workbook, which meant
+        # closing this file, reloading the ENTIRE thing back through
+        # openpyxl (parsing every cell of Processed Data — millions of
+        # them on a big campaign — just to read a handful of Pivot rows),
+        # then copying every sheet cell-by-cell into a third workbook.
+        # That reload+recopy cost scaled with Processed Data's size, not
+        # Template's, so asking for Template made EVERY sheet slower, not
+        # just itself. It's now built by _build_template_report, as a
+        # completely separate file/GeneratedReport, from values already
+        # sitting in memory (description_counts, categories, the summary
+        # metrics below) — never by reopening this file — which is both
+        # faster (no reload of a potentially huge sheet) and no less
+        # accurate (same source numbers Pivot/Campaign Analysis used,
+        # just read from the dict directly instead of round-tripping them
+        # through a saved worksheet first).
+        #
+        # Decide here (before saving) whether a template will be built, so
+        # the caller/response can know — but the actual build happens
+        # after this report is saved, so a template failure can never
+        # affect the main report.
         use_master_template = False
         if 'template' in wanted and template_sheet and os.path.exists(ReportViewSet.MASTER_TEMPLATE_PATH):
             try:
@@ -2208,295 +2256,12 @@ class ReportViewSet(
             and template_obj and os.path.exists(template_obj.template_file.path)
         )
 
-        if use_master_template or use_legacy_template:
-            if use_master_template:
-                print(f"Populating template: master template sheet '{template_sheet}'")
-            else:
-                print(f"Populating template: {template_obj.name}")
-
-            # Save and re-open the workbook so Pivot data is readable
-            # by openpyxl (xlsxwriter can't be read while open)
-            workbook.close()
-            output.seek(0)
-            xl_wb = load_workbook(output)
-            xl_pivot = xl_wb['Pivot']
-
-            # ══════════════════════════════════════════════════════════
-            # Build Sheet1's lookup FROM THE CAMPAIGN ANALYSIS SHEET DATA
-            # ══════════════════════════════════════════════════════════
-            # Sheet1 mirrors the Campaign Analysis sheet exactly:
-            #
-            #   1. The SUMMARY BLOCK values (Total Leads, Successful
-            #      Contacts, True Contacts, Conversion, True Sales,
-            #      Unworked Leads) — the same numbers written to the
-            #      Campaign Analysis summary rows.
-            #
-            #   2. EVERY disposition listed in the Campaign Analysis
-            #      category tables (Unsuccessful / Interested in Deal /
-            #      Successful / True Contacts columns) — with the same
-            #      count its VLOOKUP resolves to. Dispositions with no
-            #      Pivot entry get 0, exactly like IFERROR(VLOOKUP,0)
-            #      shows 0 in the Campaign Analysis sheet.
-            #
-            # (The Campaign Analysis sheet's Lead Count cells are live
-            #  VLOOKUP formulas that Excel hasn't calculated yet, so we
-            #  can't literally read them with openpyxl — instead we use
-            #  the SAME source data that produces them, which guarantees
-            #  identical values.)
-
-            # Case-insensitive view of the Pivot counts
-            desc_counts_lower = {
-                k.strip().lower(): v for k, v in description_counts.items()
-            }
-
-            pivot_data_by_description = {}
-
-            # 2a. Every disposition in the Campaign Analysis category
-            #     tables — count mirrors the CA sheet's VLOOKUP result
-            for cat_list in categories.values():
-                for desc in cat_list:
-                    key   = desc.strip().lower()
-                    count = desc_counts_lower.get(key, 0)   # IFERROR(...,0)
-                    pivot_data_by_description[key] = [desc, count]
-
-            # 2b. Also include any Pivot description NOT in the category
-            #     lists, so unusual dispositions still match in Sheet1
-            for i, row in enumerate(xl_pivot.iter_rows(values_only=True)):
-                if i == 0:
-                    continue
-                if row and row[0]:
-                    key = str(row[0]).strip().lower()
-                    if key not in pivot_data_by_description and key != 'grand total':
-                        pivot_data_by_description[key] = list(row)
-
-            # 1. SUMMARY BLOCK values — identical to what the Campaign
-            #    Analysis sheet's summary rows show
-            summary_entries = {
-                'total leads':                 ('total leads',                total_leads),
-                'unworked leads (new leads)':  ('unworked leads (new leads)', unworked_leads),
-                'succesful contacts':           ('succesful contacts',         successful_contacts),
-                'successful contacts':          ('successful contacts',        successful_contacts),
-                'true contacts':               ('true contacts',               true_contacts),
-                'conversion':                   ('conversion',                 conversion_decimal),
-                'true sales (post qa)':        ('true sales (post qa)',        true_sales),
-            }
-            # Calculated ratios
-            if total_leads > 0:
-                summary_entries['contactability']         = ('contactability',         successful_contacts / total_leads)
-                summary_entries['lead to sale conversion'] = ('lead to sale conversion', true_sales / total_leads)
-            if successful_contacts > 0:
-                summary_entries['conversion to true sale'] = ('conversion to true sale', true_sales / successful_contacts)
-            if true_contacts > 0:
-                summary_entries['true contacts to sales']  = ('true contacts to sales',  true_sales / true_contacts)
-
-            # Aliases for common template typos/name differences
-            ALIASES = {
-                'succesful contacts':        'successful contacts',
-                'under age':                 'client underage',
-                'go to branch':              'go to the branch',
-                'qa fail':                   'qa rework',
-                'upsell':                    'tyme bank account sale',
-                'not working cannot afford': 'cannot afford',
-            }
-            for alias, real_key in ALIASES.items():
-                if real_key in pivot_data_by_description and alias not in pivot_data_by_description:
-                    pivot_data_by_description[alias] = pivot_data_by_description[real_key]
-
-            for label, row_data in summary_entries.items():
-                pivot_data_by_description[label] = list(row_data)
-
-            # Load template and recreate with values. Master-template path
-            # copies ONLY the one sheet the caller picked (the workbook has
-            # 23 campaign-format sheets — copying all of them into every
-            # report would bloat the file with 22 irrelevant, unpopulated
-            # sheets). The legacy per-campaign upload keeps its original
-            # behaviour of copying every sheet it contains.
-            if use_master_template:
-                src_wb = load_workbook(ReportViewSet.MASTER_TEMPLATE_PATH)
-                sheet_names_to_copy = [template_sheet]
-            else:
-                src_wb = load_workbook(template_obj.template_file.path)
-                sheet_names_to_copy = src_wb.sheetnames
-            new_wb    = openpyxl.Workbook()
-            new_wb.remove(new_wb.active)
-
-            for sheet_name in sheet_names_to_copy:
-                src_sheet = src_wb[sheet_name]
-                new_sheet = new_wb.create_sheet(title=sheet_name)
-
-                for row in src_sheet.iter_rows():
-                    for cell in row:
-                        nc = new_sheet.cell(row=cell.row, column=cell.column)
-                        if cell.has_style:
-                            try:
-                                nc.font          = cell.font.copy()
-                                nc.border        = cell.border.copy()
-                                nc.fill          = cell.fill.copy()
-                                nc.number_format = cell.number_format
-                                nc.alignment     = cell.alignment.copy()
-                            except Exception:
-                                pass
-                        # Preserve formulas; keep col-1 labels; clear everything else
-                        if cell.data_type == 'f' and cell.value and str(cell.value).startswith('='):
-                            nc.value = cell.value
-                        elif cell.column == 1:
-                            nc.value = cell.value
-                        else:
-                            nc.value = None
-
-                for mr in src_sheet.merged_cells.ranges:
-                    new_sheet.merge_cells(str(mr))
-                for col_idx in range(1, src_sheet.max_column + 1):
-                    cl = get_column_letter(col_idx)
-                    if cl in src_sheet.column_dimensions:
-                        new_sheet.column_dimensions[cl].width = src_sheet.column_dimensions[cl].width
-                for ri in range(1, src_sheet.max_row + 1):
-                    if ri in src_sheet.row_dimensions:
-                        new_sheet.row_dimensions[ri].height = src_sheet.row_dimensions[ri].height
-
-            # Populate matching rows in the first sheet of the template.
-            #
-            # RULES (per user requirements):
-            #   - NEVER touch column A — the template's labels stay exactly
-            #     as uploaded (no overwriting, no case changes)
-            #   - Write ONLY the VALUE, into the template's real data column.
-            #     Templates often merge column A across many columns (e.g.
-            #     A:JK merged, data at JL) — so the data column is detected
-            #     as (widest col-A merge end) + 1, falling back to col 2.
-            #   - If the target cell is inside another merge, redirect the
-            #     write to that merge's master (top-left) cell.
-            #   - Formula cells are never overwritten.
-            target_sheet_name = template_sheet if use_master_template else src_wb.sheetnames[0]
-            tws = new_wb[target_sheet_name]
-            rows_populated = 0
-
-            # Detect the data column from column-A merges
-            a_merge_end = 1
-            for mr in tws.merged_cells.ranges:
-                if mr.min_col == 1 and mr.max_col > a_merge_end:
-                    a_merge_end = mr.max_col
-            data_col = a_merge_end + 1 if a_merge_end > 1 else 2
-            print(f"📌 Sheet1 data column: {data_col} "
-                  f"({get_column_letter(data_col)}) — "
-                  f"col A merges end at {a_merge_end}")
-
-            # Merge-master lookup so writes inside merges go to the
-            # top-left (writable) cell of that merge
-            merge_master = {}
-            for mr in tws.merged_cells.ranges:
-                master = (mr.min_row, mr.min_col)
-                for r in range(mr.min_row, mr.max_row + 1):
-                    for c in range(mr.min_col, mr.max_col + 1):
-                        merge_master[(r, c)] = master
-
-            for row_idx in range(1, tws.max_row + 1):
-                desc_cell = tws.cell(row=row_idx, column=1)
-                desc = str(desc_cell.value).strip().lower() if desc_cell.value else ""
-                if not desc:
-                    continue
-                if desc not in pivot_data_by_description:
-                    continue
-
-                row_data = pivot_data_by_description[desc]
-                # row_data shape: [description, value] — we only want the VALUE
-                val = row_data[1] if len(row_data) > 1 else None
-                if val is None:
-                    continue
-
-                # Resolve merge master for the target cell
-                write_row, write_col = merge_master.get(
-                    (row_idx, data_col), (row_idx, data_col)
-                )
-                cell = tws.cell(row=write_row, column=write_col)
-
-                # Never overwrite formulas
-                if cell.data_type == 'f' or (
-                    cell.value is not None
-                    and isinstance(cell.value, str)
-                    and cell.value.strip().startswith('=')
-                ):
-                    continue
-
-                try:
-                    if isinstance(val, float) and val != int(val):
-                        cell.value = float(val)     # ratios/percentages
-                    elif isinstance(val, (int, float)):
-                        cell.value = int(val)
-                    else:
-                        cell.value = val
-                except Exception:
-                    cell.value = val
-
-                rows_populated += 1
-                print(f"  ✅ row {row_idx:3d} → "
-                      f"{get_column_letter(write_col)}{write_row}: "
-                      f"'{desc_cell.value}' = {val}")
-
-            print(f"✅ Sheet1 populated: {rows_populated} rows matched "
-                  f"(labels untouched, values in col "
-                  f"{get_column_letter(data_col)})")
-
-            # Add the existing sheets (Processed Data, Pivot, Lead Count,
-            # Campaign Analysis, Call Count Breakdown/Agent Performance if
-            # built) from the xlsxwriter output into new_wb. Lead Count
-            # must be included here — Campaign Analysis's %-of-total-leads
-            # formulas reference 'Lead Count'!$B$3 directly, so omitting it
-            # would leave those formulas pointing at a sheet that doesn't
-            # exist in the final merged workbook.
-            for extra_name in ['Processed Data', 'Pivot', 'Lead Count', 'Campaign Analysis', 'Call Count Breakdown', 'Agent Performance']:
-                if extra_name in xl_wb.sheetnames:
-                    src_extra = xl_wb[extra_name]
-                    dst_extra = new_wb.create_sheet(title=extra_name)
-                    for row in src_extra.iter_rows():
-                        for cell in row:
-                            nc = dst_extra.cell(row=cell.row, column=cell.column)
-                            nc.value = cell.value
-                            if cell.has_style:
-                                try:
-                                    nc.font = cell.font.copy()
-                                    nc.border = cell.border.copy()
-                                    nc.fill = cell.fill.copy()
-                                    nc.number_format = cell.number_format
-                                    nc.alignment = cell.alignment.copy()
-                                except Exception:
-                                    pass
-                    for mr in src_extra.merged_cells.ranges:
-                        dst_extra.merge_cells(str(mr))
-                    # Column widths / row heights aren't cell properties — copy them
-                    # separately, or wide merged headers (e.g. Campaign Analysis) come
-                    # out at Excel's default width and truncate.
-                    for col_letter, dim in src_extra.column_dimensions.items():
-                        if dim.width:
-                            dst_extra.column_dimensions[col_letter].width = dim.width
-                    for row_idx, dim in src_extra.row_dimensions.items():
-                        if dim.height:
-                            dst_extra.row_dimensions[row_idx].height = dim.height
-
-            # Reorder sheets EXACTLY as requested:
-            # 1. Processed Data  2. Sheet1  3. Lead Count  4. Campaign Analysis
-            # 5. Call Count Breakdown (if built)  6. Agent Performance (if built)  7. Pivot
-            desired_order = ['Processed Data', target_sheet_name, 'Lead Count', 'Campaign Analysis', 'Call Count Breakdown', 'Agent Performance', 'Pivot']
-            for i, name in enumerate(desired_order):
-                if name in new_wb.sheetnames:
-                    idx = new_wb.sheetnames.index(name)
-                    new_wb.move_sheet(name, offset=i - idx)
-
-            # Save final combined workbook
-            final_output = BytesIO()
-            new_wb.save(final_output)
-            final_output.seek(0)
-            file_bytes = final_output.getvalue()
-
-        else:
-            # No template — save the 3-sheet workbook (no Sheet1). Either
-            # 'template' wasn't requested, no template_sheet was picked and
-            # the campaign has no legacy upload, or template_sheet named a
-            # sheet that doesn't exist in the master workbook.
-            print(f"⚠️  No template for campaign '{campaign.display_name}' "
-                  f"— saving report without a populated template sheet")
-            workbook.close()
-            output.seek(0)
-            file_bytes = output.getvalue()
+        # This file never carries Template — always just the sheets built
+        # above (Processed Data/Pivot/Lead Count/Campaign Analysis/Call
+        # Count Breakdown/Agent Performance, whichever were wanted).
+        workbook.close()
+        output.seek(0)
+        file_bytes = output.getvalue()
 
         # ── Save the report to disk ────────────────────────────────────
         reports_dir = os.path.join(settings.MEDIA_ROOT, 'reports')
@@ -2520,9 +2285,6 @@ class ReportViewSet(
                 'source_file':     file_instance.original_name,
                 'record_count':    total_leads,
                 'auto_generated':  True,
-                'has_sheet1':      use_master_template or use_legacy_template,
-                'template_name':   template_sheet if use_master_template else (template_obj.name if use_legacy_template else None),
-                'rows_populated':  rows_populated if (use_master_template or use_legacy_template) else 0,
                 'has_agent_performance': agent_rows is not None,
                 'agent_count':     len(agent_rows) if agent_rows else 0,
                 'agent_performance_error': agent_performance_error,
@@ -2541,24 +2303,319 @@ class ReportViewSet(
         )
 
         print(f"Report saved: {filename} (ID: {report.id})")
-        print(f"Sheets: {new_wb.sheetnames if template_obj else '3-sheet (no template)'}")
         print(f"{'='*60}\n")
+
+        # ── Template — its own file/report, built AFTER the main report
+        #    is already saved, so a failure here never loses the report
+        #    that just succeeded (same "best-effort, never fails the
+        #    upload" philosophy as Agent Performance/Call Count Breakdown
+        #    above). See _build_template_report for why this is now a
+        #    separate step entirely rather than a sheet in this workbook.
+        if use_master_template or use_legacy_template:
+            try:
+                template_report = ReportViewSet._build_template_report(
+                    campaign=campaign, file_instance=file_instance,
+                    template_sheet=template_sheet, template_obj=template_obj,
+                    use_master_template=use_master_template,
+                    description_counts=description_counts, categories=categories,
+                    total_leads=total_leads, unworked_leads=unworked_leads,
+                    successful_contacts=successful_contacts, true_contacts=true_contacts,
+                    true_sales=true_sales, conversion_decimal=conversion_decimal,
+                    main_report=report,
+                )
+                report.parameters['template_report_id'] = template_report.id
+                report.save(update_fields=['parameters'])
+                print(f"Template report saved (ID: {template_report.id})\n")
+            except Exception as e:
+                print(f"⚠️  Template report failed (non-fatal — main report "
+                      f"already saved): {e}")
+                traceback.print_exc()
+                report.parameters['template_error'] = str(e) or type(e).__name__
+                report.save(update_fields=['parameters'])
+
         return report
+
+    @staticmethod
+    def _build_template_report(campaign, file_instance, template_sheet, template_obj,
+                                use_master_template, description_counts, categories,
+                                total_leads, unworked_leads, successful_contacts,
+                                true_contacts, true_sales, conversion_decimal, main_report):
+        """
+        Builds the campaign's populated template sheet as its OWN workbook
+        and GeneratedReport (report_type='template_analysis') — entirely
+        separate from the main report file produced by
+        _auto_generate_full_report, and linked to it only via
+        parameters['main_report_id'] / the main report's
+        parameters['template_report_id'].
+
+        Sourced purely from values _auto_generate_full_report already had
+        in memory (description_counts, categories, and the summary
+        metrics) — never by reopening the main report's file. Two reasons:
+
+        1. Speed: the main report's Processed Data sheet can run into the
+           millions of rows. The old approach merged Template into that
+           same workbook, which meant closing it, reloading the WHOLE
+           thing back through openpyxl (parsing every cell just to read a
+           handful of Pivot rows), then recopying every sheet cell-by-cell
+           into a third workbook — a cost that scaled with Processed
+           Data's size even though Template itself never needed anything
+           from Processed Data. Reading the same numbers out of the dict
+           that built Pivot/Campaign Analysis in the first place costs
+           nothing extra, regardless of campaign size.
+        2. Consistency: these are the exact same Python values Pivot and
+           Campaign Analysis were built from (not a re-derived or
+           re-read copy), so Template's numbers can't drift from theirs.
+
+        Returns the new GeneratedReport, or None if neither a master
+        template sheet nor a legacy per-campaign template was available
+        (callers are expected to only call this when one of the two is
+        already confirmed present).
+        """
+        import openpyxl, os
+        from io import BytesIO
+        from datetime import datetime
+        from django.conf import settings
+        from openpyxl.utils import get_column_letter
+
+        if use_master_template:
+            print(f"Populating template: master template sheet '{template_sheet}'")
+        else:
+            print(f"Populating template: {template_obj.name}")
+
+        # Case-insensitive view of the Pivot counts
+        desc_counts_lower = {
+            k.strip().lower(): v for k, v in description_counts.items()
+        }
+
+        pivot_data_by_description = {}
+
+        # 2a. Every disposition in the Campaign Analysis category
+        #     tables — count mirrors the CA sheet's VLOOKUP result
+        for cat_list in categories.values():
+            for desc in cat_list:
+                key   = desc.strip().lower()
+                count = desc_counts_lower.get(key, 0)   # IFERROR(...,0)
+                pivot_data_by_description[key] = [desc, count]
+
+        # 2b. Also include any disposition NOT in the category lists —
+        #     straight from the same in-memory counts Pivot itself was
+        #     built from (no need to read them back out of a worksheet).
+        for desc, count in description_counts.items():
+            key = desc.strip().lower()
+            if key not in pivot_data_by_description and key != 'grand total':
+                pivot_data_by_description[key] = [desc, count]
+
+        # 1. SUMMARY BLOCK values — identical to what the Campaign
+        #    Analysis sheet's summary rows show
+        summary_entries = {
+            'total leads':                 ('total leads',                total_leads),
+            'unworked leads (new leads)':  ('unworked leads (new leads)', unworked_leads),
+            'succesful contacts':           ('succesful contacts',         successful_contacts),
+            'successful contacts':          ('successful contacts',        successful_contacts),
+            'true contacts':               ('true contacts',               true_contacts),
+            'conversion':                   ('conversion',                 conversion_decimal),
+            'true sales (post qa)':        ('true sales (post qa)',        true_sales),
+        }
+        # Calculated ratios
+        if total_leads > 0:
+            summary_entries['contactability']         = ('contactability',         successful_contacts / total_leads)
+            summary_entries['lead to sale conversion'] = ('lead to sale conversion', true_sales / total_leads)
+        if successful_contacts > 0:
+            summary_entries['conversion to true sale'] = ('conversion to true sale', true_sales / successful_contacts)
+        if true_contacts > 0:
+            summary_entries['true contacts to sales']  = ('true contacts to sales',  true_sales / true_contacts)
+
+        # Aliases for common template typos/name differences
+        ALIASES = {
+            'succesful contacts':        'successful contacts',
+            'under age':                 'client underage',
+            'go to branch':              'go to the branch',
+            'qa fail':                   'qa rework',
+            'upsell':                    'tyme bank account sale',
+            'not working cannot afford': 'cannot afford',
+        }
+        for alias, real_key in ALIASES.items():
+            if real_key in pivot_data_by_description and alias not in pivot_data_by_description:
+                pivot_data_by_description[alias] = pivot_data_by_description[real_key]
+
+        for label, row_data in summary_entries.items():
+            pivot_data_by_description[label] = list(row_data)
+
+        # Load template and recreate with values. Master-template path
+        # copies ONLY the one sheet the caller picked (the workbook has
+        # 23 campaign-format sheets — copying all of them into every
+        # report would bloat the file with 22 irrelevant, unpopulated
+        # sheets). The legacy per-campaign upload keeps its original
+        # behaviour of copying every sheet it contains.
+        if use_master_template:
+            src_wb = openpyxl.load_workbook(ReportViewSet.MASTER_TEMPLATE_PATH)
+            sheet_names_to_copy = [template_sheet]
+        else:
+            src_wb = openpyxl.load_workbook(template_obj.template_file.path)
+            sheet_names_to_copy = src_wb.sheetnames
+        new_wb    = openpyxl.Workbook()
+        new_wb.remove(new_wb.active)
+
+        for sheet_name in sheet_names_to_copy:
+            src_sheet = src_wb[sheet_name]
+            new_sheet = new_wb.create_sheet(title=sheet_name)
+
+            for row in src_sheet.iter_rows():
+                for cell in row:
+                    nc = new_sheet.cell(row=cell.row, column=cell.column)
+                    if cell.has_style:
+                        try:
+                            nc.font          = cell.font.copy()
+                            nc.border        = cell.border.copy()
+                            nc.fill          = cell.fill.copy()
+                            nc.number_format = cell.number_format
+                            nc.alignment     = cell.alignment.copy()
+                        except Exception:
+                            pass
+                    # Preserve formulas; keep col-1 labels; clear everything else
+                    if cell.data_type == 'f' and cell.value and str(cell.value).startswith('='):
+                        nc.value = cell.value
+                    elif cell.column == 1:
+                        nc.value = cell.value
+                    else:
+                        nc.value = None
+
+            for mr in src_sheet.merged_cells.ranges:
+                new_sheet.merge_cells(str(mr))
+            for col_idx in range(1, src_sheet.max_column + 1):
+                cl = get_column_letter(col_idx)
+                if cl in src_sheet.column_dimensions:
+                    new_sheet.column_dimensions[cl].width = src_sheet.column_dimensions[cl].width
+            for ri in range(1, src_sheet.max_row + 1):
+                if ri in src_sheet.row_dimensions:
+                    new_sheet.row_dimensions[ri].height = src_sheet.row_dimensions[ri].height
+
+        # Populate matching rows in the first sheet of the template.
+        #
+        # RULES (per user requirements):
+        #   - NEVER touch column A — the template's labels stay exactly
+        #     as uploaded (no overwriting, no case changes)
+        #   - Write ONLY the VALUE, into the template's real data column.
+        #     Templates often merge column A across many columns (e.g.
+        #     A:JK merged, data at JL) — so the data column is detected
+        #     as (widest col-A merge end) + 1, falling back to col 2.
+        #   - If the target cell is inside another merge, redirect the
+        #     write to that merge's master (top-left) cell.
+        #   - Formula cells are never overwritten.
+        target_sheet_name = template_sheet if use_master_template else src_wb.sheetnames[0]
+        tws = new_wb[target_sheet_name]
+        rows_populated = 0
+
+        # Detect the data column from column-A merges
+        a_merge_end = 1
+        for mr in tws.merged_cells.ranges:
+            if mr.min_col == 1 and mr.max_col > a_merge_end:
+                a_merge_end = mr.max_col
+        data_col = a_merge_end + 1 if a_merge_end > 1 else 2
+        print(f"📌 Template data column: {data_col} "
+              f"({get_column_letter(data_col)}) — "
+              f"col A merges end at {a_merge_end}")
+
+        # Merge-master lookup so writes inside merges go to the
+        # top-left (writable) cell of that merge
+        merge_master = {}
+        for mr in tws.merged_cells.ranges:
+            master = (mr.min_row, mr.min_col)
+            for r in range(mr.min_row, mr.max_row + 1):
+                for c in range(mr.min_col, mr.max_col + 1):
+                    merge_master[(r, c)] = master
+
+        for row_idx in range(1, tws.max_row + 1):
+            desc_cell = tws.cell(row=row_idx, column=1)
+            desc = str(desc_cell.value).strip().lower() if desc_cell.value else ""
+            if not desc:
+                continue
+            if desc not in pivot_data_by_description:
+                continue
+
+            row_data = pivot_data_by_description[desc]
+            # row_data shape: [description, value] — we only want the VALUE
+            val = row_data[1] if len(row_data) > 1 else None
+            if val is None:
+                continue
+
+            # Resolve merge master for the target cell
+            write_row, write_col = merge_master.get(
+                (row_idx, data_col), (row_idx, data_col)
+            )
+            cell = tws.cell(row=write_row, column=write_col)
+
+            # Never overwrite formulas
+            if cell.data_type == 'f' or (
+                cell.value is not None
+                and isinstance(cell.value, str)
+                and cell.value.strip().startswith('=')
+            ):
+                continue
+
+            try:
+                if isinstance(val, float) and val != int(val):
+                    cell.value = float(val)     # ratios/percentages
+                elif isinstance(val, (int, float)):
+                    cell.value = int(val)
+                else:
+                    cell.value = val
+            except Exception:
+                cell.value = val
+
+            rows_populated += 1
+
+        print(f"✅ Template populated: {rows_populated} rows matched "
+              f"(labels untouched, values in col "
+              f"{get_column_letter(data_col)})")
+
+        final_output = BytesIO()
+        new_wb.save(final_output)
+        final_output.seek(0)
+
+        reports_dir = os.path.join(settings.MEDIA_ROOT, 'reports')
+        os.makedirs(reports_dir, exist_ok=True)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename  = f"template_{campaign.name}_{timestamp}.xlsx"
+        filepath  = os.path.join(reports_dir, filename)
+        with open(filepath, 'wb') as f:
+            f.write(final_output.getvalue())
+
+        template_report = GeneratedReport.objects.create(
+            user=file_instance.user,
+            campaign=campaign,
+            report_type='template_analysis',
+            file=f"reports/{filename}",
+            parameters={
+                'campaign_id':    campaign.id,
+                'campaign_name':  campaign.display_name,
+                'source_file':    file_instance.original_name,
+                'main_report_id': main_report.id,
+                'template_name':  template_sheet if use_master_template else template_obj.name,
+                'rows_populated': rows_populated,
+                'auto_generated': True,
+            }
+        )
+        return template_report
 
     @action(detail=False, methods=['post'])
     def generate_campaign(self, request):
         """
-        Generate the FULL 4-sheet campaign report on demand.
+        Generate the campaign report on demand.
 
-        Produces ONE workbook with sheets in this exact order:
-          1. Processed Data     – raw records from the latest upload
-          2. Sheet1 (template)  – the campaign's template, populated with values
-          3. Campaign Analysis  – summary metrics + category breakdowns
-          4. Pivot              – counts per outcome description
+        Produces the main workbook (Processed Data / Pivot / Lead Count /
+        Campaign Analysis / Call Count Breakdown / Agent Performance,
+        whichever sheets are wanted), and — when 'template' is requested —
+        a SECOND, separate file/GeneratedReport holding just the
+        populated template sheet (see _build_template_report). They're
+        kept as two files rather than one specifically so a big campaign's
+        Processed Data sheet never has to be reopened just to attach a
+        template to it; the response below includes both reports' ids/
+        download URLs when a template was built.
 
-        This is the SAME file that gets auto-generated when a data file is
-        uploaded — this endpoint just regenerates it on demand (e.g. after
-        uploading a new template or re-uploading data).
+        This is the SAME generator that gets auto-generated when a data
+        file is uploaded — this endpoint just regenerates it on demand
+        (e.g. after uploading a new template or re-uploading data).
 
         Required POST body field: campaign_id
         Optional POST body field: sheets — a list of sheet keys from
@@ -2608,6 +2665,27 @@ class ReportViewSet(
             if template_sheet_error:
                 return template_sheet_error
 
+            # Optional: the date/time window the data was pulled for. A db
+            # sync that skips its own auto-report (auto_generate_report=
+            # False — CampaignUpload.js does this so the sync returns as
+            # soon as the data is saved) calls this endpoint right after,
+            # and needs to hand the same window through: without it the
+            # report counts each contact's latest outcome instead of every
+            # interaction inside the window, which would silently differ
+            # from what the sync's own auto-report used to produce.
+            from .external_source import _parse_source_dt
+            try:
+                requested_start_dt = _parse_source_dt(
+                    request.data.get('start_date') or None, request.data.get('start_time') or None, '00:00:00')
+                requested_end_dt = _parse_source_dt(
+                    request.data.get('end_date') or None, request.data.get('end_time') or None, '23:59:59')
+            except ValueError:
+                return Response(
+                    {'success': False,
+                     'error': 'start_date/end_date must be YYYY-MM-DD and start_time/end_time HH:MM.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
             try:
                 campaign_obj = Campaign.objects.get(id=campaign_id, is_active=True)
             except Campaign.DoesNotExist:
@@ -2644,7 +2722,8 @@ class ReportViewSet(
             # so manual and automatic reports are always identical.
             report = ReportViewSet._auto_generate_full_report(
                 latest_file, sheets=sheets, full_outcome_history=full_outcome_history,
-                template_sheet=template_sheet
+                template_sheet=template_sheet,
+                requested_start_dt=requested_start_dt, requested_end_dt=requested_end_dt
             )
 
             if report is None:
@@ -2656,17 +2735,20 @@ class ReportViewSet(
                 )
 
             metrics = report.parameters.get('metrics', {})
+            template_report_id = report.parameters.get('template_report_id')
 
             return Response({
                 'success': True,
                 'data': {
-                    'report_id':    report.id,
-                    'download_url': f'/api/reports/{report.id}/download/',
-                    'campaign':     campaign_obj.display_name,
-                    'record_count': report.parameters.get('record_count', 0),
-                    'has_sheet1':   report.parameters.get('has_sheet1', False),
-                    'metrics':      metrics,
-                    'message':      'Full 4-sheet report generated successfully.',
+                    'report_id':           report.id,
+                    'download_url':        f'/api/reports/{report.id}/download/',
+                    'campaign':            campaign_obj.display_name,
+                    'record_count':        report.parameters.get('record_count', 0),
+                    'template_report_id':  template_report_id,
+                    'template_download_url': f'/api/reports/{template_report_id}/download/' if template_report_id else None,
+                    'template_error':      report.parameters.get('template_error'),
+                    'metrics':             metrics,
+                    'message':             'Report generated successfully.',
                 }
             })
 
@@ -4256,6 +4338,34 @@ class DashboardStatsView(generics.GenericAPIView):
 # populated by QASyncView hitting the source DB live (see qa_source.py for
 # why: no supporting index for date-filtered live queries on that schema).
 
+_QA_ACTIVITY_KEEP = 50          # newest entries kept per user
+_QA_ACTIVITY_STALE = timedelta(hours=3)  # a 'running' entry older than this was interrupted (server restart, etc.)
+
+
+def _start_qa_activity(request, kind, campaign_label, filters):
+    """Open a "Recent activity" entry for a sync/download the user just requested."""
+    return QAActivity.objects.create(
+        user=request.user if request.user.is_authenticated else None,
+        kind=kind, campaign_label=(campaign_label or '')[:500], filters=filters,
+    )
+
+
+def _finish_qa_activity(activity, status, records=None, message='', file_bytes=None, file_name=None):
+    activity.status = status
+    activity.records = records
+    activity.message = (message or '')[:2000]
+    activity.finished_at = timezone.now()
+    if file_bytes is not None:
+        activity.file.save(file_name, ContentFile(file_bytes), save=False)
+    activity.save()
+    # Keep the list (and the stored files) bounded: drop everything past the newest N for this user.
+    stale = QAActivity.objects.filter(user=activity.user).order_by('-created_at')[_QA_ACTIVITY_KEEP:]
+    for old in list(stale):
+        if old.file:
+            old.file.delete(save=False)
+        old.delete()
+
+
 class QASyncView(generics.GenericAPIView):
     """
     Trigger an on-demand refresh of the local QA cache for one or more
@@ -4267,7 +4377,7 @@ class QASyncView(generics.GenericAPIView):
     # No permission_classes override here -- inherits the global IsAuthenticated default (see settings.py REST_FRAMEWORK). This used to be AllowAny; flipped as part of a security pass since this endpoint handles real data/PII and has no reason to be reachable unauthenticated.
 
     def post(self, request):
-        from .qa_source import sync_campaign_qa_cache, ExternalSourceError
+        from .qa_source import sync_campaign_qa_cache, ExternalSourceError, SyncCancelled
 
         local_campaign_ids = request.data.get('campaign_ids') or []
         campaigns = Campaign.objects.filter(id__in=local_campaign_ids)
@@ -4279,6 +4389,10 @@ class QASyncView(generics.GenericAPIView):
 
         results = []
         for campaign in campaigns:
+            activity = _start_qa_activity(request, 'sync', campaign.display_name, {
+                'campaign_ids': [campaign.id], 'start_date': start_date, 'end_date': end_date,
+                'start_time': start_time, 'end_time': end_time,
+            })
             try:
                 count, synced_at = sync_campaign_qa_cache(
                     campaign, start_date=start_date, end_date=end_date,
@@ -4290,12 +4404,28 @@ class QASyncView(generics.GenericAPIView):
                     'records_synced': count,
                     'synced_at': synced_at,
                 })
+                _finish_qa_activity(activity, 'done', records=count)
+            except SyncCancelled:
+                results.append({'campaign_id': campaign.id, 'campaign': campaign.display_name, 'cancelled': True})
+                _finish_qa_activity(activity, 'stopped', message='Stopped before it finished.')
             except ExternalSourceError as e:
                 results.append({'campaign_id': campaign.id, 'campaign': campaign.display_name, 'error': str(e)})
+                _finish_qa_activity(activity, 'failed', message=str(e))
             except Exception as e:
                 results.append({'campaign_id': campaign.id, 'campaign': campaign.display_name, 'error': f'Sync failed: {e}'})
+                _finish_qa_activity(activity, 'failed', message=f'Sync failed: {e}')
 
         return Response({'results': results})
+
+
+class QASyncCancelView(generics.GenericAPIView):
+    """Ask any running QA sync for the given campaign_ids to stop (see qa_source.request_cancel)."""
+
+    def post(self, request):
+        from .qa_source import request_cancel
+
+        stopped = [cid for cid in (request.data.get('campaign_ids') or []) if request_cancel(cid)]
+        return Response({'stopping': stopped})
 
 
 def _build_qa_queryset(request):
@@ -4380,7 +4510,41 @@ class QARecordsView(generics.GenericAPIView):
             'page': page,
             'num_pages': max(1, -(-total // page_size)),
             'last_synced': last_synced,
+            'coverage': _qa_coverage(request),
         })
+
+
+def _qa_coverage(request):
+    """
+    For each selected campaign, the parts of the requested date range that
+    have never been synced into the QA cache (see QASyncWindow) — so the page
+    can say "this range is incomplete" instead of showing a partial cache as
+    if it were everything. Only computed when both dates are given: with an
+    open-ended filter there is no range to compare. Each gap carries
+    server-local date/time strings in exactly the shape QASyncView accepts,
+    so "Sync missing range" can post them back unchanged.
+    """
+    from .qa_source import combine_date_time, compute_coverage
+
+    start_date = request.query_params.get('start_date')
+    end_date = request.query_params.get('end_date')
+    if not (start_date and end_date):
+        return []
+    start_dt = combine_date_time(start_date, request.query_params.get('start_time'), '00:00:00')
+    end_dt = combine_date_time(end_date, request.query_params.get('end_time'), '23:59:59')
+
+    local_campaign_ids = [c for c in request.query_params.get('campaign_ids', '').split(',') if c]
+    coverage = []
+    for campaign in Campaign.objects.filter(id__in=local_campaign_ids):
+        gaps = []
+        for g_start, g_end in compute_coverage(campaign, start_dt, end_dt):
+            g_start, g_end = timezone.localtime(g_start), timezone.localtime(g_end)
+            gaps.append({
+                'start_date': g_start.strftime('%Y-%m-%d'), 'start_time': g_start.strftime('%H:%M:%S'),
+                'end_date': g_end.strftime('%Y-%m-%d'), 'end_time': g_end.strftime('%H:%M:%S'),
+            })
+        coverage.append({'campaign_id': campaign.id, 'campaign': campaign.display_name, 'gaps': gaps})
+    return coverage
 
 
 class QAOutcomesView(generics.GenericAPIView):
@@ -4421,10 +4585,35 @@ class QADownloadView(generics.GenericAPIView):
         if not qs.exists():
             return Response({'error': 'No records match these filters.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        qs = qs.order_by('-call_date').values(
-            'call_date', 'customer', 'phone_number', 'agent_name',
-            'campaign__display_name', 'outcome', 'recording_key', 'recording_duration_seconds',
-        )
+        # (header, QACallRecord field, width, kind). 'text' columns are written
+        # as strings so long IDs/phone numbers never turn into numbers (Excel
+        # would show 15+ digit values in scientific notation and lose precision).
+        # "Lead ID" is the source system's contactid — lead_reference is blank
+        # on most campaigns, so it's included separately rather than used here.
+        # Extension and Hangup User come from the call's recording record, so
+        # they're only filled for calls that have a recording.
+        columns = [
+            ('Lead ID', 'contact_id', 14, 'text'),
+            ('Customer', 'customer', 24, 'text'),
+            ('Data List', 'batch_name', 30, 'text'),
+            ('Phone Number', 'phone_number', 16, 'text'),
+            ('Agent Name', 'agent_name', 22, 'text'),
+            ('Extension', 'extension', 14, 'text'),
+            ('Outcome', 'outcome', 28, 'text'),
+            ('Campaign', 'campaign__display_name', 24, 'text'),
+            ('Hangup User', 'hangup_user', 14, 'text'),
+            ('Call Start (UTC)', 'call_date', 20, 'datetime'),
+            ('Call End (UTC)', 'call_end', 20, 'datetime'),
+            ('Lead Reference', 'lead_reference', 18, 'text'),
+            ('ID Number', 'id_number', 16, 'text'),
+            ('Alt Phone Number', 'alt_phone_number', 16, 'text'),
+            ('Direction', 'direction', 12, 'text'),
+            ('Talk Time (seconds)', 'talk_seconds', 18, 'number'),
+            ('Recording Key', 'recording_key', 36, 'text'),
+            ('Recording Duration (seconds)', 'recording_duration_seconds', 26, 'number'),
+            ('Interaction ID', 'interaction_id', 38, 'text'),
+        ]
+        qs = qs.order_by('-call_date').values(*[field for _, field, _, _ in columns])
 
         output = BytesIO()
         workbook = xlsxwriter.Workbook(output, {'nan_inf_to_errors': True})
@@ -4432,8 +4621,7 @@ class QADownloadView(generics.GenericAPIView):
             'bold': True, 'bg_color': '#366092', 'font_color': 'white',
             'border': 1, 'align': 'center', 'valign': 'vcenter'
         })
-        headers = ['Date', 'Customer', 'Phone Number', 'Agent Name', 'Campaign', 'Outcome',
-                   'Recording Key', 'Recording Duration (seconds)']
+        headers = [h for h, _, _, _ in columns]
 
         # Same XLSX row ceiling as everywhere else in this codebase
         # (1,048,576 rows/sheet) — QA exports are normally far smaller than
@@ -4446,30 +4634,31 @@ class QADownloadView(generics.GenericAPIView):
             ws = workbook.add_worksheet(sheet_name)
             for col, h in enumerate(headers):
                 ws.write(0, col, h, header_fmt)
-            ws.set_column(0, 0, 20)
-            ws.set_column(1, 3, 22)
-            ws.set_column(4, 5, 22)
-            ws.set_column(6, 6, 32)
+            for col, (_, _, width, _) in enumerate(columns):
+                ws.set_column(col, col, width)
+            ws.freeze_panes(1, 0)
             return ws
 
         ws = _new_sheet(1)
         sheet_index = 1
         row_num = 1
+        total_rows = 0
         for r in qs.iterator(chunk_size=5000):
+            total_rows += 1
             if row_num > MAX_SHEET_DATA_ROWS:
                 sheet_index += 1
                 ws = _new_sheet(sheet_index)
                 row_num = 1
-            ws.write_row(row_num, 0, [
-                r['call_date'].strftime('%Y-%m-%d %H:%M:%S') if r['call_date'] else '',
-                r['customer'] or '',
-                r['phone_number'] or '',
-                r['agent_name'] or '',
-                r['campaign__display_name'] or '',
-                r['outcome'] or '',
-                r['recording_key'] or '',
-                r['recording_duration_seconds'],
-            ])
+            for col, (_, field, _, kind) in enumerate(columns):
+                value = r[field]
+                if value is None or value == '':
+                    continue  # leave the cell empty
+                if kind == 'number':
+                    ws.write_number(row_num, col, value)
+                elif kind == 'datetime':
+                    ws.write_string(row_num, col, value.strftime('%Y-%m-%d %H:%M:%S'))
+                else:
+                    ws.write_string(row_num, col, str(value))
             row_num += 1
 
         workbook.close()
@@ -4477,12 +4666,126 @@ class QADownloadView(generics.GenericAPIView):
 
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         filename = f"qa_records_{timestamp}.xlsx"
+        file_bytes = output.getvalue()
+
+        # Log it in the QA page's "Recent activity", keeping the file so it can
+        # be downloaded again later without regenerating it.
+        qp = request.query_params
+        campaign_ids = [int(c) for c in qp.get('campaign_ids', '').split(',') if c.isdigit()]
+        names = list(Campaign.objects.filter(id__in=campaign_ids).values_list('display_name', flat=True))
+        activity = _start_qa_activity(request, 'download', ', '.join(names), {
+            'campaign_ids': campaign_ids,
+            'start_date': qp.get('start_date'), 'end_date': qp.get('end_date'),
+            'start_time': qp.get('start_time'), 'end_time': qp.get('end_time'),
+            'outcomes': [o for o in qp.get('outcomes', '').split(',') if o],
+            'search': qp.get('search'),
+        })
+        _finish_qa_activity(activity, 'done', records=total_rows, file_bytes=file_bytes, file_name=filename)
+
         response = HttpResponse(
-            output.getvalue(),
+            file_bytes,
             content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
         )
         response['Content-Disposition'] = f'attachment; filename="{filename}"'
         return response
+
+
+def _serialize_qa_activity(a):
+    return {
+        'id': a.id,
+        'kind': a.kind,
+        'status': a.status,
+        'campaign': a.campaign_label,
+        'filters': a.filters,
+        'records': a.records,
+        'message': a.message,
+        'has_file': bool(a.file),
+        'created_at': a.created_at,
+        'finished_at': a.finished_at,
+    }
+
+
+class QAActivityView(generics.GenericAPIView):
+    """The signed-in user's recent QA syncs and downloads, newest first."""
+
+    def get(self, request):
+        activities = QAActivity.objects.filter(user=request.user)[:25]
+        # A sync that was 'running' when the server restarted never reports back;
+        # show it as interrupted instead of running forever.
+        cutoff = timezone.now() - _QA_ACTIVITY_STALE
+        QAActivity.objects.filter(user=request.user, status='running', created_at__lt=cutoff).update(
+            status='failed', message='Interrupted (the server restarted or the request was lost).',
+            finished_at=timezone.now(),
+        )
+        return Response([_serialize_qa_activity(a) for a in QAActivity.objects.filter(user=request.user)[:25]])
+
+
+class QAActivityFileView(generics.GenericAPIView):
+    """Re-download the file saved for a past QA download."""
+
+    def get(self, request, pk):
+        activity = QAActivity.objects.filter(pk=pk, user=request.user).first()
+        if not activity or not activity.file:
+            return Response({'error': 'This file is no longer available — run the download again.'},
+                            status=status.HTTP_404_NOT_FOUND)
+        try:
+            handle = activity.file.open('rb')
+        except FileNotFoundError:
+            return Response({'error': 'This file is no longer available — run the download again.'},
+                            status=status.HTTP_404_NOT_FOUND)
+        return FileResponse(handle, as_attachment=True, filename=os.path.basename(activity.file.name))
+
+
+# ===========================================================
+# ALTITUDE BPO ONLINE DASHBOARD — team stats for the separate dashboard app
+# ===========================================================
+#
+# The online dashboard calls these (token auth, server-to-server) instead of
+# connecting to the source DB itself, so only this backend needs allowlisting.
+
+class DashboardTeamStatsView(generics.GenericAPIView):
+    """
+    GET /api/dashboard/team-stats/?floor=Floor 1|Floor 2|Global — today's
+    Target / Current (sales) / Shortfall / average talk time per dashboard
+    team, plus the floor's combined totals. See dashboard/team_stats.py.
+    """
+
+    def get(self, request):
+        from .external_source import ExternalSourceError
+        from .team_stats import build_stats
+
+        floor = request.query_params.get('floor', 'Global')
+        try:
+            return Response(build_stats(floor))
+        except ValueError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except ExternalSourceError as e:
+            return Response({'error': str(e)}, status=status.HTTP_502_BAD_GATEWAY)
+
+
+class DashboardTeamTargetView(generics.GenericAPIView):
+    """
+    POST /api/dashboard/team-targets/ {floor, team, target} — set one team's
+    Target (the source DB doesn't hold targets; the dashboard's floor managers
+    edit them inline).
+    """
+
+    def post(self, request):
+        floor = request.data.get('floor')
+        team = request.data.get('team')
+        try:
+            target = int(request.data.get('target'))
+        except (TypeError, ValueError):
+            return Response({'error': 'target must be a whole number'}, status=status.HTTP_400_BAD_REQUEST)
+        if target < 0:
+            return Response({'error': 'target cannot be negative'}, status=status.HTTP_400_BAD_REQUEST)
+
+        row = DashboardTeam.objects.filter(floor=floor, display_name=team, is_active=True).first()
+        if not row:
+            return Response({'error': f"No team '{team}' on {floor}"}, status=status.HTTP_404_NOT_FOUND)
+        row.target = target
+        row.save(update_fields=['target', 'updated_at'])
+        return Response({'floor': row.floor, 'team': row.display_name, 'target': row.target})
 
 
 # ===========================================================

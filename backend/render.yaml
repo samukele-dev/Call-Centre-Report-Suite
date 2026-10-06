@@ -121,6 +121,13 @@ services:
         value: admin@altitudebpo.co.za
       - key: TEST_USER_PASSWORD
         sync: false
+      # API token the Altitude BPO online dashboard uses to read team stats
+      # (build.sh registers it on every deploy via `dashboard_api_token
+      # --from-env-only`, so no Shell is needed). Generate one with:
+      #   python -c "import secrets; print(secrets.token_hex(20))"
+      # and set the SAME value as SUITE_API_TOKEN on the dashboard.
+      - key: DASHBOARD_API_TOKEN
+        sync: false
 
 databases:
   # This app's OWN database (Campaign, ProcessedData, GeneratedReport,

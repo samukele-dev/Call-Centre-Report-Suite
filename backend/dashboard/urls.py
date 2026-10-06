@@ -26,7 +26,13 @@ urlpatterns = [
     path('qa/records/', views.QARecordsView.as_view(), name='qa_records'),
     path('qa/outcomes/', views.QAOutcomesView.as_view(), name='qa_outcomes'),
     path('qa/sync/', views.QASyncView.as_view(), name='qa_sync'),
+    path('qa/sync/cancel/', views.QASyncCancelView.as_view(), name='qa_sync_cancel'),
     path('qa/download/', views.QADownloadView.as_view(), name='qa_download'),
+    # Altitude BPO online dashboard (separate app; reads team stats from here)
+    path('dashboard/team-stats/', views.DashboardTeamStatsView.as_view(), name='dashboard_team_stats'),
+    path('dashboard/team-targets/', views.DashboardTeamTargetView.as_view(), name='dashboard_team_targets'),
+    path('qa/activity/', views.QAActivityView.as_view(), name='qa_activity'),
+    path('qa/activity/<int:pk>/file/', views.QAActivityFileView.as_view(), name='qa_activity_file'),
 
     # REMOVE these custom report endpoints - they conflict with the router
     # The router already creates these endpoints automatically:

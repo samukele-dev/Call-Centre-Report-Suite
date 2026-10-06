@@ -7,6 +7,7 @@ import {
 } from 'react-bootstrap';
 import DashboardService from '../api/dashboardService';
 import { saveAs } from 'file-saver';
+import { describeError } from '../utils/errorMessages';
 
 const UploadData = () => {
   const [uploadedFiles, setUploadedFiles] = useState([]);
@@ -128,7 +129,7 @@ const UploadData = () => {
       clearInterval(progressInterval);
       setUploadMessage({
         type: 'danger',
-        text: `Upload error: ${error.message}`
+        text: describeError(error, 'Upload failed')
       });
       console.error('❌ Upload error details:', error);
       setUploading(false);

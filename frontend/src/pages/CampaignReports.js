@@ -9,6 +9,7 @@ import DashboardService from '../api/dashboardService';
 import { saveAs } from 'file-saver';
 import { REPORT_SHEETS, toggleReportSheet, FULL_OUTCOME_HISTORY_OPTION } from '../utils/reportSheets';
 import ReportPreviewModal from '../components/ReportPreviewModal';
+import { describeError } from '../utils/errorMessages';
 
 const CampaignReports = () => {
   const { id } = useParams();  // campaign ID from URL
@@ -85,10 +86,22 @@ const CampaignReports = () => {
       );
       
       if (result.success) {
-        alert(`Campaign report for "${campaign?.display_name}" generated successfully!`);
+        // The populated template, when requested, is now built as its own
+        // separate file right after this one (see
+        // ReportViewSet._build_template_report) rather than as a sheet
+        // bundled into this workbook — it'll show up as its own row below
+        // once fetchReports() runs, with its own Download button.
+        const templateNote = templateSelected
+          ? (result.data?.data?.template_report_id
+              ? ' The populated Template is ready too — see its own row below.'
+              : result.data?.data?.template_error
+                ? ` Note: the Template could not be built (${result.data.data.template_error}).`
+                : '')
+          : '';
+        alert(`Campaign report for "${campaign?.display_name}" generated successfully!${templateNote}`);
         setShowGenerateModal(false);
         fetchReports();
-        
+
         if (result.data && result.data.data && result.data.data.report_id) {
           await handleDownloadReport(
             result.data.data.report_id,
@@ -99,7 +112,7 @@ const CampaignReports = () => {
         alert(`Failed to generate report: ${result.error}`);
       }
     } catch (err) {
-      alert('Error generating report');
+      alert(`Error generating report: ${describeError(err, 'unknown error')}`);
     } finally {
       setGenerating(false);
     }
@@ -112,18 +125,22 @@ const CampaignReports = () => {
         const timestamp = new Date().toISOString().slice(0, 10);
         saveAs(result.data, `${defaultName}_${timestamp}.xlsx`);
       } else {
-        alert('Failed to download report');
+        alert(`Failed to download report: ${describeError(result.error, 'unknown error')}`);
       }
     } catch (err) {
-      alert('Error downloading report');
+      alert(`Error downloading report: ${describeError(err, 'unknown error')}`);
     }
   };
 
   const getReportTypeBadge = (type) => {
     const types = {
-      'campaign_report':   { variant: 'primary',   text: 'Campaign Report' },
-      'campaign_analysis': { variant: 'success',   text: 'Campaign Analysis' },
-      'analysis':          { variant: 'info',      text: 'Template Analysis' },
+      'campaign_report':    { variant: 'primary',   text: 'Campaign Report' },
+      'campaign_analysis':  { variant: 'success',   text: 'Campaign Analysis' },
+      'analysis':           { variant: 'info',      text: 'Template Analysis' },
+      // Built as its own file right after the main report — see
+      // ReportViewSet._build_template_report — rather than as a sheet
+      // inside campaign_analysis's workbook.
+      'template_analysis':  { variant: 'info',      text: 'Template' },
     };
     const config = types[type] || { variant: 'secondary', text: type || 'Unknown' };
     return <Badge bg={config.variant}>{config.text}</Badge>;
@@ -237,6 +254,13 @@ const CampaignReports = () => {
                       <td>{getReportTypeBadge(report.report_type)}</td>
                       <td>
                         <strong>{report.parameters?.campaign_name || campaign?.display_name || 'Campaign'}</strong>
+                        {report.report_type === 'template_analysis' && report.parameters?.main_report_id && (
+                          <div>
+                            <small className="text-muted">
+                              Template for report #{report.parameters.main_report_id}
+                            </small>
+                          </div>
+                        )}
                         {report.parameters?.source_file && (
                           <div>
                             <small className="text-muted">

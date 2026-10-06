@@ -8,6 +8,7 @@ import {
 import DashboardService from '../api/dashboardService';
 import { saveAs } from 'file-saver';
 import ReportPreviewModal from '../components/ReportPreviewModal';
+import { describeError } from '../utils/errorMessages';
 
 const Reports = () => {
   const [reports, setReports] = useState([]);
@@ -93,7 +94,7 @@ const Reports = () => {
         alert(`Failed to generate report: ${result.error}`);
       }
     } catch (err) {
-      alert('Error generating report');
+      alert(`Error generating report: ${describeError(err, 'unknown error')}`);
     } finally {
       setGenerating(false);
     }
@@ -130,7 +131,7 @@ const Reports = () => {
         alert(`Failed to upload template: ${result.error || 'Unknown error'}`);
       }
     } catch (err) {
-      alert('Error uploading template');
+      alert(`Error uploading template: ${describeError(err, 'unknown error')}`);
       console.error(err);
     } finally {
       setUploadingTemplate(false);
@@ -214,7 +215,7 @@ const Reports = () => {
       }
     } catch (err) {
       console.error('Error generating campaign analysis:', err);
-      alert('Error generating campaign analysis');
+      alert(`Error generating campaign analysis: ${describeError(err, 'unknown error')}`);
     } finally {
       setGenerating(false);
     }
@@ -228,10 +229,10 @@ const Reports = () => {
         const timestamp = new Date().toISOString().slice(0,10);
         saveAs(result.data, `${defaultName}_${timestamp}.xlsx`);
       } else {
-        alert('Failed to download report');
+        alert(`Failed to download report: ${describeError(result.error, 'unknown error')}`);
       }
     } catch (err) {
-      alert('Error downloading report');
+      alert(`Error downloading report: ${describeError(err, 'unknown error')}`);
     }
   };
 
@@ -396,7 +397,7 @@ const Reports = () => {
                                 alert('Failed to extract sheets: ' + result.error);
                               }
                             } catch (err) {
-                              alert('Error extracting sheets');
+                              alert(`Error extracting sheets: ${describeError(err, 'unknown error')}`);
                             }
                           }}
                         >

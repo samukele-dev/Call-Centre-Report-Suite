@@ -7,6 +7,7 @@ import {
 import { useParams, Link } from 'react-router-dom';
 import { saveAs } from 'file-saver';
 import DashboardService from '../api/dashboardService';
+import { describeError, validateDateRange } from '../utils/errorMessages';
 import { REPORT_SHEETS, ALL_REPORT_SHEET_KEYS, toggleReportSheet, FULL_OUTCOME_HISTORY_OPTION } from '../utils/reportSheets';
 import ReportPreviewModal from '../components/ReportPreviewModal';
 
@@ -22,7 +23,18 @@ const CampaignUpload = () => {
   const [syncEndTime, setSyncEndTime] = useState('');
   const [latestReport, setLatestReport] = useState(null);
   const [reportGenerationMissing, setReportGenerationMissing] = useState(false);
+  const [generatingReport, setGeneratingReport] = useState(false);
+  const [reportError, setReportError] = useState(null);
   const [downloadingReport, setDownloadingReport] = useState(false);
+  // The populated template is now its own separate file (see
+  // _build_template_report on the backend) — built right after the main
+  // report, not merged into it, so the main report no longer has to be
+  // reopened just to attach a template to it. Tracked separately here so
+  // it gets its own download button instead of silently becoming
+  // "latestReport" (which must always stay the main/combined file).
+  const [latestTemplateReport, setLatestTemplateReport] = useState(null);
+  const [templateReportError, setTemplateReportError] = useState(null);
+  const [downloadingTemplate, setDownloadingTemplate] = useState(false);
   const [sourceLists, setSourceLists] = useState([]);
   const [loadingLists, setLoadingLists] = useState(false);
   const [listsError, setListsError] = useState(null);
@@ -69,10 +81,10 @@ const CampaignUpload = () => {
       if (result.success) {
         setSourceLists(result.data || []);
       } else {
-        setListsError(typeof result.error === 'object' ? JSON.stringify(result.error) : result.error);
+        setListsError(describeError(result.error, 'Could not load batches from the database'));
       }
     } catch (err) {
-      setListsError('Error loading batches from the database');
+      setListsError(describeError(err, 'Could not load batches from the database'));
     } finally {
       setLoadingLists(false);
     }
@@ -102,25 +114,33 @@ const CampaignUpload = () => {
       } else {
         setMessage({
           type: 'danger',
-          text: `Failed to load campaign: ${result.error}`
+          text: `Failed to load campaign: ${describeError(result.error, 'unknown error')}`
         });
       }
     } catch (err) {
       setMessage({
         type: 'danger',
-        text: 'Error loading campaign'
+        text: `Failed to load campaign: ${describeError(err, 'unknown error')}`
       });
     }
   };
 
   const handleSyncFromDatabase = async () => {
-    if (syncStartDate && syncEndDate) {
-      const from = `${syncStartDate} ${syncStartTime || '00:00'}`;
-      const to = `${syncEndDate} ${syncEndTime || '23:59'}`;
-      if (from > to) {
-        setMessage({ type: 'danger', text: 'From date/time must be before or equal to the To date/time.' });
-        return;
-      }
+    const problem =
+      (!campaign?.cd_campaign_id
+        ? 'This campaign has no Source Database Campaign ID yet, so it cannot be synced. Set one on the Campaigns page first.'
+        : null) ||
+      (syncSheets.length === 0 ? 'Tick at least one report sheet before syncing.' : null) ||
+      (syncTemplateSelected && !syncTemplateSheet
+        ? 'You chose the Template report, so also pick which Template sheet matches this campaign.'
+        : null) ||
+      validateDateRange({
+        startDate: syncStartDate, endDate: syncEndDate, startTime: syncStartTime, endTime: syncEndTime,
+      });
+    if (problem) {
+      setMessage({ type: 'danger', text: problem });
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      return;
     }
 
     setSyncing(true);
@@ -128,8 +148,19 @@ const CampaignUpload = () => {
     setDebugInfo(null);
     setLatestReport(null);
     setReportGenerationMissing(false);
+    setReportError(null);
+    setLatestTemplateReport(null);
+    setTemplateReportError(null);
 
     try {
+      // Two steps instead of one long request: the sync itself (pull + save,
+      // usually seconds) returns as soon as the data is stored, and the
+      // report is built by a second call below. Previously the report was
+      // built inside the sync's own request (autoGenerateReport = true), so
+      // that one request stayed open for minutes; if anything cut it off
+      // (Render's proxy, a worker restart, a dropped connection) the page
+      // showed a sync error even though the data was already saved and
+      // showing as Processed under Data Files.
       const result = await DashboardService.syncCampaignFromDatabase(
         campaign.id,
         syncStartDate || null,
@@ -139,7 +170,7 @@ const CampaignUpload = () => {
         syncEndTime || null,
         syncSheets,
         syncFullOutcomeHistory,
-        true,
+        false,
         syncTemplateSelected ? syncTemplateSheet : null
       );
 
@@ -163,23 +194,50 @@ const CampaignUpload = () => {
             message: file.status_display || file.status
           });
 
-          // The auto-report is generated synchronously as part of the sync
-          // itself, so it already exists by the time we get here — surface
-          // it right away instead of making the user go find it on Reports.
-          // But generation can still silently fail/not run (e.g. the dev
-          // server restarting mid-build) while the sync itself still shows
-          // as successful, so don't just grab whatever report happens to be
+          // Data is saved — say so now, then build the report as its own
+          // step. The sync stays "in progress" (controls locked) until the
+          // report finishes so a second sync can't start underneath it.
+          setGeneratingReport(true);
+          const reportResult = await DashboardService.generateCampaignReport(
+            campaign.id,
+            syncSheets,
+            syncFullOutcomeHistory,
+            syncTemplateSelected ? syncTemplateSheet : null,
+            {
+              startDate: syncStartDate, endDate: syncEndDate,
+              startTime: syncStartTime, endTime: syncEndTime,
+            }
+          );
+          setGeneratingReport(false);
+
+          // Even on success, don't just grab whatever report happens to be
           // newest for this campaign — confirm it was actually built from
           // *this* sync's file (parameters.source_file, set in
           // ReportViewSet._auto_generate_full_report) before offering it.
           // Otherwise a stale report from an earlier sync would silently be
-          // shown as if it reflected this one.
+          // shown as if it reflected this one. A failed/timed-out report
+          // request is checked the same way: the server can still finish
+          // building it after the browser stopped waiting.
+          //
+          // Filtered to report_type 'campaign_analysis' specifically (not
+          // just "newest") — the populated template is now saved as its
+          // own, separate 'template_analysis' report right after this one
+          // (see _build_template_report), so the newest row for this
+          // campaign is sometimes the template, not the main report.
           const reportsResult = await DashboardService.getReports(campaign.id);
-          const candidate = reportsResult.success ? reportsResult.data?.[0] : null;
+          const allReports = reportsResult.success ? (reportsResult.data || []) : [];
+          const candidate = allReports.find(r => r.report_type === 'campaign_analysis');
           if (candidate && candidate.parameters?.source_file === file.original_name) {
             setLatestReport(candidate);
+            const templateReportId = candidate.parameters?.template_report_id;
+            const linkedTemplate = templateReportId
+              ? allReports.find(r => r.id === templateReportId)
+              : null;
+            setLatestTemplateReport(linkedTemplate || null);
+            setTemplateReportError(candidate.parameters?.template_error || null);
           } else {
             setReportGenerationMissing(true);
+            setReportError(reportResult.success ? null : describeError(reportResult.error, 'Report generation failed'));
           }
         }
       } else {
@@ -191,16 +249,19 @@ const CampaignUpload = () => {
         // failed: ..." text.
         setMessage({
           type: 'danger',
-          text: typeof result.error === 'object' ? JSON.stringify(result.error) : result.error
+          text: describeError(result.error, 'Database sync failed')
         });
+        window.scrollTo({ top: 0, behavior: 'smooth' });
       }
     } catch (error) {
       setMessage({
         type: 'danger',
-        text: `Database sync error: ${error.message}`
+        text: describeError(error, 'Database sync failed')
       });
+      window.scrollTo({ top: 0, behavior: 'smooth' });
       console.error('❌ Database sync error details:', error);
     } finally {
+      setGeneratingReport(false);
       setSyncing(false);
     }
   };
@@ -214,12 +275,30 @@ const CampaignUpload = () => {
         const timestamp = new Date().toISOString().slice(0, 10);
         saveAs(result.data, `${campaign.name}_Report_${timestamp}.xlsx`);
       } else {
-        alert('Failed to download report');
+        alert(`Could not download the report: ${describeError(result.error, 'unknown error')}`);
       }
     } catch (err) {
-      alert('Error downloading report');
+      alert(`Could not download the report: ${describeError(err, 'unknown error')}`);
     } finally {
       setDownloadingReport(false);
+    }
+  };
+
+  const handleDownloadLatestTemplate = async () => {
+    if (!latestTemplateReport) return;
+    setDownloadingTemplate(true);
+    try {
+      const result = await DashboardService.downloadReport(latestTemplateReport.id);
+      if (result.success) {
+        const timestamp = new Date().toISOString().slice(0, 10);
+        saveAs(result.data, `${campaign.name}_Template_${timestamp}.xlsx`);
+      } else {
+        alert(`Could not download the template: ${describeError(result.error, 'unknown error')}`);
+      }
+    } catch (err) {
+      alert(`Could not download the template: ${describeError(err, 'unknown error')}`);
+    } finally {
+      setDownloadingTemplate(false);
     }
   };
 
@@ -303,7 +382,7 @@ const CampaignUpload = () => {
                   </Button>
                   <Button
                     variant="primary"
-                    className="mt-3"
+                    className="mt-3 me-2"
                     onClick={handleDownloadLatestReport}
                     disabled={downloadingReport}
                   >
@@ -319,14 +398,58 @@ const CampaignUpload = () => {
                       </>
                     )}
                   </Button>
+
+                  {/* The populated template is its own file now — see the
+                      latestTemplateReport comment at its declaration — so it
+                      gets its own button rather than being bundled into the
+                      Download Report above. */}
+                  {latestTemplateReport && (
+                    <Button
+                      variant="outline-primary"
+                      className="mt-3"
+                      onClick={handleDownloadLatestTemplate}
+                      disabled={downloadingTemplate}
+                    >
+                      {downloadingTemplate ? (
+                        <>
+                          <span className="spinner-border spinner-border-sm me-2"></span>
+                          Downloading...
+                        </>
+                      ) : (
+                        <>
+                          <i className="bi bi-file-earmark-spreadsheet me-2"></i>
+                          Download Template
+                        </>
+                      )}
+                    </Button>
+                  )}
+
+                  {!latestTemplateReport && templateReportError && (
+                    <Alert variant="warning" className="mt-3 mb-0 py-2">
+                      <i className="bi bi-exclamation-triangle me-2"></i>
+                      The report is ready, but the Template couldn't be built
+                      ({templateReportError}). Check{' '}
+                      <Link to={`/campaigns/${id}/reports`}>Reports</Link> or try
+                      generating it again from there.
+                    </Alert>
+                  )}
                 </>
+              )}
+
+              {generatingReport && (
+                <div className="mt-3 d-flex align-items-center">
+                  <span className="spinner-border spinner-border-sm me-2"></span>
+                  <span>Your data is saved. Building the report now — this can take a few minutes, and you can leave this page open.</span>
+                </div>
               )}
 
               {reportGenerationMissing && (
                 <Alert variant="warning" className="mt-3 mb-0 py-2">
                   <i className="bi bi-exclamation-triangle me-2"></i>
-                  Data synced, but the report didn't finish generating. Go to{' '}
-                  <Link to={`/campaigns/${id}/reports`}>Reports</Link> to build it.
+                  Data synced and saved, but the report isn't ready yet
+                  {reportError ? ` (${reportError})` : ''}. Check{' '}
+                  <Link to={`/campaigns/${id}/reports`}>Reports</Link> in a minute — it may still be
+                  finishing — or build it from there.
                 </Alert>
               )}
             </>
@@ -578,12 +701,12 @@ const CampaignUpload = () => {
                 variant="primary"
                 size="lg"
                 onClick={handleSyncFromDatabase}
-                disabled={syncing || syncSheets.length === 0 || (syncTemplateSelected && !syncTemplateSheet)}
+                disabled={syncing}
               >
                 {syncing ? (
                   <>
                     <span className="spinner-border spinner-border-sm me-2"></span>
-                    Pulling from database...
+                    {generatingReport ? 'Building report...' : 'Pulling from database...'}
                   </>
                 ) : (
                   <>
@@ -592,6 +715,21 @@ const CampaignUpload = () => {
                   </>
                 )}
               </Button>
+              {(() => {
+                const dateProblem = validateDateRange({
+                  startDate: syncStartDate, endDate: syncEndDate, startTime: syncStartTime, endTime: syncEndTime,
+                });
+                const hint = syncSheets.length === 0
+                  ? 'Tick at least one report sheet above before syncing.'
+                  : syncTemplateSelected && !syncTemplateSheet
+                    ? 'Choose a Template sheet above to continue.'
+                    : dateProblem;
+                return hint ? (
+                  <div className="text-danger small mt-2">
+                    <i className="bi bi-exclamation-circle me-1"></i>{hint}
+                  </div>
+                ) : null;
+              })()}
             </>
           ) : (
             <Alert variant="secondary" className="mb-0">

@@ -17,40 +17,17 @@ export const AuthProvider = ({ children }) => {
   const [user, setUser] = useState(null);
   const [authError, setAuthError] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
-  const [apiPrefix, setApiPrefix] = useState(''); // Will store '/api/' or ''
 
-  // Detect API prefix on mount
-  useEffect(() => {
-    const detectApiPrefix = async () => {
-      const endpoints = [
-        '/api-token-auth/',           // No prefix
-        '/api/api-token-auth/',       // With /api/ prefix
-      ];
-      
-      for (const endpoint of endpoints) {
-        try {
-          const response = await axios.get(`${API_BASE_URL}${endpoint}`);
-          console.log(`✅ Found endpoint: ${endpoint}`);
-          // Extract prefix
-          const prefix = endpoint.replace('api-token-auth/', '');
-          setApiPrefix(prefix);
-          break;
-        } catch (error) {
-          console.log(`❌ Not found: ${endpoint}`);
-        }
-      }
-      
-      setIsLoading(false);
-    };
-
-    detectApiPrefix();
-  }, []);
-
-  // Initialize auth state from localStorage
+  // Initialize auth state from localStorage. (This used to be preceded by a
+  // probe that GET-ed /api-token-auth/ and /api/api-token-auth/ to "detect"
+  // an API prefix. That endpoint is POST-only, so every probe was a 405 and
+  // the detected prefix was never used — but each GET still counted against
+  // the endpoint's 10/minute login throttle, so a few page refreshes could
+  // eat into real login attempts. isLoading now flips off here instead.)
   useEffect(() => {
     const token = localStorage.getItem('authToken');
     const storedUser = localStorage.getItem('user');
-    
+
     if (token && storedUser) {
       try {
         const parsedUser = JSON.parse(storedUser);
@@ -60,6 +37,7 @@ export const AuthProvider = ({ children }) => {
         logout();
       }
     }
+    setIsLoading(false);
   }, []);
 
   // Login function - tries multiple endpoints
@@ -71,7 +49,8 @@ export const AuthProvider = ({ children }) => {
     const endpoints = [
       '/api-token-auth/',
     ];
-    
+    let failureStatus = null;
+
     for (const endpoint of endpoints) {
       try {
         console.log(`🔍 Trying login endpoint: ${API_BASE_URL}${endpoint}`);
@@ -109,19 +88,27 @@ export const AuthProvider = ({ children }) => {
         return { success: true, data: userData };
         
       } catch (error) {
-        console.log(`❌ Failed with endpoint ${endpoint}:`, 
-          error.response?.status || error.message);
+        failureStatus = error.response?.status || null;
+        console.log(`❌ Failed with endpoint ${endpoint}:`,
+          failureStatus || error.message);
         // Continue to next endpoint
       }
     }
-    
-    // If we get here, all endpoints failed
-    const errorMessage = 'Login failed. Possible issues:\n' +
-      '1. Backend is not running\n' +
-      '2. URL endpoint is incorrect\n' +
-      '3. Your username/password is wrong, or that user does not exist yet ' +
-      '(see backend/create_test_user.py — TEST_USER_PASSWORD must be set ' +
-      'for it to create one)';
+
+    // If we get here, all endpoints failed. A 400 from DRF's obtain-token
+    // view means the server was reached and rejected the credentials.
+    let errorMessage;
+    if (failureStatus === 400 || failureStatus === 401) {
+      errorMessage = 'Incorrect username or password.';
+    } else if (failureStatus === 429) {
+      errorMessage = 'Too many login attempts. Wait a minute and try again.';
+    } else {
+      errorMessage = 'Login failed. Possible issues:\n' +
+        '1. Backend is not running\n' +
+        '2. URL endpoint is incorrect\n' +
+        '3. That user does not exist yet (see backend/create_test_user.py — ' +
+        'TEST_USER_PASSWORD must be set for it to create one)';
+    }
     
     setAuthError(errorMessage);
     setIsLoading(false);
@@ -229,7 +216,7 @@ export const AuthProvider = ({ children }) => {
   };
 
   // Get API prefix
-  const getApiPrefix = () => apiPrefix;
+  const getApiPrefix = () => '';
 
   return (
     <AuthContext.Provider

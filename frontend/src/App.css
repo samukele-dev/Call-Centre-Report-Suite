@@ -1143,6 +1143,68 @@ code {
   transition: width 0.3s ease;
 }
 
+.qa-activity {
+  border-radius: 8px;
+  background: var(--surface-subtle, #f7f8fa);
+  border: 1px solid var(--border-subtle, #e5e7eb);
+}
+
+.qa-activity-toggle {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  background: none;
+  border: 0;
+  text-align: left;
+  color: inherit;
+}
+
+.qa-activity-table th {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--text-muted, #6b7280);
+  background: transparent;
+}
+
+/* Floating QA sync status — visible on every page while a sync runs. */
+.qa-sync-floating {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: 1050;
+  width: 320px;
+  max-width: calc(100vw - 32px);
+  padding: 14px 16px;
+  border-radius: 10px;
+  background: var(--surface, #fff);
+  border: 1px solid var(--border-subtle, #e5e7eb);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.15);
+}
+
+.qa-sync-floating-title {
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
+.qa-sync-floating-sub {
+  font-size: 0.85rem;
+  color: var(--text-muted, #6b7280);
+  margin: 2px 0 8px;
+}
+
+.qa-sync-floating-note {
+  font-size: 0.75rem;
+  color: var(--text-muted, #6b7280);
+  margin-top: 8px;
+}
+
+.qa-sync-floating .qa-sync-progress-bar {
+  width: 100%;
+}
+
 .qa-list .campaign-list-head,
 .qa-list .campaign-row {
   grid-template-columns: 150px 1fr 140px 1fr 130px 140px 110px;

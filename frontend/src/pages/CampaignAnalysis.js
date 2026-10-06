@@ -7,6 +7,7 @@ import {
 } from 'react-bootstrap';
 import DashboardService from '../api/dashboardService';
 import { saveAs } from 'file-saver';
+import { describeError } from '../utils/errorMessages';
 
 const CampaignAnalysis = () => {
   const { id } = useParams();  // campaign ID from URL
@@ -116,7 +117,7 @@ const CampaignAnalysis = () => {
         alert('Failed to extract sheets: ' + result.error);
       }
     } catch (err) {
-      alert('Error extracting sheets');
+      alert(`Error extracting sheets: ${describeError(err, 'unknown error')}`);
     } finally {
       setGenerating(false);
     }
@@ -163,7 +164,7 @@ const CampaignAnalysis = () => {
       }
     } catch (err) {
       console.error('Error generating campaign analysis:', err);
-      alert('Error generating campaign analysis');
+      alert(`Error generating campaign analysis: ${describeError(err, 'unknown error')}`);
     } finally {
       setGenerating(false);
     }
@@ -176,10 +177,10 @@ const CampaignAnalysis = () => {
         const timestamp = new Date().toISOString().slice(0, 10);
         saveAs(result.data, `${defaultName}_${timestamp}.xlsx`);
       } else {
-        alert('Failed to download report');
+        alert(`Failed to download report: ${describeError(result.error, 'unknown error')}`);
       }
     } catch (err) {
-      alert('Error downloading report');
+      alert(`Error downloading report: ${describeError(err, 'unknown error')}`);
     }
   };
 

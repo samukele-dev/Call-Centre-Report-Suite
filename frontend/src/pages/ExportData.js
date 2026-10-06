@@ -2,6 +2,7 @@
 import React, { useState, useEffect } from 'react';
 import { Card, Spinner, Button, Form, Alert, Row, Col, Badge } from 'react-bootstrap';
 import DashboardService from '../api/dashboardService';
+import { describeError, requireSelections, validateDateRange, describeDateRange } from '../utils/errorMessages';
 
 const ExportData = () => {
   // ========== STATE ==========
@@ -26,6 +27,8 @@ const ExportData = () => {
   const [exporting, setExporting] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [syncError, setSyncError] = useState(null);   // shown right above the Sync button
+  const [listsError, setListsError] = useState(null);
   const [success, setSuccess] = useState(null);
   const [previewData, setPreviewData] = useState([]);  // <-- RENAMED from exportData
   const [showPreview, setShowPreview] = useState(false);
@@ -49,6 +52,12 @@ const ExportData = () => {
     }
   }, [campaignId]);
 
+  // Top-of-page errors can be off-screen when the button that caused them is
+  // further down, so bring them into view.
+  useEffect(() => {
+    if (error) window.scrollTo({ top: 0, behavior: 'smooth' });
+  }, [error]);
+
   // ========== API CALLS ==========
   const fetchCampaigns = async () => {
     setLoading(true);
@@ -63,10 +72,10 @@ const ExportData = () => {
           setSelectedCampaign(result.data[0]);
         }
       } else {
-        setError('Failed to load campaigns');
+        setError(`Could not load campaigns: ${describeError(result.error, 'unknown error')}`);
       }
     } catch (err) {
-      setError('Error loading campaigns');
+      setError(`Could not load campaigns: ${describeError(err, 'unknown error')}`);
       console.error(err);
     } finally {
       setLoading(false);
@@ -90,13 +99,18 @@ const ExportData = () => {
   };
 
   const fetchSourceLists = async (id) => {
+    setListsError(null);
     try {
       const result = await DashboardService.getCampaignSourceLists(id);
       if (result.success) {
         setSourceLists(result.data || []);
+      } else {
+        setSourceLists([]);
+        setListsError(describeError(result.error, "Could not load this campaign's batches."));
       }
     } catch (err) {
       console.error('Error loading source lists:', err);
+      setListsError(describeError(err, "Could not load this campaign's batches."));
     }
   };
 
@@ -137,13 +151,20 @@ const ExportData = () => {
   // SYNC FROM DATABASE
   // ============================================================
   const handleSyncFromDatabase = async () => {
-    if (!campaignId) {
-      setError('Please select a campaign first');
+    const problem =
+      requireSelections([[campaignId, 'a campaign (top of the page)']]) ||
+      (selectedCampaignData && !selectedCampaignData.cd_campaign_id
+        ? `"${selectedCampaignData.display_name}" is not linked to the call-centre database yet, so it can't be synced. Pick a campaign marked "Linked to source DB", or ask an administrator to link this one.`
+        : null) ||
+      validateDateRange({ startDate, endDate, startTime, endTime });
+    if (problem) {
+      setSyncError(problem);
       return;
     }
 
     setSyncing(true);
     setSyncMessage(null);
+    setSyncError(null);
     setError(null);
 
     try {
@@ -167,10 +188,10 @@ const ExportData = () => {
         await fetchFiles(campaignId);
         setTimeout(() => setSyncMessage(null), 8000);
       } else {
-        setError(result.error || 'Database sync failed');
+        setSyncError(describeError(result.error, 'Database sync failed'));
       }
     } catch (err) {
-      setError(err.message || 'Database sync failed');
+      setSyncError(describeError(err, 'Database sync failed'));
       console.error(err);
     } finally {
       setSyncing(false);
@@ -182,7 +203,7 @@ const ExportData = () => {
   // ============================================================
   const handleFileUpload = async () => {
     if (!campaignId) {
-      setError('Please select a campaign first');
+      setError('Please select a campaign first (top of the page).');
       return;
     }
     if (!uploadFile) {
@@ -212,10 +233,10 @@ const ExportData = () => {
         await fetchFiles(campaignId);
         setTimeout(() => setSyncMessage(null), 8000);
       } else {
-        setError(result.error || 'File upload failed');
+        setError(describeError(result.error, 'File upload failed'));
       }
     } catch (err) {
-      setError(err.message || 'File upload failed');
+      setError(describeError(err, 'File upload failed'));
       console.error(err);
     } finally {
       setUploading(false);
@@ -227,7 +248,7 @@ const ExportData = () => {
   // ============================================================
   const handleExport = async () => {
     if (!campaignId && !selectedFile) {
-      setError('Please select a campaign or a specific file to export');
+      setError('Nothing to export yet: select a campaign, then choose one of its processed files.');
       return;
     }
 
@@ -256,10 +277,10 @@ const ExportData = () => {
         setSuccess(`Export successful! File downloaded as ${result.filename}`);
         setTimeout(() => setSuccess(null), 5000);
       } else {
-        setError(result.error || 'Export failed');
+        setError(describeError(result.error, 'Export failed'));
       }
     } catch (err) {
-      setError(err.message || 'Export failed');
+      setError(describeError(err, 'Export failed'));
       console.error(err);
     } finally {
       setExporting(false);
@@ -271,7 +292,7 @@ const ExportData = () => {
   // ============================================================
   const handlePreview = async () => {
     if (!selectedFile && !campaignId) {
-      setError('Please select a campaign or file to preview');
+      setError('Nothing to preview yet: select a campaign, then choose one of its processed files.');
       return;
     }
 
@@ -290,13 +311,13 @@ const ExportData = () => {
           if (processed.length > 0) {
             result = await DashboardService.getFilePreview(processed[0].id);
           } else {
-            setError('No processed files found for this campaign');
+            setError('This campaign has files, but none has finished processing yet. Wait for processing to finish, or run a new sync.');
             setShowPreview(false);
             setLoading(false);
             return;
           }
         } else {
-          setError('No files found for this campaign');
+          setError('This campaign has no data yet. Use "Sync from Database" above first.');
           setShowPreview(false);
           setLoading(false);
           return;
@@ -306,11 +327,11 @@ const ExportData = () => {
       if (result && result.success) {
         setPreviewData(result.data?.data || []);
       } else {
-        setError(result?.error || 'Failed to preview data');
+        setError(describeError(result?.error, 'Failed to preview data'));
         setShowPreview(false);
       }
     } catch (err) {
-      setError(err.message || 'Failed to preview data');
+      setError(describeError(err, 'Failed to preview data'));
       setShowPreview(false);
     } finally {
       setLoading(false);
@@ -419,6 +440,13 @@ const ExportData = () => {
                 Pulls call data straight from the call-centre database and processes it the same way an uploaded file would.
               </p>
 
+              {listsError && (
+                <Alert variant="warning" className="py-2 small">
+                  <i className="bi bi-exclamation-triangle me-2"></i>
+                  Couldn't load the batch list, so you can only sync every active batch. {listsError}
+                </Alert>
+              )}
+
               {/* Batch Selection */}
               {sourceLists.length > 0 && (
                 <Form.Group className="mb-3">
@@ -496,14 +524,35 @@ const ExportData = () => {
                 </Col>
               </Row>
 
-              <Form.Text className="text-muted d-block mb-3">
+              <Form.Text className="text-muted d-block mb-2">
                 Filters by interaction date (when the call happened). Time is optional. Leave everything blank for no date limit.
               </Form.Text>
+              {(() => {
+                const dateProblem = validateDateRange({ startDate, endDate, startTime, endTime });
+                return dateProblem ? (
+                  <div className="text-danger small mb-3">
+                    <i className="bi bi-exclamation-circle me-1"></i>{dateProblem}
+                  </div>
+                ) : (
+                  <div className="text-muted small mb-3">
+                    <i className="bi bi-info-circle me-1"></i>
+                    This will pull: {describeDateRange({ startDate, endDate })}
+                    {listIds.length > 0 ? ` Only the ${listIds.length} batch(es) you ticked.` : ' All active batches.'}
+                  </div>
+                );
+              })()}
+
+              {syncError && (
+                <Alert variant="danger" className="py-2" onClose={() => setSyncError(null)} dismissible>
+                  <i className="bi bi-exclamation-triangle-fill me-2"></i>
+                  {syncError}
+                </Alert>
+              )}
 
               <Button
                 variant="primary"
                 onClick={handleSyncFromDatabase}
-                disabled={syncing || !campaignId}
+                disabled={syncing}
                 className="w-100"
               >
                 {syncing ? (

@@ -15,6 +15,7 @@ import {
   Legend
 } from 'chart.js';
 import { saveAs } from 'file-saver';
+import { describeError } from '../utils/errorMessages';
 
 // This page's Doughnut chart needs ArcElement registered. Previously this
 // worked only by accident — Dashboard.js registered it as a side effect of
@@ -64,7 +65,7 @@ const CampaignDetail = () => {
       setLastUpdated(new Date());
 
     } catch (err) {
-      setError(err.message);
+      setError(describeError(err));
     } finally {
       setLoading(false);
     }
@@ -90,7 +91,7 @@ const CampaignDetail = () => {
       }
     } catch (err) {
       console.error('Download error:', err);
-      alert('Error downloading file');
+      alert(`Error downloading file: ${describeError(err, 'unknown error')}`);
     }
   };
 
@@ -107,7 +108,7 @@ const CampaignDetail = () => {
       }
     } catch (err) {
       console.error('Download error:', err);
-      alert('Error downloading report');
+      alert(`Error downloading report: ${describeError(err, 'unknown error')}`);
     }
   };
 

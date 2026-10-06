@@ -3,6 +3,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { Form, Dropdown, Alert } from 'react-bootstrap';
 import { saveAs } from 'file-saver';
 import DashboardService from '../api/dashboardService';
+import { describeError, requireSelections, validateDateRange } from '../utils/errorMessages';
 import ReportPreviewModal from '../components/ReportPreviewModal';
 
 const AgentReports = () => {
@@ -26,6 +27,7 @@ const AgentReports = () => {
   useEffect(() => {
     DashboardService.getCampaigns().then(result => {
       if (result.success) setCampaigns(result.data || []);
+      else setError(`Could not load campaigns: ${describeError(result.error, 'unknown error')}`);
     });
   }, []);
 
@@ -48,14 +50,13 @@ const AgentReports = () => {
   };
 
   const handleGenerate = async () => {
-    if (selectedCampaignIds.length === 0 || runInFlightRef.current) return;
-    if (startDate && endDate) {
-      const from = `${startDate} ${startTime || '00:00'}`;
-      const to = `${endDate} ${endTime || '23:59'}`;
-      if (from > to) {
-        setError('From date/time must be before or equal to the To date/time.');
-        return;
-      }
+    if (runInFlightRef.current) return;
+    const problem =
+      requireSelections([[selectedCampaignIds, 'at least one campaign (Campaigns dropdown)']]) ||
+      validateDateRange({ startDate, endDate, startTime, endTime });
+    if (problem) {
+      setError(problem);
+      return;
     }
 
     runInFlightRef.current = true;
@@ -100,7 +101,7 @@ const AgentReports = () => {
         entry = {
           ...entry,
           status: 'error',
-          message: typeof syncResult.error === 'object' ? JSON.stringify(syncResult.error) : syncResult.error,
+          message: describeError(syncResult.error, 'Sync failed'),
         };
       }
       newResults.push(entry);
@@ -127,8 +128,10 @@ const AgentReports = () => {
         const timestamp = new Date().toISOString().slice(0, 10);
         saveAs(result.data, `${campaignName.replace(/\s+/g, '_')}_Report_${timestamp}.xlsx`);
       } else {
-        setError(`Download failed: ${result.error}`);
+        setError(`Download failed: ${describeError(result.error, 'unknown error')}`);
       }
+    } catch (err) {
+      setError(`Download failed: ${describeError(err, 'unknown error')}`);
     } finally {
       setDownloadingId(null);
     }
@@ -260,7 +263,9 @@ const AgentReports = () => {
             </span>
           ) : (
             <span className="text-muted small">
-              Pick campaigns and an optional date range, then generate.
+              {selectedCampaignIds.length === 0
+                ? 'Step 1: pick at least one campaign. Dates are optional.'
+                : `${selectedCampaignIds.length} campaign${selectedCampaignIds.length === 1 ? '' : 's'} selected. Add an optional date range, then generate.`}
             </span>
           )}
         </div>
@@ -282,7 +287,6 @@ const AgentReports = () => {
           <button
             className="btn btn-sm btn-primary"
             onClick={handleGenerate}
-            disabled={selectedCampaignIds.length === 0}
           >
             <i className="bi bi-file-earmark-bar-graph me-1"></i>Generate Reports
           </button>

@@ -5,6 +5,7 @@ import {
 } from 'react-bootstrap';
 import DashboardService from '../api/dashboardService';
 import { saveAs } from 'file-saver';
+import { describeError } from '../utils/errorMessages';
 
 const PAGE_SIZE = 50;
 
@@ -68,7 +69,7 @@ const OutcomeDescriptions = () => {
         setOutcomes([]);
       }
     } catch (err) {
-      setError(err.message || 'An error occurred while fetching outcomes');
+      setError(describeError(err, 'An error occurred while fetching outcomes'));
       setOutcomes([]);
     }
     setLoading(false);
@@ -174,7 +175,7 @@ const OutcomeDescriptions = () => {
         });
       }
     } catch (error) {
-      setUploadResult({ success: false, message: error.message || 'Upload failed' });
+      setUploadResult({ success: false, message: describeError(error, 'Upload failed') });
     } finally {
       setUploading(false);
     }

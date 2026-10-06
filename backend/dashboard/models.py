@@ -340,6 +340,19 @@ class QACallRecord(models.Model):
     call_date = models.DateTimeField(null=True, blank=True)
     recording_key = models.CharField(max_length=500, null=True, blank=True)
     recording_duration_seconds = models.IntegerField(null=True, blank=True)
+    # Added for the QA download (contact_id above is the Lead ID). Null on rows
+    # synced before these existed — migration 0011 clears QASyncWindow so the
+    # page flags those ranges for a re-sync, which fills them in.
+    lead_reference = models.CharField(max_length=255, null=True, blank=True)
+    id_number = models.CharField(max_length=100, null=True, blank=True)
+    alt_phone_number = models.CharField(max_length=100, null=True, blank=True)
+    batch_name = models.CharField(max_length=255, null=True, blank=True)
+    call_end = models.DateTimeField(null=True, blank=True)
+    direction = models.CharField(max_length=50, null=True, blank=True)
+    talk_seconds = models.IntegerField(null=True, blank=True)
+    # From cxm.recording_log (so only present for calls that have a recording).
+    extension = models.CharField(max_length=100, null=True, blank=True)
+    hangup_user = models.CharField(max_length=20, null=True, blank=True)  # agent / customer / system
     synced_at = models.DateTimeField(auto_now=True)
 
     class Meta:
@@ -355,3 +368,93 @@ class QACallRecord(models.Model):
 
     def __str__(self):
         return f"{self.contact_id} [{self.campaign.display_name}] - {self.outcome}"
+
+
+class QAActivity(models.Model):
+    """
+    One entry in the QA page's "Recent activity": a sync or a download the
+    user requested, with the filters it used, so they can come back later,
+    see what finished (or didn't), re-apply the same filters, or re-download
+    the file. Downloads keep the generated .xlsx in `file`.
+    """
+    KIND_CHOICES = [('sync', 'Sync'), ('download', 'Download')]
+    STATUS_CHOICES = [
+        ('running', 'Running'), ('done', 'Done'), ('stopped', 'Stopped'), ('failed', 'Failed'),
+    ]
+
+    user = models.ForeignKey(User, null=True, blank=True, on_delete=models.CASCADE, related_name='qa_activities')
+    kind = models.CharField(max_length=10, choices=KIND_CHOICES)
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='running')
+    campaign_label = models.CharField(max_length=500, blank=True, default='')
+    # {campaign_ids, start_date, end_date, start_time, end_time, outcomes, search}
+    filters = models.JSONField(default=dict, blank=True)
+    records = models.IntegerField(null=True, blank=True)
+    message = models.TextField(blank=True, default='')
+    file = models.FileField(upload_to='qa_activity/', null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [models.Index(fields=['user', '-created_at'])]
+
+    def __str__(self):
+        return f"{self.kind} [{self.campaign_label}] {self.status}"
+
+
+class DashboardTeam(models.Model):
+    """
+    One row on the Altitude BPO online dashboard (a separate app that reads
+    team stats from this backend instead of the source DB directly — so only
+    this backend's IP needs to be allowlisted there). `display_name` is what
+    the dashboard shows ("Team Sbu Funeral"); `source_team_names` are the
+    source-DB team names (reporting.teams.name, e.g. "TeamSbu") whose calls
+    count toward it today. Target isn't in the source DB, so it lives here and
+    is edited from the dashboard (or the admin).
+    """
+    FLOOR_CHOICES = [('Floor 1', 'Floor 1'), ('Floor 2', 'Floor 2')]
+
+    floor = models.CharField(max_length=20, choices=FLOOR_CHOICES)
+    display_name = models.CharField(max_length=100)
+    source_team_names = models.JSONField(
+        default=list, blank=True,
+        help_text='Exact reporting.teams names (e.g. ["TeamSbu"]). Leave empty until mapped — the row shows zeros.',
+    )
+    target = models.IntegerField(default=0)
+    sort_order = models.IntegerField(default=0)
+    is_active = models.BooleanField(default=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['floor', 'sort_order', 'display_name']
+        constraints = [
+            models.UniqueConstraint(fields=['floor', 'display_name'], name='unique_dashboard_team_per_floor')
+        ]
+
+    def __str__(self):
+        return f"{self.floor}: {self.display_name}"
+
+
+class QASyncWindow(models.Model):
+    """
+    A date range of a campaign's interaction history that has been fully
+    synced into QACallRecord. QACallRecord alone can't answer "is this date
+    range complete?" — an empty or thin day looks the same whether the
+    campaign had no calls or the range was never synced — so every
+    successful sync records the window it covered here (merged with any
+    overlapping/adjacent windows, see qa_source._record_synced_window) and
+    the QA page compares its filter against these to warn about gaps.
+    """
+    campaign = models.ForeignKey(
+        Campaign, on_delete=models.CASCADE, related_name='qa_sync_windows'
+    )
+    start = models.DateTimeField()
+    end = models.DateTimeField()
+    synced_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [models.Index(fields=['campaign', 'start'])]
+        ordering = ['start']
+
+    def __str__(self):
+        return f"{self.campaign.display_name}: {self.start} .. {self.end}"

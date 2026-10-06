@@ -1,5 +1,6 @@
 // src/services/apiConfig.js - COMPLETE UPDATED VERSION
 import axios from 'axios';
+import { describeError } from '../utils/errorMessages';
 
 // Base URL for your Django API. CRA bakes REACT_APP_* env vars into the
 // build at BUILD time (not read at runtime) — Render's render.yaml sets
@@ -84,7 +85,7 @@ export const dashboardAPI = {
       console.error('Login error:', error);
       return {
         success: false,
-        error: error.response?.data || 'Login failed'
+        error: describeError(error, 'Login failed')
       };
     }
   },
@@ -97,7 +98,7 @@ export const dashboardAPI = {
       console.error('Register error:', error);
       return {
         success: false,
-        error: error.response?.data || 'Registration failed'
+        error: describeError(error, 'Registration failed')
       };
     }
   },
@@ -110,7 +111,7 @@ export const dashboardAPI = {
       console.error('Verify token error:', error);
       return {
         success: false,
-        error: error.response?.data || 'Token verification failed'
+        error: describeError(error, 'Token verification failed')
       };
     }
   },
@@ -133,7 +134,7 @@ export const dashboardAPI = {
       console.error('Upload error:', error);
       return {
         success: false,
-        error: error.response?.data?.error || error.response?.data || 'Upload failed'
+        error: describeError(error, 'Upload failed')
       };
     }
   },
@@ -147,7 +148,7 @@ export const dashboardAPI = {
       console.error('Dashboard stats error:', error);
       return {
         success: false,
-        error: error.response?.data?.error || error.response?.data || 'Failed to load stats'
+        error: describeError(error, 'Failed to load stats')
       };
     }
   },
@@ -161,7 +162,7 @@ export const dashboardAPI = {
       console.error('Get files error:', error);
       return {
         success: false,
-        error: error.response?.data?.error || error.response?.data || 'Failed to load files'
+        error: describeError(error, 'Failed to load files')
       };
     }
   },
@@ -175,7 +176,7 @@ export const dashboardAPI = {
       console.error('Preview error:', error.response || error);
       return { 
         success: false, 
-        error: error.response?.data || error.message 
+        error: describeError(error) 
       };
     }
   },
@@ -191,7 +192,7 @@ export const dashboardAPI = {
       console.error('Download processed file error:', error);
       return {
         success: false,
-        error: error.response?.data?.error || error.response?.data || 'Failed to download file'
+        error: describeError(error, 'Failed to download file')
       };
     }
   },
@@ -205,7 +206,7 @@ export const dashboardAPI = {
       console.error('Outcomes error:', error);
       return {
         success: false,
-        error: error.response?.data?.error || error.response?.data || 'Failed to load outcomes'
+        error: describeError(error, 'Failed to load outcomes')
       };
     }
   },
@@ -219,7 +220,7 @@ export const dashboardAPI = {
       console.error('Generate campaign report error:', error);
       return {
         success: false,
-        error: error.response?.data?.error || error.response?.data || 'Failed to generate report'
+        error: describeError(error, 'Failed to generate report')
       };
     }
   },
@@ -233,7 +234,7 @@ export const dashboardAPI = {
       console.error('Get reports error:', error);
       return {
         success: false,
-        error: error.response?.data?.error || error.response?.data || 'Failed to load reports'
+        error: describeError(error, 'Failed to load reports')
       };
     }
   },
@@ -249,7 +250,7 @@ export const dashboardAPI = {
       console.error('Download report error:', error);
       return {
         success: false,
-        error: error.response?.data?.error || error.response?.data || 'Failed to download report'
+        error: describeError(error, 'Failed to download report')
       };
     }
   },
@@ -278,7 +279,7 @@ export const dashboardAPI = {
       console.error('Bulk upload error:', error);
       return {
         success: false,
-        error: error.response?.data?.error || error.response?.data || 'Bulk upload failed'
+        error: describeError(error, 'Bulk upload failed')
       };
     }
   },
@@ -294,7 +295,7 @@ export const dashboardAPI = {
       console.error('Export outcomes error:', error);
       return {
         success: false,
-        error: error.response?.data?.error || error.response?.data || 'Failed to export outcomes'
+        error: describeError(error, 'Failed to export outcomes')
       };
     }
   },

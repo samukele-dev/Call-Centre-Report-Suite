@@ -24,3 +24,13 @@ python manage.py migrate
 # the Render dashboard (see render.yaml, backend/.env.example) rather than
 # leaving this at its hardcoded-default credentials on a real deployment.
 python create_test_user.py
+
+# Registers the dashboard's API token from the DASHBOARD_API_TOKEN environment
+# variable (set it in the Render dashboard — no Shell needed, which the free plan
+# doesn't have). Does nothing if the variable isn't set; never prints the token.
+python manage.py dashboard_api_token --from-env-only
+
+# Creates/refreshes the Altitude BPO online dashboard's Floor 2 teams (Themba,
+# Thelma, Ayanda, Sandra, Pat) and their source-DB mapping. Idempotent: never
+# resets a target a manager has set from the dashboard.
+python manage.py seed_dashboard_teams

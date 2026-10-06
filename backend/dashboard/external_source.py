@@ -366,6 +366,26 @@ def _fetch_customer_ids_called_in_range(cd_campaign_id, start_dt, end_dt):
 
     conn = _get_connection()
     try:
+        # _run_windowed only chunks (and so only survives the statement
+        # timeout) when BOTH bounds are set; with either one missing it
+        # issues a single unbounded scan of reporting.interaction_voice
+        # (137M+ rows, no campaign_id index), which always hits the 25s
+        # statement timeout with nothing to halve and retry. The UI lets
+        # either date be left blank (e.g. only "from" picked), so close the
+        # open side here: no end -> now; no start -> the campaign's oldest
+        # list, before which it can't have any calls.
+        if start_dt and not end_dt:
+            end_dt = datetime.now()
+        elif end_dt and not start_dt:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT MIN(created_at) FROM cxm.cd_lists WHERE campaign_id = %s",
+                (cd_campaign_id,),
+            )
+            earliest = cur.fetchone()[0]
+            conn.rollback()  # don't leave a transaction open for the SET in _run_windowed
+            start_dt = earliest.replace(tzinfo=None) if earliest else end_dt - timedelta(days=365)
+
         try:
             _run_windowed(conn, start_dt, end_dt, run_window)
         except Exception:
@@ -453,9 +473,13 @@ def fetch_call_data_from_source(cd_campaign_id, start_date=None, end_date=None, 
     if list_ids:
         # cl.id is uuid; list_ids arrives as plain strings (JSON from the
         # frontend), which psycopg2 adapts as text[]. Postgres won't
-        # implicitly cast uuid = text inside ANY() (unlike a lone scalar
-        # comparison), so cast the column side explicitly.
-        where_clauses.append("cl.id::text = ANY(%s)")
+        # implicitly cast uuid = text inside ANY(), so a cast is needed —
+        # but on the PARAMETER side (%s::uuid[]), never the column side
+        # (cl.id::text): casting the column makes the predicate
+        # non-sargable, so Postgres can't use the id index and scans the
+        # whole joined table instead (measured on Funeral Upsell: 8 rows
+        # took ~67s that way).
+        where_clauses.append("cl.id = ANY(%s::uuid[])")
         params.append([str(x) for x in list_ids])
     else:
         # No specific batches picked — default to active lists only (see
@@ -465,7 +489,11 @@ def fetch_call_data_from_source(cd_campaign_id, start_date=None, end_date=None, 
         start_dt = _parse_source_dt(start_date, start_time, '00:00:00')
         end_dt = _parse_source_dt(end_date, end_time, '23:59:59')
         called_ids = _fetch_customer_ids_called_in_range(cd_campaign_id, start_dt, end_dt)
-        where_clauses.append("cd.id::text = ANY(%s)")
+        # Parameter-side cast, same reason as cl.id above — this is the
+        # big one: cd is cxm.contact_data (millions of rows), and
+        # cd.id::text = ANY(...) forces a full scan of it instead of an
+        # index lookup per id.
+        where_clauses.append("cd.id = ANY(%s::uuid[])")
         params.append(called_ids)
 
     sql = SOURCE_QUERY_TEMPLATE.format(where_clause=" AND ".join(where_clauses))
@@ -1004,7 +1032,7 @@ def fetch_outcome_history_counts(cd_campaign_id, start_dt=None, end_dt=None, cus
         conn.close()
 
 
-def fetch_qa_interactions(cd_campaign_id, start_dt=None, end_dt=None, on_window=None):
+def fetch_qa_interactions(cd_campaign_id, start_dt=None, end_dt=None, on_window=None, skipped_out=None):
     """
     Full per-interaction call history for a campaign — contact info,
     outcome, agent, and recording for every logged call, not just each
@@ -1017,6 +1045,11 @@ def fetch_qa_interactions(cd_campaign_id, start_dt=None, end_dt=None, on_window=
     upsert incrementally instead of holding a campaign's entire history in
     memory at once. The full concatenated list is also returned, for
     smaller callers that don't need incremental handling.
+
+    skipped_out, when given (a list), is extended with the (start, end)
+    windows _run_windowed had to skip because they kept timing out — rows in
+    those ranges are NOT in the result, so a caller that records "this range
+    is synced" (qa_source) must leave them out.
 
     Same windowed/chunked approach as fetch_agent_performance/
     fetch_contact_call_counts — reporting.interaction_voice has no
@@ -1047,11 +1080,23 @@ def fetch_qa_interactions(cd_campaign_id, start_dt=None, end_dt=None, on_window=
                 cd.firstname       AS firstname,
                 cd.lastname        AS lastname,
                 cd.tel1            AS phone_number,
+                cd.tel2            AS alt_phone_number,
+                cd.lead_reference  AS lead_reference,
+                COALESCE(
+                    cd.custom->>'api_idnumber', cd.custom->>'idn', cd.custom->>'id_num',
+                    cd.custom->>'idno', cd.custom->>'id_no', cd.custom->>'idnumber',
+                    cd.custom->>'id_number'
+                )                  AS id_number,
                 iv.start_time      AS call_date,
+                iv.end_time        AS call_end,
+                iv.direction::text AS direction,
+                iv.talk_time       AS talk_time,
                 uu.display_name    AS agent_name,
                 oo.name::text      AS outcome,
                 rl.recording       AS recording_key,
-                rl.audio_length    AS recording_duration
+                rl.audio_length    AS recording_duration,
+                rl.extension       AS extension,
+                rl.hangup_user::text AS hangup_user
             FROM reporting.interaction_voice iv
             LEFT JOIN cxm.contact_data cd    ON cd.id = iv.customer_id
             LEFT JOIN reporting.outcomes oo  ON oo.id = iv.outcome_id
@@ -1063,13 +1108,39 @@ def fetch_qa_interactions(cd_campaign_id, start_dt=None, end_dt=None, on_window=
         )
         columns = [d[0] for d in cur.description]
         window_rows = [dict(zip(columns, row)) for row in cur.fetchall()]
+
+        # Batch (upload list) name per contact, looked up for just this
+        # window's contacts rather than joined into the query above: a
+        # per-row lateral join to cd_lists made the same one-day pull ~4.5x
+        # slower (2.8s -> 12.8s for 24k rows), enough to risk the 25s
+        # statement timeout on busy days. A contact in several of the
+        # campaign's lists gets the most recently created one.
+        customer_ids = list({str(r['customer_id']) for r in window_rows if r['customer_id'] is not None})
+        batch_by_customer = {}
+        if customer_ids:
+            cur.execute(
+                """
+                SELECT DISTINCT ON (x.contact_data_id) x.contact_data_id, cl.name
+                FROM cxm.cd_to_cd_lists x
+                JOIN cxm.cd_lists cl ON cl.id = x.cd_list_id
+                WHERE x.contact_data_id = ANY(%s::uuid[]) AND cl.campaign_id = %s
+                ORDER BY x.contact_data_id, cl.created_at DESC
+                """,
+                (customer_ids, cd_campaign_id),
+            )
+            batch_by_customer = {str(cid): name for cid, name in cur.fetchall()}
+        for r in window_rows:
+            r['batch_name'] = batch_by_customer.get(str(r['customer_id']))
+
         all_rows.extend(window_rows)
         if on_window and window_rows:
             on_window(window_rows)
 
     conn = _get_connection()
     try:
-        _run_windowed(conn, start_dt, end_dt, run_window)
+        skipped = _run_windowed(conn, start_dt, end_dt, run_window)
+        if skipped_out is not None:
+            skipped_out.extend(skipped)
         return all_rows
     except Exception as e:
         raise ExternalSourceError(f"QA interaction query against external database failed: {e}")

@@ -3,6 +3,7 @@ import React, { useState, useEffect } from 'react';
 import { Card, Spinner, Button } from 'react-bootstrap';
 import { Link } from 'react-router-dom';
 import DashboardService from '../api/dashboardService';
+import { describeError } from '../utils/errorMessages';
 
 const STATUS_META = {
   uploaded:   { label: 'Uploaded',   chip: 'chip-blue' },
@@ -122,7 +123,7 @@ const Dashboard = () => {
       console.error('Sync error:', error);
       setSyncMessage({
         type: 'error',
-        text: error.message || 'Network error while syncing campaigns'
+        text: describeError(error, 'Network error while syncing campaigns')
       });
     } finally {
       setSyncing(false);
@@ -154,7 +155,7 @@ const Dashboard = () => {
       console.error('Connection test error:', error);
       setSyncMessage({
         type: 'error',
-        text: `❌ Network error: ${error.message}`
+        text: `❌ ${describeError(error, 'Network error')}`
       });
       setTimeout(() => setSyncMessage(null), 5000);
     }

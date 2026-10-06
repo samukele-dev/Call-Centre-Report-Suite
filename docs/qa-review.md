@@ -247,6 +247,61 @@ Fixed on both ends:
   pattern used on Campaigns.js — restored now that local queries are cheap
   enough to compute an exact count on every request.
 
+### Sync coverage tracking: partial caches no longer look complete
+
+The cache only holds the date ranges that were actually synced (each sync
+pulls the page's date filter at the time — default last 7 days). Before this,
+viewing a wider range than was synced silently showed partial numbers:
+Absa Insurance, 17–30 Sep, showed 68 sales when the source DB's own sale
+flag has 263 — the cache only held 29–30 Sep (exactly 68 sales).
+
+- `QASyncWindow` (`models.py`) records each campaign's fully-synced ranges;
+  `qa_source._record_synced_window` merges them on every successful sync. A
+  Stopped/failed sync records nothing, and sub-ranges that timed out in
+  `_run_windowed` (`fetch_qa_interactions(skipped_out=...)`) are excluded.
+- `GET /api/qa/records/` returns `coverage`: per selected campaign, the
+  `gaps` in the requested range (only when both dates are given; future
+  time and gaps under a minute are ignored). Each gap carries
+  `start_date/start_time/end_date/end_time`, the same shape `POST /api/qa/sync/`
+  accepts.
+- `QA.js` shows a warning banner listing the gaps with a **Sync missing
+  range** button, which runs one sync per gap.
+- Rows cached before this existed have no recorded window, so those ranges
+  show as gaps until re-synced once.
+
+### Download columns and background sync
+
+- **Download (`QADownloadView`)** is driven by one `columns` list: Lead ID
+  (the source `contactid`), Lead Reference, Customer, ID Number, Phone, Alt
+  Phone, Batch, Campaign, Agent, Outcome, Call Start/End (UTC), Direction,
+  Talk Time, Recording Key/Duration, Interaction ID. IDs and phones are written
+  as text. The new fields are `QACallRecord` columns (migration 0011) filled
+  by `fetch_qa_interactions`; the batch name is looked up per window for just
+  that window's contacts (a per-row join made pulls ~4.5x slower). Migration
+  0011 clears `QASyncWindow`, so previously synced ranges show as gaps and a
+  re-sync fills the new columns in place.
+- **The sync loop lives in `context/QASyncContext.js`** (app level), not in
+  `QA.js`, so it keeps running when you open Campaigns / Export Data / Agent
+  Reports. `components/QASyncStatus.js` shows a floating progress card with a
+  **Stop** button on every page. Stop calls `POST /api/qa/sync/cancel/`
+  (`qa_source.request_cancel`), which halts the pull between source-DB windows
+  and records no coverage for it, then aborts the browser request. A full page
+  reload still ends the loop's UI (the server finishes the campaign it was on).
+- **Extension / Hangup User** come from `cxm.recording_log` (`extension`,
+  `hangup_user` = agent/customer/system), so they are only filled for calls
+  that have a recording. "Data List" in the download is the batch name.
+- **Notifications:** when a sync or download finishes (or fails), the provider
+  shows the floating card and fires a browser `Notification` (permission is
+  requested on the click that starts it; unsupported browsers just get the card).
+- **Recent activity:** `QAActivity` (migration 0012) logs each sync (one per
+  campaign request) and each download with its filters, status and record
+  count. `GET /api/qa/activity/` lists the signed-in user's latest 25;
+  downloads keep their `.xlsx` (`GET /api/qa/activity/<id>/file/`) so it can be
+  fetched again. The QA page's **Recent activity** panel has **Use filters**
+  (restores that entry's campaigns/dates/outcomes) and **File**. Only the newest
+  50 entries per user are kept (older files are deleted); a sync still
+  "running" after 3 hours is shown as interrupted.
+
 ## Status
 
 Resolved. The missing-index limitation on the source DB no longer affects

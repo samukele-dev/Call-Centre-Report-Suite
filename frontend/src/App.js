@@ -2,6 +2,8 @@
 import React from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
 import { AuthProvider } from './context/AuthContext';
+import { QASyncProvider } from './context/QASyncContext';
+import QASyncStatus from './components/QASyncStatus';
 import './App.css';
 
 // Layout
@@ -31,6 +33,8 @@ function App() {
   return (
     <Router>
       <AuthProvider>
+        <QASyncProvider>
+        <QASyncStatus />
         <Routes>
           {/* Public route */}
           <Route path="/login" element={<Login />} />
@@ -132,6 +136,7 @@ function App() {
           {/* Catch all route - redirect to campaigns */}
           <Route path="*" element={<Navigate to="/campaigns" />} />
         </Routes>
+        </QASyncProvider>
       </AuthProvider>
     </Router>
   );

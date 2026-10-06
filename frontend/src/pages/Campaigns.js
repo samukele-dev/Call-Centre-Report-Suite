@@ -9,6 +9,7 @@ import { saveAs } from 'file-saver';
 import DashboardService from '../api/dashboardService';
 import { FULL_OUTCOME_HISTORY_OPTION } from '../utils/reportSheets';
 import ReportPreviewModal from '../components/ReportPreviewModal';
+import { describeError, validateDateRange } from '../utils/errorMessages';
 
 const PAGE_SIZE = 10;
 
@@ -133,10 +134,10 @@ const Campaigns = () => {
         const timestamp = new Date().toISOString().slice(0, 10);
         saveAs(result.data, `${defaultName}_${timestamp}.xlsx`);
       } else {
-        alert('Failed to download report');
+        alert(`Failed to download report: ${describeError(result.error, 'unknown error')}`);
       }
     } catch (err) {
-      alert('Error downloading report');
+      alert(`Error downloading report: ${describeError(err, 'unknown error')}`);
     }
   };
 
@@ -180,6 +181,16 @@ const Campaigns = () => {
   };
 
   const handleGenerateCombined = async () => {
+    const problem =
+      (combinedSheets.length === 0 ? 'Tick at least one report sheet to include before generating.' : null) ||
+      validateDateRange({
+        startDate: combinedStartDate, endDate: combinedEndDate,
+        startTime: combinedStartTime, endTime: combinedEndTime,
+      });
+    if (problem) {
+      setCombinedResult({ success: false, error: problem });
+      return;
+    }
     setCombinedGenerating(true);
     setCombinedResult(null);
     try {
@@ -198,7 +209,7 @@ const Campaigns = () => {
         setCombinedResult({ success: false, error: result.error });
       }
     } catch (err) {
-      setCombinedResult({ success: false, error: 'Error generating combined report' });
+      setCombinedResult({ success: false, error: describeError(err, 'Error generating combined report') });
     } finally {
       setCombinedGenerating(false);
     }
@@ -214,10 +225,10 @@ const Campaigns = () => {
         if (result.success && result.data?.data?.report_id) {
           results.push({ campaign: c, status: 'success', reportId: result.data.data.report_id });
         } else {
-          results.push({ campaign: c, status: 'error', error: result.error || 'Unknown error' });
+          results.push({ campaign: c, status: 'error', error: describeError(result.error, 'Unknown error') });
         }
       } catch (err) {
-        results.push({ campaign: c, status: 'error', error: 'Request failed' });
+        results.push({ campaign: c, status: 'error', error: describeError(err, 'Request failed') });
       }
       setBulkResults([...results]);
     }
@@ -225,8 +236,13 @@ const Campaigns = () => {
   };
 
   const handleSaveCampaign = async () => {
-    if (!formData.name || !formData.display_name || !formData.sheet_name) {
-      alert('Please fill in all required fields');
+    const missingFields = [
+      [formData.name, '"Campaign Name (Internal)"'],
+      [formData.display_name, '"Display Name"'],
+      [formData.sheet_name, '"Sheet Name in Templates"'],
+    ].filter(([value]) => !String(value || '').trim()).map(([, label]) => label);
+    if (missingFields.length > 0) {
+      alert(`Please fill in: ${missingFields.join(', ')}.`);
       return;
     }
 
@@ -243,10 +259,10 @@ const Campaigns = () => {
         setSaveMessage(wasEditing ? 'Campaign updated.' : 'Campaign created.');
         setTimeout(() => setSaveMessage(null), 3000);
       } else {
-        alert(`Failed to save campaign: ${JSON.stringify(result.error)}`);
+        alert(`Failed to save campaign: ${describeError(result.error, 'unknown error')}`);
       }
     } catch (err) {
-      alert('Error saving campaign');
+      alert(`Error saving campaign: ${describeError(err, 'unknown error')}`);
     } finally {
       setCreating(false);
     }
@@ -1026,7 +1042,7 @@ const Campaigns = () => {
             <Button
               variant="primary"
               onClick={handleGenerateCombined}
-              disabled={combinedGenerating || combinedSheets.length === 0 || loadingFiles}
+              disabled={combinedGenerating || loadingFiles}
             >
               {combinedGenerating ? (
                 <>
