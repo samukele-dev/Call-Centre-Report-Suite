@@ -22,6 +22,8 @@ from dashboard.models import DashboardTeam
 #   - Pat's calls on the Vodacom Funeral Upsell campaign are logged under the
 #     "VodacomFuneralUpsell" team; "TeamPatricia" (26 agents) had no calls in the
 #     last 3 days but is Pat's team by name, so both count.
+#   - Anita's team is "Team Anita_Funeral" (8 agents, 3.5k calls in the last 3 days).
+#     A separate "Team Media Anita" exists (1 agent, Media campaign) — not counted.
 #
 # Targets start at 0 — managers set them from the dashboard.
 TEAMS = [
@@ -34,6 +36,7 @@ TEAMS = [
     ('Floor 2', 'Team Ayanda', ['TeamAyanda']),
     ('Floor 2', 'Team Sandra', ['Team_Sandra', 'Team Sandra']),
     ('Floor 2', 'Team Pat', ['VodacomFuneralUpsell', 'TeamPatricia']),
+    ('Floor 2', 'Team Anita', ['Team Anita_Funeral']),
 ]
 
 # Placeholder rows an earlier version of this command created from the dashboard's
