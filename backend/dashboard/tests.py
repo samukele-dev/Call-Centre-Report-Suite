@@ -29,11 +29,11 @@ class DashboardTeamStatsTests(TestCase):
         DashboardTeam.objects.create(floor='Floor 2', display_name='Retired', source_team_names=['TeamX'], target=99, is_active=False)
 
         self.db = {
-            # calls, sales, answered, talk_seconds
-            'TeamA': {'calls': 100, 'sales': 4, 'answered': 10, 'talk_seconds': 600.0},    # 60s avg
-            'TeamA2': {'calls': 50, 'sales': 1, 'answered': 10, 'talk_seconds': 1400.0},   # 140s avg
-            'TeamB': {'calls': 40, 'sales': 2, 'answered': 2, 'talk_seconds': 20.0},       # 10s avg
-            'TeamC': {'calls': 80, 'sales': 6, 'answered': 20, 'talk_seconds': 4000.0},    # 200s avg
+            # calls, sales, answered, talk_seconds, agents
+            'TeamA': {'calls': 100, 'sales': 4, 'answered': 10, 'talk_seconds': 600.0, 'agents': 5},
+            'TeamA2': {'calls': 50, 'sales': 1, 'answered': 10, 'talk_seconds': 1400.0, 'agents': 5},
+            'TeamB': {'calls': 40, 'sales': 2, 'answered': 2, 'talk_seconds': 20.0, 'agents': 2},
+            'TeamC': {'calls': 80, 'sales': 6, 'answered': 20, 'talk_seconds': 4000.0, 'agents': 8},
         }
 
         from rest_framework.test import APIClient
@@ -49,20 +49,30 @@ class DashboardTeamStatsTests(TestCase):
     def test_floor_rows_and_weighted_total_average(self):
         data = self._get('Floor 1').json()
         rows = {t['team']: t for t in data['teams']}
-        # Team A combines two source teams: 5 sales, (600+1400)/(10+10) = 100s
+        # Team A combines two source teams: 5 sales, (600+1400)/(5+5 live agents) = 200s
         self.assertEqual(rows['Team A']['current'], 5)
         self.assertEqual(rows['Team A']['shortfall'], 5)
-        self.assertEqual(rows['Team A']['avg_talk_seconds'], 100.0)
+        self.assertEqual(rows['Team A']['avg_talk_seconds'], 200.0)
+        self.assertEqual(rows['Team A']['agents_live'], 10)
         self.assertEqual(rows['Team B']['avg_talk_seconds'], 10.0)
         # Unmapped rows show zeros / no average, and say they're unmapped.
         self.assertEqual(rows['Unmapped']['current'], 0)
         self.assertIsNone(rows['Unmapped']['avg_talk_seconds'])
         self.assertFalse(rows['Unmapped']['mapped'])
-        # Floor total: weighted, NOT the mean of 100 and 10 (= 55): 2020s / 22 answered = 91.8
+        # Floor total: weighted, NOT the mean of 200 and 10 (= 105): 2020s / 12 agents = 168.3
         t = data['totals']
         self.assertEqual((t['target'], t['current'], t['shortfall']), (22, 7, 15))
-        self.assertEqual(t['avg_talk_seconds'], 91.8)
+        self.assertEqual(t['avg_talk_seconds'], 168.3)
+        self.assertEqual(t['agents_live'], 12)
         self.assertEqual(t['calls_answered'], 22)
+
+    def test_team_pat_pinned_first_then_by_sales(self):
+        from .models import DashboardTeam
+        DashboardTeam.objects.create(floor='Floor 2', display_name='Team Pat', source_team_names=['TeamP'], target=5, sort_order=9)
+        self.db['TeamP'] = {'calls': 1, 'sales': 0, 'answered': 0, 'talk_seconds': 0.0, 'agents': 1}
+        self.assertEqual([t['team'] for t in self._get('Floor 2').json()['teams']], ['Team Pat', 'Team C'])
+        # Floor 1: no Pat, so purely most sales first (Team A 5, Team B 2, Unmapped 0).
+        self.assertEqual([t['team'] for t in self._get('Floor 1').json()['teams']], ['Team A', 'Team B', 'Unmapped'])
 
     def test_floor_is_isolated_and_inactive_rows_hidden(self):
         data = self._get('Floor 2').json()
@@ -73,7 +83,7 @@ class DashboardTeamStatsTests(TestCase):
         data = self._get('Global').json()
         self.assertEqual(len(data['teams']), 4)
         self.assertEqual(data['totals']['current'], 13)
-        self.assertEqual(data['totals']['avg_talk_seconds'], round((2020 + 4000) / (22 + 20), 1))
+        self.assertEqual(data['totals']['avg_talk_seconds'], round((2020 + 4000) / (12 + 8), 1))
 
     def test_unknown_floor_and_db_failure_and_auth(self):
         from unittest import mock

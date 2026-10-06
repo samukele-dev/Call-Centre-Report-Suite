@@ -6,11 +6,11 @@ only this backend's IP has to be allowlisted there.
 
 For each DashboardTeam row: Current = sales today (calls whose outcome carries
 the source DB's own sale=1 flag — the same definition Agent Performance uses),
-and average talk time = total talk time / number of answered calls (talk time
-> 0) across the row's source teams. A floor's total average is weighted the
-same way (total talk seconds / total answered calls), never an average of
-per-team averages, which would let a 3-call team count as much as a 3,000-call
-one.
+and average talk time = total talk time of all the team's agents / number of
+agents live in the team today (agents with at least one call since midnight).
+A floor's total is weighted the same way (total talk seconds / total live
+agents), never an average of per-team averages, which would let a 3-agent team
+count as much as a 30-agent one.
 """
 import threading
 import time
@@ -21,6 +21,9 @@ from .external_source import ExternalSourceError, _get_connection
 from .models import DashboardTeam
 
 FLOORS = ['Floor 1', 'Floor 2']
+
+# Always listed first on its floor, whatever its sales.
+PINNED_TEAM = 'Team Pat'
 
 # "Today" means today at the call centre (South Africa), not UTC — the app's
 # TIME_ZONE is UTC, which would roll the dashboard's day over at 02:00.
@@ -41,7 +44,7 @@ def day_window(now=None):
 
 def fetch_team_day_stats(team_names, start_dt, end_dt):
     """
-    {source team name: {'calls', 'sales', 'answered', 'talk_seconds'}} for
+    {source team name: {'calls', 'sales', 'answered', 'talk_seconds', 'agents'}} for
     calls started in [start_dt, end_dt). A one-day window keeps this on the
     start_time index (measured ~0.2s) — reporting.interaction_voice has no
     team/campaign index, so never call this with a wide range.
@@ -59,7 +62,8 @@ def fetch_team_day_stats(team_names, start_dt, end_dt):
                    COUNT(*) FILTER (WHERE oo.sale = 1)                             AS sales,
                    COUNT(*) FILTER (WHERE iv.talk_time > interval '0')             AS answered,
                    COALESCE(SUM(EXTRACT(EPOCH FROM iv.talk_time))
-                            FILTER (WHERE iv.talk_time > interval '0'), 0)         AS talk_seconds
+                            FILTER (WHERE iv.talk_time > interval '0'), 0)         AS talk_seconds,
+                   COUNT(DISTINCT iv.user_id)                                      AS agents
             FROM reporting.interaction_voice iv
             JOIN reporting.teams t         ON t.id = iv.team_id
             LEFT JOIN reporting.outcomes oo ON oo.id = iv.outcome_id
@@ -70,8 +74,8 @@ def fetch_team_day_stats(team_names, start_dt, end_dt):
             (start_dt, end_dt, list(team_names)),
         )
         return {
-            name: {'calls': calls, 'sales': sales, 'answered': answered, 'talk_seconds': float(talk)}
-            for name, calls, sales, answered, talk in cur.fetchall()
+            name: {'calls': calls, 'sales': sales, 'answered': answered, 'talk_seconds': float(talk), 'agents': agents}
+            for name, calls, sales, answered, talk, agents in cur.fetchall()
         }
     except Exception as e:
         raise ExternalSourceError(f"Team stats query against external database failed: {e}")
@@ -91,8 +95,8 @@ def _cached_day_stats(team_names, start_dt, end_dt):
     return stats
 
 
-def _avg(talk_seconds, answered):
-    return round(talk_seconds / answered, 1) if answered else None
+def _avg(talk_seconds, agents):
+    return round(talk_seconds / agents, 1) if agents else None
 
 
 def build_stats(floor, now=None):
@@ -114,12 +118,13 @@ def build_stats(floor, now=None):
     by_name = _cached_day_stats(names, start_dt, end_dt) if names else {}
 
     teams = []
-    t_target = t_current = t_answered = 0
+    t_target = t_current = t_answered = t_agents = 0
     t_talk = 0.0
     for r in rows:
         mine = [by_name[n] for n in (r.source_team_names or []) if n in by_name]
         current = sum(m['sales'] for m in mine)
         answered = sum(m['answered'] for m in mine)
+        agents = sum(m['agents'] for m in mine)
         talk = sum(m['talk_seconds'] for m in mine)
         teams.append({
             'floor': r.floor,
@@ -127,7 +132,8 @@ def build_stats(floor, now=None):
             'target': r.target,
             'current': current,
             'shortfall': r.target - current,
-            'avg_talk_seconds': _avg(talk, answered),
+            'avg_talk_seconds': _avg(talk, agents),
+            'agents_live': agents,
             'calls_answered': answered,
             'talk_seconds': round(talk, 1),
             'mapped': bool(r.source_team_names),
@@ -135,7 +141,13 @@ def build_stats(floor, now=None):
         t_target += r.target
         t_current += current
         t_answered += answered
+        t_agents += agents
         t_talk += talk
+
+    # Floors stay grouped; within a floor Team Pat is pinned first, then the
+    # rest by sales today (most first). sorted() is stable, so ties keep their
+    # configured sort_order.
+    teams.sort(key=lambda t: (t['floor'], t['team'] != PINNED_TEAM, -t['current']))
 
     return {
         'floor': floor,
@@ -146,7 +158,8 @@ def build_stats(floor, now=None):
             'target': t_target,
             'current': t_current,
             'shortfall': t_target - t_current,
-            'avg_talk_seconds': _avg(t_talk, t_answered),
+            'avg_talk_seconds': _avg(t_talk, t_agents),
+            'agents_live': t_agents,
             'calls_answered': t_answered,
             'talk_seconds': round(t_talk, 1),
         },
