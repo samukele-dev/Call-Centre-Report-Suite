@@ -36,6 +36,8 @@ class DashboardTeamStatsTests(TestCase):
             'TeamC': {'calls': 80, 'sales': 6, 'answered': 20, 'talk_seconds': 4000.0, 'agents': 8},
         }
 
+        self.headcounts = {'TeamA': 6, 'TeamA2': 4, 'TeamB': 3, 'TeamC': 9}
+
         from rest_framework.test import APIClient
         from django.contrib.auth.models import User
         self.client = APIClient()
@@ -43,7 +45,8 @@ class DashboardTeamStatsTests(TestCase):
 
     def _get(self, floor):
         from unittest import mock
-        with mock.patch('dashboard.team_stats.fetch_team_day_stats', return_value=self.db):
+        with mock.patch('dashboard.team_stats.fetch_team_day_stats', return_value=self.db), \
+                mock.patch('dashboard.team_stats.fetch_team_headcounts', return_value=self.headcounts):
             return self.client.get('/api/dashboard/team-stats/', {'floor': floor})
 
     def test_floor_rows_and_weighted_total_average(self):
@@ -54,6 +57,8 @@ class DashboardTeamStatsTests(TestCase):
         self.assertEqual(rows['Team A']['shortfall'], 5)
         self.assertEqual(rows['Team A']['avg_talk_seconds'], 200.0)
         self.assertEqual(rows['Team A']['agents_live'], 10)
+        self.assertEqual(rows['Team A']['headcount'], 10)   # 6 + 4 on its two source teams
+        self.assertEqual(rows['Unmapped']['headcount'], 0)
         self.assertEqual(rows['Team B']['avg_talk_seconds'], 10.0)
         # Unmapped rows show zeros / no average, and say they're unmapped.
         self.assertEqual(rows['Unmapped']['current'], 0)
@@ -64,6 +69,7 @@ class DashboardTeamStatsTests(TestCase):
         self.assertEqual((t['target'], t['current'], t['shortfall']), (22, 7, 15))
         self.assertEqual(t['avg_talk_seconds'], 168.3)
         self.assertEqual(t['agents_live'], 12)
+        self.assertEqual(t['headcount'], 13)
         self.assertEqual(t['calls_answered'], 22)
 
     def test_team_pat_pinned_first_then_by_sales(self):

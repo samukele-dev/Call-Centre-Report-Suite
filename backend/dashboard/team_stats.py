@@ -95,6 +95,46 @@ def _cached_day_stats(team_names, start_dt, end_dt):
     return stats
 
 
+# Rosters change slowly (people join/leave), so cache them far longer than the sales numbers.
+HEADCOUNT_CACHE_SECONDS = 600
+_headcount_cache = {}
+
+
+def fetch_team_headcounts(team_names):
+    """{source team name: number of agents on that team in the source DB's user list}."""
+    if not team_names:
+        return {}
+    conn = _get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SET statement_timeout = 15000")
+        cur.execute(
+            "SELECT team_name::text, COUNT(*) FROM reporting.users WHERE team_name::text = ANY(%s) GROUP BY team_name::text",
+            (list(team_names),),
+        )
+        return {name: count for name, count in cur.fetchall()}
+    except Exception as e:
+        raise ExternalSourceError(f"Headcount query against external database failed: {e}")
+    finally:
+        conn.close()
+
+
+def _cached_headcounts(team_names):
+    """Headcounts are a nice-to-have: if the lookup fails the stats still load (headcount shows a dash)."""
+    key = tuple(sorted(team_names))
+    with _cache_lock:
+        hit = _headcount_cache.get(key)
+        if hit and time.monotonic() - hit[0] < HEADCOUNT_CACHE_SECONDS:
+            return hit[1]
+    try:
+        counts = fetch_team_headcounts(team_names)
+    except ExternalSourceError:
+        return hit[1] if hit else None
+    with _cache_lock:
+        _headcount_cache[key] = (time.monotonic(), counts)
+    return counts
+
+
 def _avg(talk_seconds, agents):
     return round(talk_seconds / agents, 1) if agents else None
 
@@ -116,16 +156,19 @@ def build_stats(floor, now=None):
     rows = list(DashboardTeam.objects.filter(floor__in=floors, is_active=True).order_by('floor', 'sort_order', 'display_name'))
     names = sorted({n for r in rows for n in (r.source_team_names or [])})
     by_name = _cached_day_stats(names, start_dt, end_dt) if names else {}
+    headcounts = _cached_headcounts(names) if names else {}   # None if unavailable
 
     teams = []
     t_target = t_current = t_answered = t_agents = 0
     t_talk = 0.0
+    t_headcount = 0
     for r in rows:
         mine = [by_name[n] for n in (r.source_team_names or []) if n in by_name]
         current = sum(m['sales'] for m in mine)
         answered = sum(m['answered'] for m in mine)
         agents = sum(m['agents'] for m in mine)
         talk = sum(m['talk_seconds'] for m in mine)
+        headcount = None if headcounts is None else sum(headcounts.get(n, 0) for n in (r.source_team_names or []))
         teams.append({
             'floor': r.floor,
             'team': r.display_name,
@@ -134,6 +177,7 @@ def build_stats(floor, now=None):
             'shortfall': r.target - current,
             'avg_talk_seconds': _avg(talk, agents),
             'agents_live': agents,
+            'headcount': headcount,
             'calls_answered': answered,
             'talk_seconds': round(talk, 1),
             'mapped': bool(r.source_team_names),
@@ -142,6 +186,7 @@ def build_stats(floor, now=None):
         t_current += current
         t_answered += answered
         t_agents += agents
+        t_headcount += headcount or 0
         t_talk += talk
 
     # Floors stay grouped; within a floor Team Pat is pinned first, then the
@@ -160,6 +205,7 @@ def build_stats(floor, now=None):
             'shortfall': t_target - t_current,
             'avg_talk_seconds': _avg(t_talk, t_agents),
             'agents_live': t_agents,
+            'headcount': None if headcounts is None else t_headcount,
             'calls_answered': t_answered,
             'talk_seconds': round(t_talk, 1),
         },

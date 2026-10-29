@@ -4750,6 +4750,11 @@ class DashboardTeamStatsView(generics.GenericAPIView):
     team, plus the floor's combined totals. See dashboard/team_stats.py.
     """
 
+    # Server-to-server calls from the online dashboard, polled every 30s by every open
+    # screen through ONE shared token user — DRF's global 1000/hour user throttle would
+    # 429 them. Token auth still applies; only the rate limit is lifted.
+    throttle_classes = []
+
     def get(self, request):
         from .external_source import ExternalSourceError
         from .team_stats import build_stats
@@ -4769,6 +4774,8 @@ class DashboardTeamTargetView(generics.GenericAPIView):
     Target (the source DB doesn't hold targets; the dashboard's floor managers
     edit them inline).
     """
+
+    throttle_classes = []   # see DashboardTeamStatsView
 
     def post(self, request):
         floor = request.data.get('floor')
