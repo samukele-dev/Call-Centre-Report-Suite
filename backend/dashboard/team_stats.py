@@ -89,7 +89,14 @@ def _cached_day_stats(team_names, start_dt, end_dt):
         hit = _cache.get(key)
         if hit and time.monotonic() - hit[0] < CACHE_SECONDS:
             return hit[1]
-    stats = fetch_team_day_stats(team_names, start_dt, end_dt)
+    try:
+        stats = fetch_team_day_stats(team_names, start_dt, end_dt)
+    except ExternalSourceError:
+        # Source DB slow/unreachable: serve the last numbers for today rather than
+        # failing the dashboard (a stale cache entry is only ever for this same day).
+        if hit:
+            return hit[1]
+        raise
     with _cache_lock:
         _cache[key] = (time.monotonic(), stats)
     return stats
@@ -101,15 +108,22 @@ _headcount_cache = {}
 
 
 def fetch_team_headcounts(team_names):
-    """{source team name: number of agents on that team in the source DB's user list}."""
+    """{source team name: current agents on it — enabled, not deleted, not managers/admins.
+    (Counting every row overstated teams badly: e.g. TeamPatricia has 26 users, all disabled.)}"""
     if not team_names:
         return {}
     conn = _get_connection()
     try:
         cur = conn.cursor()
-        cur.execute("SET statement_timeout = 15000")
+        cur.execute("SET statement_timeout = 5000")   # a nice-to-have: never hold up the sales numbers
         cur.execute(
-            "SELECT team_name::text, COUNT(*) FROM reporting.users WHERE team_name::text = ANY(%s) GROUP BY team_name::text",
+            """
+            SELECT team_name::text, COUNT(*) FROM reporting.users
+            WHERE team_name::text = ANY(%s)
+              AND deleted_at IS NULL AND enabled
+              AND NOT is_manager AND NOT is_superuser
+            GROUP BY team_name::text
+            """,
             (list(team_names),),
         )
         return {name: count for name, count in cur.fetchall()}
