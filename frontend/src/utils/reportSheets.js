@@ -9,6 +9,7 @@ export const REPORT_SHEETS = [
   { key: 'campaign_analysis', label: 'Campaign Analysis', description: 'Categorized metrics with Excel formulas', requiresPivot: true, requiresLeadCount: true },
   { key: 'call_count_breakdown', label: 'Call Count Breakdown', description: 'How many times each contact was called in range', dbOnly: true },
   { key: 'agent_performance', label: 'Agent Performance', description: 'Per-agent call stats, sorted by sales', dbOnly: true },
+  { key: 'pause_reasons', label: 'Pause Reasons', description: 'Per-agent pause time and count by pause reason', dbOnly: true },
   { key: 'template', label: 'Template (Sheet1)', description: "The campaign's template, populated", requiresPivot: true, requiresLeadCount: true, requiresCampaignAnalysis: true },
 ];
 

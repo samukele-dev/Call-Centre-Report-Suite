@@ -866,6 +866,138 @@ def fetch_agent_performance(cd_campaign_id, start_dt=None, end_dt=None):
     return results
 
 
+def fetch_pause_reasons(cd_campaign_id, start_dt=None, end_dt=None):
+    """
+    Per-agent pause time broken down by pause reason — for the "Pause
+    Reasons" report sheet. Pause rows are reporting.user_state_history
+    rows with status = 'pause'; their pause_reason_id joins to
+    reporting.pause_reasons for the reason name (NULL -> "No Reason").
+
+    Same performance profile as fetch_agent_performance (see its
+    docstring): user_state_history has no usable campaign/date path on its
+    own, so the campaign's agents are found from reporting.interaction_voice
+    first and user_state_history is then queried by that small user_id list
+    plus the window. Consequence: an agent who paused but made/took no
+    call for this campaign in the window is not listed.
+
+    Returns (reasons, rows): `reasons` is the list of reason names seen,
+    sorted by total time descending; `rows` is one dict per agent
+    ({'user_id','display_name','team_name','by_reason': {name:
+    {'seconds','count'}}, 'total_seconds','total_count'}) sorted by name.
+    Raises ExternalSourceError on failure — callers treat the sheet as
+    best-effort.
+    """
+    if not cd_campaign_id:
+        raise ExternalSourceError("No cd_campaign_id provided.")
+
+    totals = {}  # user_id -> {reason name -> {'seconds', 'count'}}
+
+    def run_window(cur, w_start, w_end, is_last):
+        end_op = "<=" if is_last else "<"
+
+        call_where = ["iv.campaign_id = %s", "iv.user_id IS NOT NULL"]
+        call_params = [cd_campaign_id]
+        if w_start:
+            call_where.append("iv.start_time >= %s")
+            call_params.append(w_start)
+        if w_end:
+            call_where.append(f"iv.start_time {end_op} %s")
+            call_params.append(w_end)
+        # GROUP BY, not SELECT DISTINCT: measured on a single day of Telkom
+        # Migrations, DISTINCT took 30s (past the 25s statement timeout)
+        # while the equivalent GROUP BY took 1.4s.
+        cur.execute(
+            f"SELECT iv.user_id FROM reporting.interaction_voice iv WHERE {' AND '.join(call_where)} GROUP BY iv.user_id",
+            call_params,
+        )
+        user_ids = [str(r[0]) for r in cur.fetchall()]
+        if not user_ids:
+            return
+
+        state_where = ["ush.user_id::text = ANY(%s)", "ush.status = 'pause'"]
+        state_params = [user_ids]
+        if w_start:
+            state_where.append("ush.start_time >= %s")
+            state_params.append(w_start)
+        if w_end:
+            state_where.append(f"ush.start_time {end_op} %s")
+            state_params.append(w_end)
+        cur.execute(
+            f"""
+            SELECT
+                ush.user_id,
+                COALESCE(pr.name::text, 'No Reason') AS reason,
+                COUNT(*)                                           AS pause_count,
+                COALESCE(SUM(EXTRACT(EPOCH FROM ush.duration)), 0) AS pause_seconds
+            FROM reporting.user_state_history ush
+            LEFT JOIN reporting.pause_reasons pr ON pr.id = ush.pause_reason_id
+            WHERE {" AND ".join(state_where)}
+            GROUP BY ush.user_id, COALESCE(pr.name::text, 'No Reason')
+            """,
+            state_params,
+        )
+        for uid, reason, count, seconds in cur.fetchall():
+            bucket = totals.setdefault(uid, {}).setdefault(reason, {'seconds': 0.0, 'count': 0})
+            bucket['seconds'] += float(seconds or 0)
+            bucket['count'] += count or 0
+
+    def _fetch_users(connection, user_ids):
+        cur = connection.cursor()
+        cur.execute(
+            "SELECT id, display_name, team_name FROM reporting.users WHERE id::text = ANY(%s)",
+            (user_ids,),
+        )
+        return {row[0]: {'display_name': row[1], 'team_name': row[2]} for row in cur.fetchall()}
+
+    conn = _get_connection()
+    try:
+        try:
+            _run_windowed(conn, start_dt, end_dt, run_window)
+        except Exception:
+            # Same single retry on a fresh connection as
+            # fetch_agent_performance, with the accumulator reset so a
+            # half-finished first attempt isn't double-counted.
+            totals.clear()
+            conn.close()
+            conn = _get_connection()
+            _run_windowed(conn, start_dt, end_dt, run_window)
+
+        if not totals:
+            return [], []
+
+        user_ids = [str(u) for u in totals.keys()]
+        try:
+            users = _fetch_users(conn, user_ids)
+        except Exception:
+            conn.close()
+            conn = _get_connection()
+            users = _fetch_users(conn, user_ids)
+    except ExternalSourceError:
+        raise
+    except Exception as e:
+        raise ExternalSourceError(f"Pause reasons query against external database failed: {e}")
+    finally:
+        conn.close()
+
+    reason_seconds = {}
+    rows = []
+    for uid, by_reason in totals.items():
+        u = users.get(uid, {})
+        for name, v in by_reason.items():
+            reason_seconds[name] = reason_seconds.get(name, 0) + v['seconds']
+        rows.append({
+            'user_id': str(uid),
+            'display_name': u.get('display_name') or 'Unknown Agent',
+            'team_name': u.get('team_name') or '',
+            'by_reason': by_reason,
+            'total_seconds': sum(v['seconds'] for v in by_reason.values()),
+            'total_count': sum(v['count'] for v in by_reason.values()),
+        })
+    rows.sort(key=lambda r: r['display_name'].lower())
+    reasons = sorted(reason_seconds, key=lambda n: (-reason_seconds[n], n.lower()))
+    return reasons, rows
+
+
 def fetch_contact_call_counts(cd_campaign_id, start_dt=None, end_dt=None):
     """
     How many times each contact was actually called within a date range —

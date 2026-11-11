@@ -1030,7 +1030,7 @@ class ReportViewSet(
 
     ALL_REPORT_SHEETS = {
         'processed_data', 'pivot', 'lead_count', 'campaign_analysis',
-        'call_count_breakdown', 'agent_performance', 'template',
+        'call_count_breakdown', 'agent_performance', 'pause_reasons', 'template',
     }
 
     # The master "Call Centre Report Template.xlsx" — one workbook with a
@@ -1523,7 +1523,10 @@ class ReportViewSet(
         # report with zero indication anything had gone wrong.
         agent_performance_error = None
         call_count_breakdown_error = None
-        if campaign.cd_campaign_id and ('agent_performance' in wanted or 'call_count_breakdown' in wanted):
+        pause_reasons_data = None  # (reasons, rows) from fetch_pause_reasons
+        pause_reasons_error = None
+        if campaign.cd_campaign_id and ('agent_performance' in wanted or 'call_count_breakdown' in wanted
+                                        or 'pause_reasons' in wanted):
             # When the sync asked for a specific window, scope both of these
             # to EXACTLY that window (like the outcome-history block above and
             # the combined report already do) — NOT to date_span. date_span is
@@ -1560,6 +1563,21 @@ class ReportViewSet(
                     print(f"⚠️  Agent Performance sheet skipped: {e}")
                     agent_rows = None
                     agent_performance_error = str(e) or type(e).__name__
+
+            if 'pause_reasons' in wanted:
+                try:
+                    from .external_source import fetch_pause_reasons
+                    pause_reasons_data = fetch_pause_reasons(
+                        campaign.cd_campaign_id,
+                        start_dt=perf_start,
+                        end_dt=perf_end,
+                    )
+                    print(f"⏸️  Pause Reasons: {len(pause_reasons_data[1])} agents, "
+                          f"{len(pause_reasons_data[0])} reasons")
+                except Exception as e:
+                    print(f"⚠️  Pause Reasons sheet skipped: {e}")
+                    pause_reasons_data = None
+                    pause_reasons_error = str(e) or type(e).__name__
 
             if 'call_count_breakdown' in wanted:
                 try:
@@ -2214,6 +2232,47 @@ class ReportViewSet(
             )
             print(f"⚠️  Agent Performance sheet shows an error placeholder: {agent_performance_error}")
 
+        # ── Pause Reasons — one row per agent, time + count per pause reason
+        #    (reasons ordered by total time, biggest first) ─────────────────
+        if pause_reasons_data is not None:
+            pr_reasons, pr_rows = pause_reasons_data
+            pr_ws = workbook.add_worksheet('Pause Reasons')
+            if not pr_rows:
+                pr_ws.set_column(0, 0, 60)
+                pr_ws.merge_range(0, 0, 2, 0, 'No pause activity found for this campaign in range.',
+                                  fmts['ca_italic_note'])
+            else:
+                pr_headers = ['User', 'Team', 'Total Pause', 'Total Pauses']
+                for name in pr_reasons:
+                    pr_headers += [f'{name} Time', f'{name} Count']
+                for col, h in enumerate(pr_headers):
+                    pr_ws.write(0, col, h, fmts['header'])
+                pr_ws.set_column(0, 1, 22)
+                pr_ws.set_column(2, len(pr_headers) - 1, 14)
+                for row_num, a in enumerate(pr_rows, start=1):
+                    pr_ws.write(row_num, 0, a['display_name'], fmts['cell'])
+                    pr_ws.write(row_num, 1, a['team_name'], fmts['cell'])
+                    pr_ws.write(row_num, 2, a['total_seconds'] / 86400, fmts['duration'])
+                    pr_ws.write(row_num, 3, a['total_count'], fmts['number'])
+                    for i, name in enumerate(pr_reasons):
+                        v = a['by_reason'].get(name)
+                        pr_ws.write(row_num, 4 + i * 2, (v['seconds'] / 86400) if v else 0, fmts['duration'])
+                        pr_ws.write(row_num, 5 + i * 2, v['count'] if v else 0, fmts['number'])
+                pr_ws.freeze_panes(1, 2)
+                pr_ws.autofilter(0, 0, len(pr_rows), len(pr_headers) - 1)
+            print(f"Pause Reasons sheet built: {len(pr_rows)} agents")
+        elif pause_reasons_error:
+            pr_ws = workbook.add_worksheet('Pause Reasons')
+            pr_ws.set_column(0, 0, 100)
+            pr_ws.merge_range(
+                0, 0, 2, 0,
+                f"⚠ Pause Reasons could not be built — the database "
+                f"query failed even after a retry:\n{pause_reasons_error}\n\n"
+                f"Try Generate Report again; if it keeps failing, the source "
+                f"database may be under heavy load or unreachable.",
+                fmts['ca_italic_note']
+            )
+
         # ── SHEET 4 — TEMPLATE — now built as its OWN separate report ───
         # Template used to be merged into this same workbook, which meant
         # closing this file, reloading the ENTIRE thing back through
@@ -2288,6 +2347,8 @@ class ReportViewSet(
                 'has_agent_performance': agent_rows is not None,
                 'agent_count':     len(agent_rows) if agent_rows else 0,
                 'agent_performance_error': agent_performance_error,
+                'has_pause_reasons': pause_reasons_data is not None,
+                'pause_reasons_error': pause_reasons_error,
                 'has_call_count_breakdown': call_counts is not None,
                 'call_count_breakdown_error': call_count_breakdown_error,
                 'metrics': {
